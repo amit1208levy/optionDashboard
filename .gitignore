@@ -1,0 +1,20 @@
+# Secrets — MUST NEVER be committed
+.credentials.json
+.settings.json
+
+# Per-user state
+.groups.json
+.account_names.json
+.strategies.json
+.history.json
+.snapshots.json
+
+# Build artifacts
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
+
+# OS
+.DS_Store

@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip3 list *)",
+      "Bash(pip3 install *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5050/setup)",
+      "Bash(kill 40143)",
+      "Bash(python3 app.py)",
+      "Bash(pkill -f \"python3 app.py\")",
+      "Read(//tmp/**)",
+      "Bash(python3 -c \"import customtkinter as ctk; ctk.set_appearance_mode\\('dark'\\); app=ctk.CTk\\(\\); app.geometry\\('400x300'\\); app.configure\\(fg_color='#0f1117'\\); ctk.CTkLabel\\(app,text='test',text_color='white'\\).pack\\(pady=50\\); app.mainloop\\(\\)\")",
+      "Bash(python3 -c \"import tkinter; print\\(tkinter.TkVersion\\); print\\(tkinter.TclVersion\\)\")",
+      "Bash(pkill -f \"python3 -c\")",
+      "Bash(brew list *)",
+      "WebSearch",
+      "WebFetch(domain:developer.tastytrade.com)",
+      "WebFetch(domain:tastyworks-api.readthedocs.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.tastyworks.com)",
+      "Bash(python3 -c \"import app; print\\('OK'\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\('app.py'\\).read\\(\\)\\); print\\('ok'\\)\")",
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['app.py','models.py','strategy_card.py','api.py']]; print\\('ok'\\)\")",
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['app.py','models.py','api.py']]; print\\('ok'\\)\")",
+      "WebFetch(domain:www.tastylive.com)",
+      "Bash(python3 -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['app.py','models.py','api.py','strategies.py','strategies_page.py','strategy_card.py']]; print\\('ok'\\)\")",
+      "Bash(python3 -c \"import strategies; print\\(len\\(strategies.TEMPLATES\\), 'templates'\\); print\\([t.key for t in strategies.TEMPLATES]\\)\")",
+      "Bash(python3 -c \"import models; import app; print\\('import ok'\\)\")",
+      "Bash(chmod +x /Users/amitlevy/Desktop/dashboard/build.sh)",
+      "Bash(python3 -c \"import updater; r=updater.check_latest\\(\\); print\\(r\\)\")",
+      "Bash(git --version)",
+      "Bash(gh --version)",
+      "Bash(gh auth *)",
+      "Bash(git init *)",
+      "Bash(git add *)"
+    ]
+  }
+}
