@@ -1,6 +1,12 @@
 """Options Dashboard — setup + portfolio + configure screens."""
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
+
+import numpy as np
+import matplotlib
+matplotlib.use("QtAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QStackedWidget, QVBoxLayout, QHBoxLayout,
@@ -20,6 +26,7 @@ from models import (
 from strategy_card import StrategyCard, pnl_color, money, fmt_num
 from strategies_page import ConfigurePage
 from strategy_detail import StrategyDetailPage
+from watchlist_page import WatchlistPage
 
 
 # ── Workers ──────────────────────────────────────────────────────────────────
@@ -272,6 +279,7 @@ class PortfolioScreen(QWidget):
     logout_requested    = pyqtSignal()
     configure_requested = pyqtSignal()
     strategy_clicked    = pyqtSignal(object)
+    watchlist_requested = pyqtSignal()
 
     BALANCE_CARDS = [
         ("net-liquidating-value",   "Net Liq"),
@@ -337,6 +345,17 @@ class PortfolioScreen(QWidget):
         self.alloc_lay.setSpacing(6)
         self.body.addWidget(self.alloc_card)
 
+        self.heat_header = self._section_header("P&L Calendar  (closed trades)")
+        self.body.addWidget(self.heat_header)
+        self.heat_card = QFrame()
+        self.heat_card.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; border-radius: 12px; }}"
+        )
+        self.heat_lay = QVBoxLayout(self.heat_card)
+        self.heat_lay.setContentsMargins(18, 14, 18, 16)
+        self.heat_lay.setSpacing(0)
+        self.body.addWidget(self.heat_card)
+
         self.my_header  = self._section_header("My Strategies")
         self.body.addWidget(self.my_header)
         self.my_container = QVBoxLayout()
@@ -400,6 +419,18 @@ class PortfolioScreen(QWidget):
         )
         configure_btn.clicked.connect(self.configure_requested.emit)
         hl.addWidget(configure_btn)
+
+        watchlist_btn = QPushButton("☆  Watchlist")
+        watchlist_btn.setFixedHeight(32)
+        watchlist_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        watchlist_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 0 12px; "
+            f"font-size: 12px; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+        )
+        watchlist_btn.clicked.connect(self.watchlist_requested.emit)
+        hl.addWidget(watchlist_btn)
 
         refresh_btn = QPushButton("↻  Refresh")
         refresh_btn.setFixedHeight(32)
@@ -740,6 +771,7 @@ class PortfolioScreen(QWidget):
 
         self._render_greeks(positions, metrics)
         self._render_allocation(instances, unassigned)
+        self._render_heatmap(self.history)
 
         total_pnl = sum(i.pnl for i in instances) + sum(s.pnl for s in unassigned)
         self.pnl_total_lbl.setText(money(total_pnl, signed=True))
@@ -887,6 +919,90 @@ class PortfolioScreen(QWidget):
                 f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
             )
             self.alloc_lay.addWidget(more)
+
+    def _render_heatmap(self, history):
+        self._clear_layout(self.heat_lay)
+
+        # Build daily P&L from closed lots
+        today    = date.today()
+        start    = today - timedelta(weeks=52)
+        daily    = {}
+        for lot in history:
+            raw_date = lot.get("closed_at") or lot.get("close_date") or ""
+            try:
+                d = date.fromisoformat(str(raw_date)[:10])
+            except ValueError:
+                continue
+            if d >= start:
+                daily[d] = daily.get(d, 0.0) + float(lot.get("pnl") or 0)
+
+        if not daily:
+            empty = QLabel("No closed trades yet — P&L calendar will appear here.")
+            empty.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 12px; border: none; background: transparent;"
+            )
+            self.heat_lay.addWidget(empty)
+            return
+
+        # Build 7×53 grid (rows=Mon-Sun, cols=weeks)
+        start_dow = start.weekday()
+        num_weeks = 53
+        grid = np.full((7, num_weeks), np.nan)
+        for day_off in range((today - start).days + 1):
+            d   = start + timedelta(days=day_off)
+            col = (day_off + start_dow) // 7
+            row = d.weekday()
+            if col < num_weeks:
+                grid[row, col] = daily.get(d, np.nan)
+
+        # Matplotlib calendar
+        fig, ax = plt.subplots(figsize=(14, 1.8))
+        fig.patch.set_facecolor("#161928")
+        ax.set_facecolor("#161928")
+
+        vmax = max(abs(v) for v in daily.values()) if daily else 1
+        vmax = max(vmax, 1)
+
+        from matplotlib.colors import TwoSlopeNorm, ListedColormap
+        norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+
+        masked = np.ma.masked_invalid(grid)
+        ax.imshow(masked, cmap="RdYlGn", norm=norm, aspect="auto",
+                  interpolation="nearest")
+
+        # Gray out NaN cells
+        nan_mask = np.isnan(grid)
+        nan_overlay = np.where(nan_mask, 1.0, np.nan)
+        nan_cmap = ListedColormap(["#1a1d2e"])
+        ax.imshow(nan_overlay, cmap=nan_cmap, aspect="auto",
+                  interpolation="nearest", vmin=0, vmax=1)
+
+        # Month labels on x-axis
+        month_labels, month_cols = [], []
+        cur_month = None
+        for day_off in range((today - start).days + 1):
+            d   = start + timedelta(days=day_off)
+            col = (day_off + start_dow) // 7
+            if d.month != cur_month and col < num_weeks:
+                month_labels.append(d.strftime("%b"))
+                month_cols.append(col)
+                cur_month = d.month
+        ax.set_xticks(month_cols)
+        ax.set_xticklabels(month_labels, color="#64748b", fontsize=8)
+
+        ax.set_yticks(range(7))
+        ax.set_yticklabels(["M", "T", "W", "T", "F", "S", "S"],
+                           color="#64748b", fontsize=8)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.tick_params(length=0)
+        fig.tight_layout(pad=0.3)
+
+        canvas = FigureCanvas(fig)
+        canvas.setFixedHeight(130)
+        canvas.setStyleSheet("background: transparent;")
+        self.heat_lay.addWidget(canvas)
+        plt.close(fig)
 
     def _clear_layout(self, lay):
         while lay.count():
@@ -1045,6 +1161,7 @@ class MainWindow(QStackedWidget):
         self.portfolio = None
         self.configure = None
         self.detail    = None
+        self.watchlist = None
         self._show_initial()
 
     def _show_initial(self):
@@ -1075,6 +1192,7 @@ class MainWindow(QStackedWidget):
         self.portfolio.logout_requested.connect(self._show_setup)
         self.portfolio.configure_requested.connect(self._show_configure)
         self.portfolio.strategy_clicked.connect(self._show_detail)
+        self.portfolio.watchlist_requested.connect(self._show_watchlist)
         self.addWidget(self.portfolio)
         self.setCurrentWidget(self.portfolio)
 
@@ -1095,6 +1213,29 @@ class MainWindow(QStackedWidget):
             self.removeWidget(self.configure)
             self.configure.deleteLater()
             self.configure = None
+
+    def _show_watchlist(self):
+        if self.portfolio is None:
+            return
+        acct = self.portfolio.current_account()
+        nlv  = 0.0
+        if acct:
+            try:
+                nlv = float(acct["balances"].get("net-liquidating-value") or 0)
+            except (TypeError, ValueError):
+                pass
+        self.watchlist = WatchlistPage(self.portfolio.token, nlv)
+        self.watchlist.back_requested.connect(self._back_from_watchlist)
+        self.addWidget(self.watchlist)
+        self.setCurrentWidget(self.watchlist)
+
+    def _back_from_watchlist(self):
+        if self.portfolio:
+            self.setCurrentWidget(self.portfolio)
+        if self.watchlist:
+            self.removeWidget(self.watchlist)
+            self.watchlist.deleteLater()
+            self.watchlist = None
 
     def _show_detail(self, strategy):
         if self.portfolio is None:
@@ -1134,6 +1275,7 @@ class MainWindow(QStackedWidget):
         self.portfolio = None
         self.configure = None
         self.detail    = None
+        self.watchlist = None
 
 
 if __name__ == "__main__":
