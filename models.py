@@ -239,7 +239,7 @@ class Strategy:
             if v is None:
                 continue
             any_set = True
-            total += l.sign * l.quantity * l.multiplier * v
+            total += l.sign * l.quantity * 100 * v
         return total if any_set else None
 
     def _detect_name(self):
@@ -373,24 +373,40 @@ def _norm_cdf(z):
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
 
-def probability_of_profit(strategy):
+def probability_of_profit(strategy, iv_fallback=0.30):
     """
     Estimate P(strategy P&L > 0 at expiration) as a percentage, or None if
     we lack the inputs. Uses a log-normal model for the underlying at expiry.
     """
-    legs = strategy.legs
+    legs = [l for l in strategy.legs if l.is_option]
+    if not legs:
+        return None
 
     # Underlying price from any leg's quote
     s0 = next((l.underlying_price for l in legs if l.underlying_price), None)
-    # Volatility: average IV of legs that have one
+    # Fallback 1: infer from ATM leg (smallest |delta - 0.5| gives strike closest to spot)
+    if s0 is None:
+        best = None
+        for l in legs:
+            if l.strike and l.delta is not None:
+                score = abs(abs(l.delta) - 0.5)
+                if best is None or score < best[0]:
+                    best = (score, l.strike)
+        if best:
+            s0 = best[1]
+    # Fallback 2: midpoint of strikes
+    if s0 is None:
+        strikes = [l.strike for l in legs if l.strike]
+        if strikes:
+            s0 = (min(strikes) + max(strikes)) / 2.0
+
+    # Volatility: average IV of legs that have one; else fallback
     ivs = [l.iv for l in legs if l.iv]
+    iv = (sum(ivs) / len(ivs)) if ivs else iv_fallback
+
     dte = strategy.dte
 
-    if s0 is None or not ivs or dte is None or dte < 0:
-        return None
-
-    iv = sum(ivs) / len(ivs)
-    if iv <= 0:
+    if s0 is None or dte is None or dte < 0 or iv <= 0:
         return None
 
     if dte == 0:
@@ -712,4 +728,213 @@ def strategy_performance(strategy_id, history, capital_req=None):
         "avg_dit":     avg_dit,
         "win_rate":    win_rate,
         "weekly_pct":  capital_pct,
+    }
+
+
+# ── Portfolio-level analytics ───────────────────────────────────────────────
+
+def _metric_float(metrics_for_symbol, *keys):
+    """Pull the first present float from several possible API field names."""
+    if not metrics_for_symbol:
+        return None
+    for k in keys:
+        v = metrics_for_symbol.get(k)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def symbol_ivr(metrics_for_symbol):
+    """Implied-Volatility Rank as 0–100, or None."""
+    v = _metric_float(
+        metrics_for_symbol,
+        "implied-volatility-index-rank",
+        "iv-rank",
+    )
+    if v is None:
+        return None
+    return v * 100 if v <= 1 else v
+
+
+def symbol_ivp(metrics_for_symbol):
+    """Implied-Volatility Percentile as 0–100, or None."""
+    v = _metric_float(
+        metrics_for_symbol,
+        "implied-volatility-percentile",
+        "iv-percentile",
+    )
+    if v is None:
+        return None
+    return v * 100 if v <= 1 else v
+
+
+def symbol_beta(metrics_for_symbol):
+    """Beta vs. SPY (1.0 default), or None if unknown."""
+    return _metric_float(metrics_for_symbol, "beta")
+
+
+def symbol_hv30(metrics_for_symbol):
+    v = _metric_float(
+        metrics_for_symbol,
+        "historical-volatility-30-day",
+        "hv-30",
+    )
+    if v is None:
+        return None
+    return v * 100 if v <= 1 else v
+
+
+def portfolio_greeks(positions, metrics_by_root=None):
+    """
+    Aggregate net Δ/Γ/Θ/V across positions.
+    Returns dict with net_delta/gamma/theta/vega and, if metrics provided,
+    beta_weighted_delta (SPY-equivalent delta).
+    """
+    net_delta = 0.0
+    net_gamma = 0.0
+    net_theta = 0.0
+    net_vega  = 0.0
+    bw_delta  = 0.0
+    have_beta = False
+
+    metrics_by_root = metrics_by_root or {}
+
+    for p in positions:
+        if not p.is_option:
+            continue
+        sign = p.sign  # +1 long / -1 short
+        d = _to_float(p.delta) * p.quantity * 100 * sign
+        g = _to_float(p.gamma) * p.quantity * 100 * sign
+        t = _to_float(p.theta) * p.quantity * 100 * sign
+        v = _to_float(p.vega)  * p.quantity * 100 * sign
+        net_delta += d
+        net_gamma += g
+        net_theta += t
+        net_vega  += v
+
+        beta = symbol_beta(metrics_by_root.get(p.root))
+        if beta is not None:
+            have_beta = True
+            bw_delta += d * beta
+
+    return {
+        "net_delta":  net_delta,
+        "net_gamma":  net_gamma,
+        "net_theta":  net_theta,
+        "net_vega":   net_vega,
+        "beta_weighted_delta": bw_delta if have_beta else None,
+    }
+
+
+def _notional_capital(strategy):
+    """Fallback capital estimate: short-option strike notional + long-option cost."""
+    total = 0.0
+    for leg in strategy.legs:
+        mult = leg.multiplier or 1
+        qty  = leg.quantity
+        if leg.is_option:
+            if leg.is_long:
+                total += leg.cost_basis
+            else:
+                total += (leg.strike or 0) * qty * mult
+        else:
+            total += abs(leg.market_value)
+    return total
+
+
+def _capital_for(strategy):
+    _, ml, _ = strategy_extremes(strategy)
+    if ml is not None and ml != float("-inf"):
+        return abs(ml)
+    return _notional_capital(strategy)
+
+
+def capital_allocation(instances, unassigned_groups, overrides_by_id=None):
+    """
+    Return a list of {"root": str, "capital": float, "pct": float}
+    sorted by capital desc. Uses max-loss when defined; otherwise a
+    notional estimate (short-strike notional + long option cost).
+    """
+    overrides_by_id = overrides_by_id or {}
+    buckets = defaultdict(float)
+
+    for inst in instances:
+        cap = overrides_by_id.get(inst.id)
+        if cap is None:
+            cap = _capital_for(inst)
+        buckets[inst.root or "—"] += cap
+
+    for g in unassigned_groups:
+        buckets[g.root or "—"] += _capital_for(g)
+
+    total = sum(buckets.values())
+    rows = [
+        {"root": r, "capital": c, "pct": (c / total * 100 if total else 0)}
+        for r, c in buckets.items()
+    ]
+    rows.sort(key=lambda x: x["capital"], reverse=True)
+    return rows, total
+
+
+# ── What-if scenario ────────────────────────────────────────────────────────
+
+def scenario_pnl(strategy, price_pct=0.0, iv_pct=0.0, days_forward=0):
+    """
+    Estimate strategy P&L under a hypothetical move using first-order Greeks.
+      ΔS = current_price * price_pct/100
+      P&L ≈ Σ legs of (Δ*ΔS + 0.5*Γ*ΔS² + V*ΔIV + Θ*days) * qty * mult * sign
+    Returns dict with pnl and shocked greeks.
+    """
+    pnl = 0.0
+    new_delta = 0.0
+    new_theta = 0.0
+    new_vega  = 0.0
+
+    S = next((l.underlying_price for l in strategy.legs if l.underlying_price), None)
+    if S is None:
+        # No live underlying price — use first strike as crude anchor
+        S = next((l.strike for l in strategy.legs if l.strike), 100.0)
+
+    dS = S * (price_pct / 100.0)
+
+    for leg in strategy.legs:
+        if not leg.is_option:
+            continue
+        mult = leg.multiplier or 100
+        sign = leg.sign
+        qty  = leg.quantity
+        d = _to_float(leg.delta)
+        g = _to_float(leg.gamma)
+        t = _to_float(leg.theta)
+        v = _to_float(leg.vega)
+
+        leg_pnl = (d * dS + 0.5 * g * dS * dS
+                   + v * iv_pct           # vega is per 1 vol-point
+                   + t * days_forward)    # theta is per day
+        pnl += leg_pnl * qty * mult * sign
+
+        # Rough shocked greeks (delta approx: d + gamma*dS; vega & theta decay linearly)
+        shocked_d = d + g * dS
+        new_delta += shocked_d * qty * mult * sign
+        new_theta += t * qty * mult * sign
+        new_vega  += v * qty * mult * sign
+
+    # First-order extrapolation can overshoot the theoretical bounds of the
+    # payoff diagram. Clamp so a short option can't "profit" beyond the credit
+    # received, etc.
+    mp, ml, _ = strategy_extremes(strategy)
+    if mp is not None and mp != float("inf"):
+        pnl = min(pnl, mp)
+    if ml is not None and ml != float("-inf"):
+        pnl = max(pnl, ml)
+
+    return {
+        "pnl":       pnl,
+        "net_delta": new_delta,
+        "net_theta": new_theta,
+        "net_vega":  new_vega,
     }

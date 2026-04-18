@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QComboBox,
     QDialog, QDialogButtonBox, QFormLayout, QMessageBox, QTextEdit
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
 import theme as T
 import api
@@ -17,10 +17,11 @@ import updater
 from version import VERSION
 from models import (
     Position, StrategyInstance, unassigned_positions, group_unassigned,
-    build_snapshot, detect_closures
+    build_snapshot, detect_closures, portfolio_greeks, capital_allocation
 )
-from strategy_card import StrategyCard, pnl_color, money
+from strategy_card import StrategyCard, pnl_color, money, fmt_num
 from strategies_page import ConfigurePage
+from strategy_detail import StrategyDetailPage
 
 
 # ── Workers ──────────────────────────────────────────────────────────────────
@@ -74,11 +75,16 @@ class PortfolioWorker(QThread):
                 for p in positions:
                     p.attach_quote(quotes.get(p.symbol))
 
+                # Per-underlying metrics: IVR/IVP/beta/HV30
+                roots = list({p.root for p in positions if p.root})
+                metrics = api.get_market_metrics(self.token, roots)
+
                 accounts.append({
                     "number":    num,
                     "nickname":  acct.get("nickname") or num,
                     "balances":  balances,
                     "positions": positions,
+                    "metrics":   metrics,
                 })
             self.done.emit({"accounts": accounts, "error": ""})
         except Exception as e:
@@ -264,6 +270,7 @@ class AccountSettingsDialog(QDialog):
 class PortfolioScreen(QWidget):
     logout_requested    = pyqtSignal()
     configure_requested = pyqtSignal()
+    strategy_clicked    = pyqtSignal(object)
 
     BALANCE_CARDS = [
         ("net-liquidating-value",   "Net Liq"),
@@ -305,6 +312,29 @@ class PortfolioScreen(QWidget):
 
         self.body.addLayout(self._build_balance_row())
         self.body.addSpacing(4)
+
+        self.greeks_header = self._section_header("Portfolio Greeks")
+        self.body.addWidget(self.greeks_header)
+        self.greeks_row = QHBoxLayout()
+        self.greeks_row.setSpacing(12)
+        self.body.addLayout(self.greeks_row)
+        self.greek_tiles = {}
+        for key, label in [("net_delta","Net Δ"), ("beta_weighted_delta","β-Wtd Δ (SPY)"),
+                           ("net_theta","Net Θ"), ("net_vega","Net Vega")]:
+            tile = self._make_tile(label)
+            self.greek_tiles[key] = tile
+            self.greeks_row.addWidget(tile["frame"])
+
+        self.alloc_header = self._section_header("Capital by Ticker")
+        self.body.addWidget(self.alloc_header)
+        self.alloc_card = QFrame()
+        self.alloc_card.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; border-radius: 12px; }}"
+        )
+        self.alloc_lay = QVBoxLayout(self.alloc_card)
+        self.alloc_lay.setContentsMargins(18, 14, 18, 16)
+        self.alloc_lay.setSpacing(6)
+        self.body.addWidget(self.alloc_card)
 
         self.my_header  = self._section_header("My Strategies")
         self.body.addWidget(self.my_header)
@@ -376,6 +406,18 @@ class PortfolioScreen(QWidget):
         refresh_btn.clicked.connect(self._load_data)
         hl.addWidget(refresh_btn)
 
+        self.live_btn = QPushButton("○  Live")
+        self.live_btn.setFixedHeight(32)
+        self.live_btn.setCheckable(True)
+        self.live_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.live_btn.toggled.connect(self._toggle_live)
+        self._style_live_btn(False)
+        hl.addWidget(self.live_btn)
+
+        self._live_timer = QTimer(self)
+        self._live_timer.setInterval(15000)
+        self._live_timer.timeout.connect(self._load_data)
+
         self.update_btn = QPushButton(f"v{VERSION}")
         self.update_btn.setFixedHeight(32)
         self.update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -406,6 +448,51 @@ class PortfolioScreen(QWidget):
         )
         hl.addWidget(logout_btn)
         return header
+
+    def _style_live_btn(self, on):
+        if on:
+            self.live_btn.setText("●  Live")
+            self.live_btn.setStyleSheet(
+                f"QPushButton {{ background: {T.GREEN_D}; color: white; border: none; "
+                f"border-radius: 6px; padding: 0 10px; font-size: 11px; font-weight: bold; }}"
+                f"QPushButton:hover {{ background: {T.GREEN}; }}"
+            )
+        else:
+            self.live_btn.setText("○  Live")
+            self.live_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+                f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 0 10px; "
+                f"font-size: 11px; }}"
+                f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+            )
+
+    def _toggle_live(self, on):
+        self._style_live_btn(on)
+        if on:
+            self._live_timer.start()
+        else:
+            self._live_timer.stop()
+
+    def _make_tile(self, label):
+        f = QFrame()
+        f.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; border-radius: 12px; }}"
+        )
+        lay = QVBoxLayout(f)
+        lay.setContentsMargins(16, 12, 16, 14)
+        lay.setSpacing(2)
+        lbl = QLabel(label.upper())
+        lbl.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 10px; font-weight: bold; letter-spacing: 0.7px; "
+            f"border: none; background: transparent;"
+        )
+        val = QLabel("—")
+        val.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 18px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        lay.addWidget(lbl); lay.addWidget(val)
+        return {"frame": f, "value": val}
 
     def _section_header(self, text):
         l = QLabel(text.upper())
@@ -441,6 +528,26 @@ class PortfolioScreen(QWidget):
             lay.addWidget(lbl); lay.addWidget(val)
             self.bal_cards[key] = val
             row.addWidget(w)
+
+        cap_card = QFrame()
+        cap_card.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; border-radius: 12px; }}"
+        )
+        clay = QVBoxLayout(cap_card)
+        clay.setContentsMargins(20, 14, 20, 16)
+        clay.setSpacing(4)
+        clbl = QLabel("CAPITAL USED")
+        clbl.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 10px; font-weight: bold; letter-spacing: 0.7px; "
+            f"border: none; background: transparent;"
+        )
+        self.cap_used_lbl = QLabel("—")
+        self.cap_used_lbl.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 22px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        clay.addWidget(clbl); clay.addWidget(self.cap_used_lbl)
+        row.addWidget(cap_card)
 
         pnl_card = QFrame()
         pnl_card.setStyleSheet(
@@ -604,13 +711,34 @@ class PortfolioScreen(QWidget):
             except (ValueError, TypeError):
                 widget.setText("—")
 
+        # Capital used = maintenance requirement / net liq
+        try:
+            maint   = float(bal.get("maintenance-requirement") or 0)
+            net_liq = float(bal.get("net-liquidating-value") or 0)
+            if net_liq > 0:
+                pct = (maint / net_liq) * 100.0
+                self.cap_used_lbl.setText(f"{pct:.1f}%")
+                color = T.RED if pct >= 80 else (T.YELLOW if pct >= 50 else T.TEXT)
+                self.cap_used_lbl.setStyleSheet(
+                    f"color: {color}; font-size: 22px; font-weight: bold; "
+                    f"border: none; background: transparent;"
+                )
+            else:
+                self.cap_used_lbl.setText("—")
+        except (ValueError, TypeError):
+            self.cap_used_lbl.setText("—")
+
         self._clear_layout(self.my_container)
         self._clear_layout(self.ua_container)
 
         positions = acct["positions"]
+        metrics   = acct.get("metrics") or {}
         instances = [StrategyInstance(d, positions) for d in self.strategies_raw]
         leftover  = unassigned_positions(positions, self.strategies_raw)
         unassigned = group_unassigned(leftover)
+
+        self._render_greeks(positions, metrics)
+        self._render_allocation(instances, unassigned)
 
         total_pnl = sum(i.pnl for i in instances) + sum(s.pnl for s in unassigned)
         self.pnl_total_lbl.setText(money(total_pnl, signed=True))
@@ -629,7 +757,8 @@ class PortfolioScreen(QWidget):
             self.my_container.addWidget(empty)
         else:
             for inst in instances:
-                card = StrategyCard(inst)
+                card = StrategyCard(inst, metrics=metrics)
+                card.clicked.connect(self.strategy_clicked.emit)
                 self.my_container.addWidget(card)
 
         if not unassigned:
@@ -642,8 +771,121 @@ class PortfolioScreen(QWidget):
             self.ua_container.addWidget(empty)
         else:
             for strat in unassigned:
-                card = StrategyCard(strat)
+                card = StrategyCard(strat, metrics=metrics)
+                card.clicked.connect(self.strategy_clicked.emit)
                 self.ua_container.addWidget(card)
+
+    def _render_greeks(self, positions, metrics_by_root):
+        g = portfolio_greeks(positions, metrics_by_root)
+        fields = [
+            ("net_delta",            g["net_delta"]),
+            ("beta_weighted_delta",  g["beta_weighted_delta"]),
+            ("net_theta",            g["net_theta"]),
+            ("net_vega",             g["net_vega"]),
+        ]
+        for key, val in fields:
+            tile = self.greek_tiles[key]
+            if val is None:
+                tile["value"].setText("—")
+                tile["value"].setStyleSheet(
+                    f"color: {T.MUTED}; font-size: 18px; font-weight: bold; "
+                    f"border: none; background: transparent;"
+                )
+                continue
+            color = pnl_color(val) if key in ("net_delta","beta_weighted_delta","net_theta") else T.TEXT
+            sign = "+" if val >= 0 else "−"
+            if abs(val) >= 100:
+                text = f"{sign}{abs(val):,.0f}"
+            else:
+                text = f"{sign}{abs(val):.2f}"
+            tile["value"].setText(text)
+            tile["value"].setStyleSheet(
+                f"color: {color}; font-size: 18px; font-weight: bold; "
+                f"border: none; background: transparent;"
+            )
+
+    def _render_allocation(self, instances, unassigned):
+        self._clear_layout(self.alloc_lay)
+        overrides = {r["id"]: r["capital_override"]
+                     for r in self.strategies_raw
+                     if r.get("capital_override") is not None}
+        rows, total = capital_allocation(instances, unassigned, overrides)
+
+        if not rows or total <= 0:
+            empty = QLabel("No capital allocated.")
+            empty.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 12px; border: none; background: transparent;"
+            )
+            self.alloc_lay.addWidget(empty)
+            return
+
+        header = QLabel(f"Total deployed: {money(total)}")
+        header.setStyleSheet(
+            f"color: {T.TEXT_DIM}; font-size: 12px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        self.alloc_lay.addWidget(header)
+
+        top_rows = rows[:8]
+        for r in top_rows:
+            row_w = QHBoxLayout()
+            row_w.setSpacing(10)
+            name = QLabel(r["root"])
+            name.setFixedWidth(70)
+            name.setStyleSheet(
+                f"color: {T.TEXT}; font-size: 12px; font-weight: bold; "
+                f"border: none; background: transparent;"
+            )
+            row_w.addWidget(name)
+
+            bar_outer = QFrame()
+            bar_outer.setFixedHeight(12)
+            bar_outer.setStyleSheet(
+                f"QFrame {{ background: #12151d; border: 1px solid {T.BORDER}; "
+                f"border-radius: 6px; }}"
+            )
+            bar_lay = QHBoxLayout(bar_outer)
+            bar_lay.setContentsMargins(0, 0, 0, 0)
+            bar_lay.setSpacing(0)
+            fill = QFrame()
+            fill_color = T.RED if r["pct"] >= 40 else (T.YELLOW if r["pct"] >= 20 else T.PURPLE)
+            fill.setStyleSheet(
+                f"QFrame {{ background: {fill_color}; border: none; border-radius: 5px; }}"
+            )
+            stretch_fill = int(max(1, round(r["pct"] * 10)))
+            stretch_rest = int(max(1, round((100 - r["pct"]) * 10)))
+            bar_lay.addWidget(fill, stretch_fill)
+            spacer = QWidget()
+            spacer.setStyleSheet("background: transparent;")
+            bar_lay.addWidget(spacer, stretch_rest)
+            row_w.addWidget(bar_outer, 1)
+
+            pct_lbl = QLabel(f"{r['pct']:.1f}%")
+            pct_lbl.setFixedWidth(55)
+            pct_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            pct_lbl.setStyleSheet(
+                f"color: {T.TEXT_DIM}; font-size: 12px; "
+                f"border: none; background: transparent;"
+            )
+            row_w.addWidget(pct_lbl)
+
+            cap_lbl = QLabel(money(r["capital"]))
+            cap_lbl.setFixedWidth(90)
+            cap_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            cap_lbl.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 11px; "
+                f"border: none; background: transparent;"
+            )
+            row_w.addWidget(cap_lbl)
+
+            self.alloc_lay.addLayout(row_w)
+
+        if len(rows) > 8:
+            more = QLabel(f"+ {len(rows) - 8} more tickers")
+            more.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
+            )
+            self.alloc_lay.addWidget(more)
 
     def _clear_layout(self, lay):
         while lay.count():
@@ -781,6 +1023,7 @@ class MainWindow(QStackedWidget):
         self.setStyleSheet(f"background: {T.BG};")
         self.portfolio = None
         self.configure = None
+        self.detail    = None
         self._show_initial()
 
     def _show_initial(self):
@@ -810,6 +1053,7 @@ class MainWindow(QStackedWidget):
         self.portfolio = PortfolioScreen(creds, token)
         self.portfolio.logout_requested.connect(self._show_setup)
         self.portfolio.configure_requested.connect(self._show_configure)
+        self.portfolio.strategy_clicked.connect(self._show_detail)
         self.addWidget(self.portfolio)
         self.setCurrentWidget(self.portfolio)
 
@@ -831,6 +1075,36 @@ class MainWindow(QStackedWidget):
             self.configure.deleteLater()
             self.configure = None
 
+    def _show_detail(self, strategy):
+        if self.portfolio is None:
+            return
+        self.detail = StrategyDetailPage(strategy, self.portfolio)
+        self.detail.back_requested.connect(self._back_from_detail)
+        self.detail.reopen_requested.connect(self._reopen_detail)
+        self.addWidget(self.detail)
+        self.setCurrentWidget(self.detail)
+
+    def _reopen_detail(self, strategy):
+        """Tear down current detail + re-open for same strategy (picks up edits)."""
+        if self.detail:
+            self.removeWidget(self.detail)
+            self.detail.deleteLater()
+            self.detail = None
+        # Pull a fresh instance from the portfolio (reflects any saved edits)
+        fresh = next(
+            (i for i in self.portfolio.current_instances() if i.id == getattr(strategy, "id", None)),
+            strategy,
+        )
+        self._show_detail(fresh)
+
+    def _back_from_detail(self):
+        if self.portfolio:
+            self.setCurrentWidget(self.portfolio)
+        if self.detail:
+            self.removeWidget(self.detail)
+            self.detail.deleteLater()
+            self.detail = None
+
     def _clear_all(self):
         while self.count():
             w = self.widget(0)
@@ -838,6 +1112,7 @@ class MainWindow(QStackedWidget):
             w.deleteLater()
         self.portfolio = None
         self.configure = None
+        self.detail    = None
 
 
 if __name__ == "__main__":

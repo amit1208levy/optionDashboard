@@ -233,6 +233,38 @@ def get_transactions(token, account_number, per_page=250, max_pages=40):
     return items
 
 
+def get_market_metrics(token, symbols):
+    """
+    Returns {symbol: metrics_dict} with fields like
+      implied-volatility-index, implied-volatility-index-rank,
+      implied-volatility-percentile, beta, historical-volatility-30-day,
+      liquidity-rating, earnings, etc.
+    """
+    if not symbols:
+        return {}
+    # API accepts up to ~100 symbols per call
+    out = {}
+    unique = list({s for s in symbols if s})
+    for i in range(0, len(unique), 100):
+        chunk = unique[i:i+100]
+        try:
+            r = requests.get(
+                f"{BASE}/market-metrics",
+                headers=auth_headers(token),
+                params={"symbols": ",".join(chunk)},
+                timeout=15,
+            )
+        except requests.exceptions.RequestException:
+            continue
+        if r.status_code != 200:
+            continue
+        for it in r.json().get("data", {}).get("items", []) or []:
+            sym = it.get("symbol")
+            if sym:
+                out[sym] = it
+    return out
+
+
 def get_market_data(token, equity_options=None, future_options=None):
     """
     Snapshot quotes + Greeks for options. Returns {symbol: quote dict}.
