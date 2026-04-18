@@ -67,8 +67,11 @@ class PortfolioWorker(QThread):
                                 if p.is_option and p.instrument_type == "Equity Option"]
                 future_opts = [p.symbol for p in positions
                                 if p.is_option and p.instrument_type == "Future Option"]
+                equities    = [p.symbol for p in positions
+                                if not p.is_option and p.instrument_type == "Equity"]
                 quotes = api.get_market_data(
-                    self.token, equity_options=equity_opts, future_options=future_opts
+                    self.token, equity_options=equity_opts,
+                    future_options=future_opts, equities=equities,
                 )
                 for p in positions:
                     p.attach_quote(quotes.get(p.symbol))

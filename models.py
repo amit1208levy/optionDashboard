@@ -140,12 +140,15 @@ class Position:
         self.iv    = f("implied-volatility")
         self.underlying_price = f("underlying-price")
 
-        # Live mark — positions endpoint often returns 0 for futures options
+        # Live mark — positions endpoint often returns 0 for futures options;
+        # stocks return last/bid/ask rather than mark
         mark = f("mark")
-        if mark is None:
+        if mark is None or mark == 0:
             bid, ask = f("bid"), f("ask")
             if bid is not None and ask is not None:
                 mark = (bid + ask) / 2.0
+            elif f("last") is not None:
+                mark = f("last")
         if mark is not None and mark > 0:
             self.mark_price = mark
             self._recompute()
