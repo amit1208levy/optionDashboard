@@ -2,8 +2,6 @@
 import sys
 from datetime import datetime, timezone
 
-import webbrowser
-
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QStackedWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QComboBox,
@@ -917,7 +915,7 @@ class PortfolioScreen(QWidget):
     def _on_update_result(self, result, silent):
         self.update_btn.setEnabled(True)
         if result.get("available"):
-            self.update_btn.setText(f"⬇ v{result['latest']}")
+            self.update_btn.setText("⬇  Update")
             self.update_btn.setStyleSheet(
                 f"QPushButton {{ background: {T.PURPLE}; color: white; "
                 f"border: none; border-radius: 6px; padding: 0 10px; "
@@ -946,17 +944,20 @@ class PortfolioScreen(QWidget):
         lay.setContentsMargins(22, 20, 22, 20)
         lay.setSpacing(10)
 
-        hdr = QLabel(f"New version available: v{result['latest']}")
+        hdr = QLabel("New update available")
         hdr.setStyleSheet(
             f"color: {T.ACCENT}; font-size: 16px; font-weight: bold; border: none;"
         )
         lay.addWidget(hdr)
 
-        sub = QLabel(f"You're on v{VERSION}.")
+        sub = QLabel(
+            f"You're on {result.get('local') or VERSION} — "
+            f"latest is {result.get('latest') or '?'}."
+        )
         sub.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
         lay.addWidget(sub)
 
-        notes_lbl = QLabel("Release notes:")
+        notes_lbl = QLabel("Changes:")
         notes_lbl.setStyleSheet(
             f"color: {T.LABEL}; font-size: 11px; font-weight: bold; "
             f"border: none; margin-top: 6px;"
@@ -988,15 +989,32 @@ class PortfolioScreen(QWidget):
             f"border-radius: 6px; padding: 0 16px; font-weight: bold; }}"
             f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
         )
-        url = result.get("url") or ""
+        download.setText("⬇  Update now")
         def _go():
-            if url:
-                webbrowser.open(url)
+            download.setEnabled(False)
+            download.setText("Updating…")
+            ok, msg = updater.pull()
+            if not ok:
+                QMessageBox.warning(dlg, "Update failed", msg)
+                download.setEnabled(True)
+                download.setText("⬇  Update now")
+                return
+            QMessageBox.information(
+                dlg, "Update installed",
+                "The app will now relaunch with the new version.",
+            )
             dlg.accept()
+            self._relaunch()
         download.clicked.connect(_go)
         row.addWidget(download)
         lay.addLayout(row)
         dlg.exec()
+
+    def _relaunch(self):
+        import os, sys
+        here = os.path.dirname(os.path.abspath(__file__))
+        python = sys.executable
+        os.execv(python, [python, os.path.join(here, "app.py")])
 
     def _open_settings(self):
         if not self._accounts:

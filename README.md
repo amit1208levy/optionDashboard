@@ -2,21 +2,41 @@
 
 Desktop dashboard for managing a TastyTrade options portfolio.
 
-## Releasing a new version
+## Install (first time)
 
-1. Bump the version in [`version.py`](version.py) (e.g. `1.0.0` → `1.0.1`).
-2. Commit and push.
-3. Build the DMG locally:
-   ```bash
-   ./build.sh
-   ```
-4. Upload the DMG as a GitHub release:
-   ```bash
-   gh release create v1.0.1 dist/OptionsDashboard-1.0.1.dmg \
-     --title "v1.0.1" \
-     --notes "What changed in this release"
-   ```
+Requires Python 3.10+ and git.
 
-Every running copy of the app auto-checks GitHub releases on launch, and
-users get a "⬇ Update available" button in the header when a newer version
-is published.
+```bash
+git clone https://github.com/amit1208levy/optionDashboard.git
+cd optionDashboard
+./run.sh
+```
+
+The first run installs dependencies (PyQt6, requests, matplotlib) into your
+user site-packages, then launches the app.
+
+## Launch
+
+```bash
+./run.sh
+```
+
+## Updates
+
+The app checks GitHub on launch. When new commits are on `main`, a
+**⬇ Update** button appears in the header. Click it → **Update now** and
+the app pulls the new code and relaunches itself. No manual download,
+no Gatekeeper prompts.
+
+## Releasing a new version (maintainer)
+
+Just push to `main`. Every running copy will see the update on next launch.
+
+```bash
+git add -A
+git commit -m "your change"
+git push origin main
+```
+
+Bump `VERSION` in [`version.py`](version.py) for human-readable release notes,
+but the update check itself is commit-SHA based — any push triggers it.

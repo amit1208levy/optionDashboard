@@ -1,62 +1,74 @@
-"""GitHub Releases update checker — no auth needed for public repos."""
-import re
-import requests
+"""Git-based updater — check GitHub for new commits, pull, relaunch."""
+import os
+import subprocess
 
-from version import VERSION, GITHUB_OWNER, GITHUB_REPO
-
-RELEASES_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def _parse(v):
-    """'v1.2.3' or '1.2.3' → (1,2,3). Non-numeric chunks become 0."""
-    nums = re.findall(r"\d+", v or "")
-    return tuple(int(n) for n in nums) if nums else (0,)
+def _git(*args, timeout=15):
+    """Run a git command in the repo directory. Returns (ok, stdout, stderr)."""
+    try:
+        r = subprocess.run(
+            ["git", *args],
+            cwd=HERE,
+            capture_output=True, text=True,
+            timeout=timeout,
+        )
+        return r.returncode == 0, r.stdout.strip(), r.stderr.strip()
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return False, "", str(e)
 
 
-def is_newer(remote, local=VERSION):
-    return _parse(remote) > _parse(local)
+def is_git_repo():
+    ok, _, _ = _git("rev-parse", "--is-inside-work-tree")
+    return ok
 
 
 def check_latest():
     """
     Returns dict:
       { "available": bool,
-        "latest": "1.2.3" or "",
-        "url": download-URL or "",
-        "notes": release body,
-        "error": str }
-    Silent on network failure — returns available=False.
+        "latest": short-sha or "",
+        "local":  short-sha or "",
+        "notes":  recent commit subjects (joined),
+        "error":  str }
     """
-    try:
-        r = requests.get(RELEASES_URL, timeout=8,
-                         headers={"Accept": "application/vnd.github+json"})
-    except requests.exceptions.RequestException as e:
-        return {"available": False, "latest": "", "url": "", "notes": "", "error": str(e)}
+    if not is_git_repo():
+        return {"available": False, "latest": "", "local": "", "notes": "",
+                "error": "Not a git checkout — reinstall from GitHub."}
 
-    if r.status_code == 404:
-        return {"available": False, "latest": "", "url": "", "notes": "",
-                "error": "No releases published yet."}
-    if r.status_code != 200:
-        return {"available": False, "latest": "", "url": "", "notes": "",
-                "error": f"GitHub returned {r.status_code}"}
+    ok, _, err = _git("fetch", "--quiet", "origin")
+    if not ok:
+        return {"available": False, "latest": "", "local": "", "notes": "",
+                "error": f"Fetch failed: {err or 'network error'}"}
 
-    data = r.json() or {}
-    tag  = (data.get("tag_name") or "").lstrip("v")
-    body = data.get("body") or ""
+    ok, local, _   = _git("rev-parse", "--short", "HEAD")
+    ok2, remote, _ = _git("rev-parse", "--short", "@{u}")
+    if not ok or not ok2:
+        return {"available": False, "latest": "", "local": local, "notes": "",
+                "error": "Could not read git refs."}
 
-    # Prefer a .dmg asset; fall back to the release page URL
-    dmg = ""
-    for a in data.get("assets", []) or []:
-        name = (a.get("name") or "").lower()
-        if name.endswith(".dmg"):
-            dmg = a.get("browser_download_url") or ""
-            break
-    url = dmg or data.get("html_url") or ""
+    if local == remote:
+        return {"available": False, "latest": remote, "local": local,
+                "notes": "", "error": ""}
+
+    # Collect commit subjects between local and remote
+    _, log_out, _ = _git(
+        "log", "--pretty=format:• %s", f"{local}..{remote}"
+    )
 
     return {
-        "available": is_newer(tag),
-        "latest":    tag,
-        "url":       url,
-        "notes":     body,
+        "available": True,
+        "latest":    remote,
+        "local":     local,
+        "notes":     log_out or "(no commit messages)",
         "error":     "",
     }
+
+
+def pull():
+    """Pull the latest main. Returns (ok, message)."""
+    ok, out, err = _git("pull", "--ff-only", "origin", "main", timeout=60)
+    if ok:
+        return True, out or "Up to date."
+    return False, (err or out or "git pull failed.")
