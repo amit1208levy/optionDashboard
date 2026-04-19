@@ -894,7 +894,7 @@ class PortfolioScreen(QWidget):
             row_w.addWidget(bar_outer, 1)
 
             pct_lbl = QLabel(f"{r['pct']:.1f}%")
-            pct_lbl.setFixedWidth(55)
+            pct_lbl.setFixedWidth(60)
             pct_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
             pct_lbl.setStyleSheet(
                 f"color: {T.TEXT_DIM}; font-size: 12px; "
@@ -903,7 +903,7 @@ class PortfolioScreen(QWidget):
             row_w.addWidget(pct_lbl)
 
             cap_lbl = QLabel(money(r["capital"]))
-            cap_lbl.setFixedWidth(90)
+            cap_lbl.setFixedWidth(115)
             cap_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
             cap_lbl.setStyleSheet(
                 f"color: {T.MUTED}; font-size: 11px; "
