@@ -265,9 +265,9 @@ def get_market_metrics(token, symbols):
     return out
 
 
-def get_market_data(token, equity_options=None, future_options=None, equities=None):
+def get_market_data(token, equity_options=None, future_options=None, equities=None, futures=None):
     """
-    Snapshot quotes + Greeks for options and stocks. Returns {symbol: quote dict}.
+    Snapshot quotes + Greeks for options and stocks/futures. Returns {symbol: quote dict}.
     Silently returns {} on error (Greeks are a nice-to-have).
     """
     params = {}
@@ -277,6 +277,8 @@ def get_market_data(token, equity_options=None, future_options=None, equities=No
         params["future-option"] = ",".join(future_options)
     if equities:
         params["equity"] = ",".join(equities)
+    if futures:
+        params["future"] = ",".join(futures)
     if not params:
         return {}
     try:

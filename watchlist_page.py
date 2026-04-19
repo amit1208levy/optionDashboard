@@ -1,7 +1,35 @@
 """Watchlist page — track tickers by IV rank and size potential trades."""
+import re
 import api
 from models import symbol_ivr, symbol_ivp, symbol_beta, symbol_hv30
 import theme as T
+
+_FUT_MONTH = "FGHJKMNQUVXZ"
+
+def _has_price(quote):
+    """Return True if the quote dict contains a usable price."""
+    if not quote:
+        return False
+    for k in ("mark", "last", "bid", "ask"):
+        try:
+            if float(quote.get(k) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+def _normalize_ticker(text):
+    """
+    Collapse any futures contract symbol down to its root.
+    /MESU6 -> MES,  /6AH6 -> 6A,  AAPL -> AAPL
+    Also handles bare contract month: MESU6 -> MES
+    """
+    t = text.strip().upper().lstrip("/")
+    # Strip trailing month-code + 1-2 digit year (e.g. U6, H26)
+    m = re.match(rf"^([A-Z0-9]{{1,5}})[{_FUT_MONTH}]\d{{1,2}}$", t)
+    if m:
+        return m.group(1)
+    return t
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
@@ -26,7 +54,18 @@ class _FetchWorker(QThread):
             self.done.emit({}, {})
             return
         metrics = api.get_market_metrics(self.token, self.tickers)
-        quotes  = api.get_market_data(self.token, equities=self.tickers)
+        # Try equity quotes first
+        quotes = api.get_market_data(self.token, equities=self.tickers)
+        # For any ticker that got no price, retry as a futures root (/MES, /6A …)
+        missing = [t for t in self.tickers
+                   if not _has_price(quotes.get(t))]
+        if missing:
+            fut_syms = ["/" + t for t in missing]
+            fut_quotes = api.get_market_data(self.token, futures=fut_syms)
+            for sym, q in fut_quotes.items():
+                root = sym.lstrip("/")
+                if root in missing:
+                    quotes[root] = q
         self.done.emit(metrics, quotes)
 
 
@@ -381,8 +420,8 @@ class WatchlistPage(QWidget):
         hl.addStretch()
 
         self.add_input = QLineEdit()
-        self.add_input.setPlaceholderText("Add ticker  (e.g. AAPL)")
-        self.add_input.setFixedWidth(200)
+        self.add_input.setPlaceholderText("Add ticker  (e.g. AAPL, MES, 6A)")
+        self.add_input.setFixedWidth(220)
         self.add_input.setFixedHeight(32)
         self.add_input.returnPressed.connect(self._add_ticker)
         hl.addWidget(self.add_input)
@@ -430,7 +469,7 @@ class WatchlistPage(QWidget):
     # ── Data ─────────────────────────────────────────────────────────────────
 
     def _add_ticker(self):
-        ticker = self.add_input.text().strip().upper()
+        ticker = _normalize_ticker(self.add_input.text())
         if not ticker or ticker in self._tickers:
             self.add_input.clear()
             return
