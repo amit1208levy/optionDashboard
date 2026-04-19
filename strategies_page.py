@@ -323,7 +323,7 @@ class PastLegPickerDialog(QDialog):
         self.history = history
         self.setStyleSheet(T.BASE_STYLE)
         self.setWindowTitle("Add past closed legs")
-        self.setMinimumSize(560, 520)
+        self.setMinimumSize(600, 560)
 
         strat_names = {s["id"]: (s.get("name") or "") for s in strategies_raw}
 
@@ -343,28 +343,52 @@ class PastLegPickerDialog(QDialog):
         sub.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
         root.addWidget(sub)
 
+        # Search bar
+        self._search = QLineEdit()
+        self._search.setPlaceholderText("Search by ticker, type, date…")
+        self._search.setClearButtonEnabled(True)
+        self._search.textChanged.connect(self._filter)
+        root.addWidget(self._search)
+
+        # Count label
+        self._count_lbl = QLabel("")
+        self._count_lbl.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none;"
+        )
+        root.addWidget(self._count_lbl)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        box = QWidget()
-        vl = QVBoxLayout(box)
-        vl.setContentsMargins(4, 4, 4, 4)
-        vl.setSpacing(4)
+        self._box = QWidget()
+        self._vl = QVBoxLayout(self._box)
+        self._vl.setContentsMargins(4, 4, 4, 4)
+        self._vl.setSpacing(4)
 
-        self._rows = []
-        pool = sorted(
+        self._rows = []       # list of (QFrame row_w, QCheckBox cb, str search_text)
+        self._pool = sorted(
             [h for h in history if h.get("strategy_id") != strategy_id],
             key=lambda e: e.get("closed_at") or "",
             reverse=True,
         )
 
-        if not pool:
+        if not self._pool:
             note = QLabel("No closed legs recorded yet. Legs auto-log here when they "
                           "leave the portfolio (e.g. expired, closed, or rolled).")
             note.setWordWrap(True)
             note.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; padding: 18px;")
-            vl.addWidget(note)
+            self._vl.addWidget(note)
         else:
-            for entry in pool:
+            for entry in self._pool:
+                label_text = _history_label(entry)
+                search_text = " ".join([
+                    entry.get("root") or "",
+                    entry.get("symbol") or "",
+                    entry.get("call_put") or "",
+                    {"C": "Call", "P": "Put"}.get(entry.get("call_put"), "Stock"),
+                    str(entry.get("strike") or ""),
+                    (entry.get("closed_at") or "")[:10],
+                ]).lower()
+
                 row_w = QFrame()
                 row_w.setStyleSheet(
                     f"QFrame {{ background: #12151d; border: 1px solid {T.BORDER}; "
@@ -373,7 +397,8 @@ class PastLegPickerDialog(QDialog):
                 )
                 hl = QHBoxLayout(row_w)
                 hl.setContentsMargins(10, 6, 10, 6)
-                cb = QCheckBox(_history_label(entry))
+
+                cb = QCheckBox(label_text)
                 cb.setStyleSheet(
                     f"QCheckBox {{ color: {T.TEXT}; font-size: 12px; background: transparent; }}"
                 )
@@ -403,11 +428,11 @@ class PastLegPickerDialog(QDialog):
                 )
                 hl.addWidget(pl)
 
-                vl.addWidget(row_w)
-                self._rows.append(cb)
+                self._vl.addWidget(row_w)
+                self._rows.append((row_w, cb, search_text))
 
-        vl.addStretch()
-        scroll.setWidget(box)
+        self._vl.addStretch()
+        scroll.setWidget(self._box)
         root.addWidget(scroll, 1)
 
         btns = QDialogButtonBox(
@@ -417,8 +442,28 @@ class PastLegPickerDialog(QDialog):
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
 
+        self._update_count()
+
+    def _filter(self, text):
+        q = text.strip().lower()
+        for row_w, cb, search_text in self._rows:
+            visible = not q or q in search_text
+            row_w.setVisible(visible)
+        self._update_count()
+
+    def _update_count(self):
+        q = self._search.text().strip().lower()
+        visible = sum(1 for row_w, _, st in self._rows if not q or q in st)
+        total   = len(self._rows)
+        if total == 0:
+            self._count_lbl.setText("")
+        elif q:
+            self._count_lbl.setText(f"{visible} of {total} legs match")
+        else:
+            self._count_lbl.setText(f"{total} closed leg{'s' if total != 1 else ''}")
+
     def selected_symbols(self):
-        return [cb.property("symbol") for cb in self._rows if cb.isChecked()]
+        return [cb.property("symbol") for _, cb, _ in self._rows if cb.isChecked()]
 
 
 # ── Active strategy row ──────────────────────────────────────────────────────
