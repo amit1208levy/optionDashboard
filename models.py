@@ -856,6 +856,41 @@ def _capital_for(strategy):
     return _notional_capital(strategy)
 
 
+def strategy_allocation(instances, unassigned_groups, overrides_by_id=None):
+    """
+    Like capital_allocation but returns one row per strategy (not per ticker).
+    Each row: {id, name, root, capital, pct, pnl}.
+    """
+    overrides_by_id = overrides_by_id or {}
+    rows = []
+    for inst in instances:
+        cap = overrides_by_id.get(inst.id)
+        if cap is None:
+            cap = _capital_for(inst)
+        rows.append({
+            "id":      inst.id,
+            "name":    inst.name,
+            "root":    inst.root or "—",
+            "capital": cap,
+            "pct":     0.0,
+            "pnl":     inst.pnl,
+        })
+    for g in unassigned_groups:
+        rows.append({
+            "id":      g.id,
+            "name":    g.auto_name,
+            "root":    g.root or "—",
+            "capital": _capital_for(g),
+            "pct":     0.0,
+            "pnl":     g.pnl,
+        })
+    total = sum(r["capital"] for r in rows)
+    for r in rows:
+        r["pct"] = r["capital"] / total * 100 if total else 0.0
+    rows.sort(key=lambda x: x["capital"], reverse=True)
+    return rows, total
+
+
 def capital_allocation(instances, unassigned_groups, overrides_by_id=None):
     """
     Return a list of {"root": str, "capital": float, "pct": float}
