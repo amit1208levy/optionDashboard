@@ -921,19 +921,44 @@ def portfolio_greeks(positions, metrics_by_root=None):
 
 
 def _notional_capital(strategy):
-    """Fallback capital estimate: short-option strike notional + long-option cost."""
-    total = 0.0
+    """
+    Margin estimate for undefined-risk strategies.
+
+    Futures options  → underlying_price × multiplier × 12% × qty  (SPAN approximation)
+    Equity options   → strike × 100 × 20% × qty                   (naked margin rule)
+    Stock positions  → abs(market_value)
+
+    We take the LARGEST single short leg (not their sum) since the broker
+    nets offsetting positions (strangle = one margin block, not two).
+    Long legs add their cost basis on top.
+    """
+    best = 0.0
+    long_cost = 0.0
+
     for leg in strategy.legs:
         mult = leg.multiplier or 1
         qty  = leg.quantity
-        if leg.is_option:
-            if leg.is_long:
-                total += leg.cost_basis
-            else:
-                total += (leg.strike or 0) * qty * mult
+
+        if not leg.is_option:
+            best += abs(leg.market_value)
+            continue
+
+        if leg.is_long:
+            long_cost += leg.cost_basis
+            continue
+
+        # --- short option ---
+        if leg.instrument_type == "Future Option":
+            # SPAN-style: ~12% of underlying notional per contract
+            ref = leg.underlying_price or leg.strike or 0
+            cap = ref * mult * 0.12 * qty
         else:
-            total += abs(leg.market_value)
-    return total
+            # Naked equity option: ~20% of strike × 100 shares
+            cap = (leg.strike or 0) * min(mult, 100) * 0.20 * qty
+
+        best = max(best, cap)
+
+    return best + long_cost
 
 
 def _capital_for(strategy):
