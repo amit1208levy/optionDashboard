@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 import api
 import theme as T
 from models import (
-    StrategyInstance, strategy_extremes, probability_of_profit,
+    StrategyInstance, strategy_extremes, probability_of_profit, capital_for_strategy,
     strategy_performance, symbol_ivr, symbol_ivp, symbol_beta, symbol_hv30,
     scenario_pnl
 )
@@ -322,16 +322,7 @@ class StrategyDetailPage(QWidget):
         be_text = "  /  ".join(f"${b:,.2f}" for b in breakevens[:2]) if breakevens else "—"
         cell(3, "Breakeven", be_text, T.TEXT_DIM)
 
-        # Reward-to-risk uses capital override when present
-        if (max_profit not in (None, float("inf"), 0)
-                and cap_required not in (None, 0)):
-            rr = abs(max_profit) / abs(cap_required)
-            rr_text = f"{rr:.2f} : 1"
-        else:
-            rr_text = "—"
-        cell(4, "Reward : Risk", rr_text, T.TEXT_DIM)
-
-        for i in range(5):
+        for i in range(4):
             grid.setColumnStretch(i, 1)
 
         lay.addLayout(grid)
@@ -345,9 +336,11 @@ class StrategyDetailPage(QWidget):
         if override is not None:
             return override
         _, max_loss, _ = strategy_extremes(self.strategy)
-        if max_loss is None or max_loss == float("-inf"):
-            return None
-        return abs(max_loss)
+        if max_loss is not None and max_loss != float("-inf"):
+            return abs(max_loss)
+        # Undefined-risk: use notional estimate (short-strike margin approx)
+        est = capital_for_strategy(self.strategy)
+        return est if est else None
 
     def _capital_override(self):
         if not isinstance(self.strategy, StrategyInstance):
@@ -458,7 +451,6 @@ class StrategyDetailPage(QWidget):
         items = [
             ("Δ Delta",  fmt_num(s.net_delta, 2, signed=True),
                 pnl_color(s.net_delta) if s.net_delta else T.TEXT_DIM),
-            ("Γ Gamma",  fmt_num(s.net_gamma, 2, signed=True), T.TEXT_DIM),
             ("Θ Theta",  fmt_num(s.net_theta, 2, signed=True),
                 pnl_color(s.net_theta) if s.net_theta else T.TEXT_DIM),
             ("V Vega",   fmt_num(s.net_vega,  2, signed=True), T.TEXT_DIM),

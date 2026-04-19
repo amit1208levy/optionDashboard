@@ -376,7 +376,36 @@ def _norm_cdf(z):
     return 0.5 * (1 + math.erf(z / math.sqrt(2)))
 
 
-def probability_of_profit(strategy, iv_fallback=0.30):
+def _iv_from_delta(delta, s0, strike, dte, is_call):
+    """
+    Approximate IV from Black-Scholes delta via bisection (r=0 model).
+    Returns IV or None if solution not found.
+    """
+    if not all([delta, s0, strike, dte]) or dte <= 0:
+        return None
+    T = dte / 365.0
+    abs_delta = abs(delta)
+    if abs_delta <= 0 or abs_delta >= 1:
+        return None
+    import math as _math
+    from_iv, to_iv = 0.001, 5.0
+    for _ in range(60):
+        mid = (from_iv + to_iv) / 2.0
+        sigma_T = mid * _math.sqrt(T)
+        if sigma_T == 0:
+            break
+        d1 = (_math.log(s0 / strike) + 0.5 * mid * mid * T) / sigma_T
+        model_delta = _norm_cdf(d1) if is_call else _norm_cdf(d1) - 1.0
+        if abs(abs(model_delta) - abs_delta) < 1e-5:
+            return mid
+        if abs(model_delta) > abs_delta:
+            to_iv = mid
+        else:
+            from_iv = mid
+    return (from_iv + to_iv) / 2.0
+
+
+def probability_of_profit(strategy, iv_fallback=0.20):
     """
     Estimate P(strategy P&L > 0 at expiration) as a percentage, or None if
     we lack the inputs. Uses a log-normal model for the underlying at expiry.
@@ -403,9 +432,26 @@ def probability_of_profit(strategy, iv_fallback=0.30):
         if strikes:
             s0 = (min(strikes) + max(strikes)) / 2.0
 
-    # Volatility: average IV of legs that have one; else fallback
-    ivs = [l.iv for l in legs if l.iv]
-    iv = (sum(ivs) / len(ivs)) if ivs else iv_fallback
+    dte = strategy.dte
+
+    # Volatility: use leg IV directly, else infer from delta, else fallback
+    ivs = [l.iv for l in legs if l.iv and l.iv > 0]
+    if ivs:
+        iv = sum(ivs) / len(ivs)
+    elif s0 and dte:
+        # Infer IV from delta for each leg that has both delta and strike
+        inferred = []
+        for l in legs:
+            if l.delta is not None and l.strike and s0:
+                iv_est = _iv_from_delta(
+                    l.delta, s0, l.strike, dte,
+                    is_call=(l.call_put == "C"),
+                )
+                if iv_est:
+                    inferred.append(iv_est)
+        iv = sum(inferred) / len(inferred) if inferred else iv_fallback
+    else:
+        iv = iv_fallback
 
     dte = strategy.dte
 
@@ -854,6 +900,11 @@ def _capital_for(strategy):
     if ml is not None and ml != float("-inf"):
         return abs(ml)
     return _notional_capital(strategy)
+
+
+def capital_for_strategy(strategy):
+    """Public wrapper around _capital_for."""
+    return _capital_for(strategy)
 
 
 def strategy_allocation(instances, unassigned_groups, overrides_by_id=None):
