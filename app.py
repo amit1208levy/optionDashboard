@@ -15,7 +15,7 @@ import updater
 from version import VERSION
 from models import (
     Position, StrategyInstance, unassigned_positions, group_unassigned,
-    build_snapshot, detect_closures, portfolio_greeks, capital_allocation
+    build_snapshot, detect_closures, portfolio_greeks,
 )
 from strategy_card import StrategyCard, pnl_color, money, fmt_num
 from strategies_page import ConfigurePage
@@ -329,17 +329,6 @@ class PortfolioScreen(QWidget):
             tile = self._make_tile(label)
             self.greek_tiles[key] = tile
             self.greeks_row.addWidget(tile["frame"])
-
-        self.alloc_header = self._section_header("Capital by Ticker")
-        self.body.addWidget(self.alloc_header)
-        self.alloc_card = QFrame()
-        self.alloc_card.setStyleSheet(
-            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; border-radius: 12px; }}"
-        )
-        self.alloc_lay = QVBoxLayout(self.alloc_card)
-        self.alloc_lay.setContentsMargins(18, 14, 18, 16)
-        self.alloc_lay.setSpacing(6)
-        self.body.addWidget(self.alloc_card)
 
         self.my_header  = self._section_header("My Strategies")
         self.body.addWidget(self.my_header)
@@ -767,8 +756,6 @@ class PortfolioScreen(QWidget):
         unassigned = group_unassigned(leftover)
 
         self._render_greeks(positions, metrics)
-        self._render_allocation(instances, unassigned)
-
 
         total_pnl = sum(i.pnl for i in instances) + sum(s.pnl for s in unassigned)
         self.pnl_total_lbl.setText(money(total_pnl, signed=True))
@@ -833,89 +820,6 @@ class PortfolioScreen(QWidget):
                 f"color: {color}; font-size: 18px; font-weight: bold; "
                 f"border: none; background: transparent;"
             )
-
-    def _render_allocation(self, instances, unassigned):
-        self._clear_layout(self.alloc_lay)
-        overrides = {r["id"]: r["capital_override"]
-                     for r in self.strategies_raw
-                     if r.get("capital_override") is not None}
-        rows, total = capital_allocation(instances, unassigned, overrides)
-
-        if not rows or total <= 0:
-            empty = QLabel("No capital allocated.")
-            empty.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 12px; border: none; background: transparent;"
-            )
-            self.alloc_lay.addWidget(empty)
-            return
-
-        header = QLabel(f"Total deployed: {money(total)}")
-        header.setStyleSheet(
-            f"color: {T.TEXT_DIM}; font-size: 12px; font-weight: bold; "
-            f"border: none; background: transparent;"
-        )
-        self.alloc_lay.addWidget(header)
-
-        top_rows = rows[:8]
-        for r in top_rows:
-            row_w = QHBoxLayout()
-            row_w.setSpacing(10)
-            name = QLabel(r["root"])
-            name.setFixedWidth(70)
-            name.setStyleSheet(
-                f"color: {T.TEXT}; font-size: 12px; font-weight: bold; "
-                f"border: none; background: transparent;"
-            )
-            row_w.addWidget(name)
-
-            bar_outer = QFrame()
-            bar_outer.setFixedHeight(12)
-            bar_outer.setStyleSheet(
-                f"QFrame {{ background: #12151d; border: 1px solid {T.BORDER}; "
-                f"border-radius: 6px; }}"
-            )
-            bar_lay = QHBoxLayout(bar_outer)
-            bar_lay.setContentsMargins(0, 0, 0, 0)
-            bar_lay.setSpacing(0)
-            fill = QFrame()
-            fill_color = T.RED if r["pct"] >= 40 else (T.YELLOW if r["pct"] >= 20 else T.PURPLE)
-            fill.setStyleSheet(
-                f"QFrame {{ background: {fill_color}; border: none; border-radius: 5px; }}"
-            )
-            stretch_fill = int(max(1, round(r["pct"] * 10)))
-            stretch_rest = int(max(1, round((100 - r["pct"]) * 10)))
-            bar_lay.addWidget(fill, stretch_fill)
-            spacer = QWidget()
-            spacer.setStyleSheet("background: transparent;")
-            bar_lay.addWidget(spacer, stretch_rest)
-            row_w.addWidget(bar_outer, 1)
-
-            pct_lbl = QLabel(f"{r['pct']:.1f}%")
-            pct_lbl.setFixedWidth(60)
-            pct_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            pct_lbl.setStyleSheet(
-                f"color: {T.TEXT_DIM}; font-size: 12px; "
-                f"border: none; background: transparent;"
-            )
-            row_w.addWidget(pct_lbl)
-
-            cap_lbl = QLabel(money(r["capital"]))
-            cap_lbl.setFixedWidth(115)
-            cap_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            cap_lbl.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 11px; "
-                f"border: none; background: transparent;"
-            )
-            row_w.addWidget(cap_lbl)
-
-            self.alloc_lay.addLayout(row_w)
-
-        if len(rows) > 8:
-            more = QLabel(f"+ {len(rows) - 8} more tickers")
-            more.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
-            )
-            self.alloc_lay.addWidget(more)
 
     def _clear_layout(self, lay):
         while lay.count():

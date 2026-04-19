@@ -856,10 +856,13 @@ def portfolio_greeks(positions, metrics_by_root=None):
         if not p.is_option:
             continue
         sign = p.sign  # +1 long / -1 short
-        d = _to_float(p.delta) * p.quantity * 100 * sign
-        g = _to_float(p.gamma) * p.quantity * 100 * sign
-        t = _to_float(p.theta) * p.quantity * 100 * sign
-        v = _to_float(p.vega)  * p.quantity * 100 * sign
+        # Equity options: greeks are per-share; 100 shares per contract.
+        # Futures options: greeks are already per-contract; no extra multiplier.
+        mult = 100 if p.instrument_type == "Equity Option" else 1
+        d = _to_float(p.delta) * p.quantity * mult * sign
+        g = _to_float(p.gamma) * p.quantity * mult * sign
+        t = _to_float(p.theta) * p.quantity * mult * sign
+        v = _to_float(p.vega)  * p.quantity * mult * sign
         net_delta += d
         net_gamma += g
         net_theta += t
