@@ -585,6 +585,7 @@ def build_snapshot(positions):
             "open_price":  p.avg_open_price,
             "mark":        p.mark_price,
             "multiplier":  p.multiplier,
+            "pnl":         p.pnl,       # live P&L stored so detect_closures can use it
             "instrument":  p.instrument_type,
             "call_put":    p.call_put,
             "strike":      p.strike,
@@ -593,6 +594,28 @@ def build_snapshot(positions):
             "root":        p.root,
         }
     return snap
+
+
+def _tx_dollar_value(t):
+    """
+    Return the signed dollar value of a transaction.
+    TastyTrade's `value` field is the authoritative dollar amount.
+    Credit = money in (positive), Debit = money out (negative).
+    Falls back to price × qty × multiplier if value is missing.
+    """
+    raw = t.get("value")
+    if raw is not None:
+        try:
+            v = abs(float(raw))
+            effect = (t.get("value-effect") or "").lower()
+            return v if "credit" in effect else -v
+        except (TypeError, ValueError):
+            pass
+    # fallback
+    qty  = abs(float(t.get("quantity") or 0))
+    price = float(t.get("price") or 0)
+    mult  = float(t.get("multiplier") or 1) or 1
+    return qty * price * mult
 
 
 def transactions_to_closed_lots(transactions):
@@ -617,6 +640,8 @@ def transactions_to_closed_lots(transactions):
         root   = normalize_root(root_sym) or root_sym
         cp, k  = parse_option_symbol(sym)
         instr  = t.get("instrument-type") or ""
+        # Signed dollar value: positive = cash received, negative = cash paid
+        dollar_val = _tx_dollar_value(t)
 
         is_open_action   = "to open" in al
         is_close_action  = (
@@ -629,15 +654,22 @@ def transactions_to_closed_lots(transactions):
                 "qty": qty, "price": price, "when": when,
                 "sign": side_sign, "multiplier": mult,
                 "root": root, "call_put": cp, "strike": k, "instrument": instr,
+                # dollar_val is negative for buy (debit), positive for sell (credit)
+                "dollar_val": dollar_val,
             })
         elif is_close_action:
             close_price = 0.0 if "expir" in al else price
+            close_dollar = 0.0 if "expir" in al else dollar_val
             remaining = qty
             open_q = queues.get(sym, [])
             while remaining > 0 and open_q:
                 lot = open_q[0]
                 take = min(remaining, lot["qty"])
-                pnl = lot["sign"] * take * lot["multiplier"] * (close_price - lot["price"])
+                frac = take / lot["qty"] if lot["qty"] else 1.0
+                # P&L = what we got on open + what we got on close
+                # Short: open_dollar > 0 (credit), close_dollar < 0 (debit to buy back)
+                # Long:  open_dollar < 0 (debit),  close_dollar > 0 (credit on sale)
+                pnl = lot["dollar_val"] * frac + close_dollar * (take / qty if qty else 1.0)
                 lots.append({
                     "symbol":      sym,
                     "root":        lot["root"],
@@ -656,6 +688,7 @@ def transactions_to_closed_lots(transactions):
                     "instrument":  lot["instrument"],
                 })
                 lot["qty"] -= take
+                lot["dollar_val"] *= (1 - frac)
                 remaining -= take
                 if lot["qty"] <= 1e-9:
                     open_q.pop(0)
@@ -701,9 +734,14 @@ def detect_closures(prev_snap, current_symbols, strategy_map, now_iso):
         op    = d.get("open_price") or 0
         mark  = d.get("mark") or 0
         mult  = d.get("multiplier") or 1
-        notional_open  = sign * qty * mult * op
-        notional_close = sign * qty * mult * mark
-        pnl = notional_close - notional_open
+        # Prefer the live P&L stored in the snapshot (handles futures multiplier
+        # correctly via position.pnl); fall back to price-based calc for old snapshots.
+        if "pnl" in d:
+            pnl = d["pnl"]
+        else:
+            notional_open  = sign * qty * mult * op
+            notional_close = sign * qty * mult * mark
+            pnl = notional_close - notional_open
         closures.append({
             "symbol":       sym,
             "root":         d.get("root"),
