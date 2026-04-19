@@ -332,6 +332,141 @@ TEMPLATES: List[Template] = [
         ],
         metrics=["max_loss", "delta", "theta", "vega", "iv", "dte"],
     ),
+    Template(
+        key="short_straddle",
+        name="Short Straddle",
+        category="Volatility",
+        outlook="Neutral",
+        risk="Undefined",
+        description=(
+            "Sell an ATM call and ATM put at the same strike and expiry. "
+            "Collects maximum premium; profits if the underlying stays near the strike."
+        ),
+        setup="Short Call (ATM) + Short Put (same strike, ATM)",
+        max_profit="Net credit",
+        max_loss="Unlimited (both directions)",
+        capital_note="Margin-intensive. Higher premium than strangle but narrower profit zone.",
+        ideal_when="High IV, very neutral outlook, expecting a large IV crush.",
+        legs=[
+            LegSpec("Short Put (ATM)",  "short", "P", strike_rank=1),
+            LegSpec("Short Call (ATM)", "short", "C", strike_rank=1),
+        ],
+        metrics=["max_profit", "break_even", "pop", "delta", "theta", "vega",
+                 "iv", "capital_req", "dte"],
+    ),
+    Template(
+        key="jade_lizard",
+        name="Jade Lizard",
+        category="Income",
+        outlook="Neutral-to-Bullish",
+        risk="Undefined (downside only)",
+        description=(
+            "Short put + short call spread. Collect enough credit to eliminate upside risk "
+            "(credit > call spread width). Downside risk is undefined if stock falls through the short put."
+        ),
+        setup="Short Put (low K) + Short Call (mid K) + Long Call (high K)",
+        max_profit="Net credit received",
+        max_loss="Downside: short put strike − net credit (large). Upside: none if credit > spread width.",
+        capital_note="Margin for short put + spread width. Similar to a strangle with capped upside.",
+        ideal_when="Neutral-to-slightly-bullish; high IVR; stock that has sold off and IV is elevated.",
+        legs=[
+            LegSpec("Short Put",            "short", "P", strike_rank=1),
+            LegSpec("Short Call",           "short", "C", strike_rank=2),
+            LegSpec("Long Call (OTM wing)", "long",  "C", strike_rank=3),
+        ],
+        metrics=["max_profit", "break_even", "pop", "capital_req",
+                 "delta", "theta", "vega", "iv", "dte"],
+    ),
+    Template(
+        key="reverse_jade_lizard",
+        name="Reverse Jade Lizard",
+        category="Income",
+        outlook="Neutral-to-Bearish",
+        risk="Undefined (upside only)",
+        description=(
+            "Short call + short put spread. Collect enough credit to eliminate downside risk "
+            "(credit > put spread width). Upside risk is undefined if stock rallies through the short call."
+        ),
+        setup="Long Put (low K) + Short Put (mid K) + Short Call (high K)",
+        max_profit="Net credit received",
+        max_loss="Upside: unlimited above short call. Downside: none if credit > spread width.",
+        capital_note="Margin for short call + spread width.",
+        ideal_when="Neutral-to-slightly-bearish; high IVR; stock that has rallied and IV is elevated.",
+        legs=[
+            LegSpec("Long Put (OTM wing)", "long",  "P", strike_rank=1),
+            LegSpec("Short Put",           "short", "P", strike_rank=2),
+            LegSpec("Short Call",          "short", "C", strike_rank=3),
+        ],
+        metrics=["max_profit", "break_even", "pop", "capital_req",
+                 "delta", "theta", "vega", "iv", "dte"],
+    ),
+    Template(
+        key="bwb_put",
+        name="Broken Wing Butterfly (Puts)",
+        category="Volatility",
+        outlook="Neutral-to-Bearish",
+        risk="Defined",
+        description=(
+            "Asymmetric put butterfly with unequal wing widths, typically entered for a net credit. "
+            "The wider lower wing creates a credit; zero upside risk when structured correctly."
+        ),
+        setup="Long Put (lowest K) + Short 2× Put (mid K) + Long Put (highest K near ATM)",
+        max_profit="Credit received + narrow wing width (underlying pins at short strike)",
+        max_loss="Wide wing − narrow wing − credit received (loss at lowest strike)",
+        capital_note="Usually entered for a credit. Capital = difference in wing widths.",
+        ideal_when="High IV, neutral-to-slightly-bearish, want defined risk with a credit entry.",
+        legs=[
+            LegSpec("Long Put (far wing)",   "long",  "P", strike_rank=1),
+            LegSpec("Short Put (body) ×2",   "short", "P", strike_rank=2, qty=2),
+            LegSpec("Long Put (near wing)",  "long",  "P", strike_rank=3),
+        ],
+        metrics=["max_profit", "max_loss", "break_even", "pop", "capital_req",
+                 "delta", "theta", "iv", "dte"],
+    ),
+    Template(
+        key="put_ratio_spread",
+        name="Put Front Ratio Spread",
+        category="Income",
+        outlook="Neutral-to-Bearish",
+        risk="Undefined (downside)",
+        description=(
+            "Buy one put closer to ATM, sell two puts further OTM. Typically entered for a net credit. "
+            "Max profit at the short put strike; undefined risk if stock falls below both short puts."
+        ),
+        setup="Long Put (higher K) + Short 2× Put (lower K)",
+        max_profit="Strike width + net credit (underlying pins at short put strike)",
+        max_loss="Undefined below short strike breakeven",
+        capital_note="Margin for the extra naked put. Credit offsets premium on the long put.",
+        ideal_when="High IV, neutral-to-moderately bearish, expecting stock to settle near OTM strikes.",
+        legs=[
+            LegSpec("Short Put ×2 (low K)", "short", "P", strike_rank=1, qty=2),
+            LegSpec("Long Put (high K)",    "long",  "P", strike_rank=2),
+        ],
+        metrics=["max_profit", "break_even", "pop", "capital_req",
+                 "delta", "theta", "vega", "iv", "dte"],
+    ),
+    Template(
+        key="call_ratio_spread",
+        name="Call Front Ratio Spread",
+        category="Income",
+        outlook="Neutral-to-Bullish",
+        risk="Undefined (upside)",
+        description=(
+            "Buy one call closer to ATM, sell two calls further OTM. Typically entered for a net credit. "
+            "Max profit at the short call strike; undefined risk if stock rallies past both short calls."
+        ),
+        setup="Long Call (lower K) + Short 2× Call (higher K)",
+        max_profit="Strike width + net credit (underlying pins at short call strike)",
+        max_loss="Undefined above short strike breakeven",
+        capital_note="Margin for the extra naked call. Credit offsets premium on the long call.",
+        ideal_when="High IV, neutral-to-moderately bullish, expecting stock to settle near OTM strikes.",
+        legs=[
+            LegSpec("Long Call (low K)",     "long",  "C", strike_rank=1),
+            LegSpec("Short Call ×2 (high K)","short", "C", strike_rank=2, qty=2),
+        ],
+        metrics=["max_profit", "break_even", "pop", "capital_req",
+                 "delta", "theta", "vega", "iv", "dte"],
+    ),
 ]
 
 
