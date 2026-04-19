@@ -21,78 +21,308 @@ from PyQt6.QtWidgets import (
 )
 
 
-# ── Heatmap helper (also imported by app.py) ─────────────────────────────────
+# ── Calendar card ─────────────────────────────────────────────────────────────
 
-def build_heatmap_canvas(history):
-    """
-    Build and return a matplotlib FigureCanvas calendar heatmap of daily P&L.
-    Returns None if there are no closed trades.
-    """
-    today = date.today()
-    start = today - timedelta(weeks=52)
-    daily = {}
-    for lot in history:
-        raw = lot.get("closed_at") or lot.get("close_date") or ""
-        try:
-            d = date.fromisoformat(str(raw)[:10])
-        except ValueError:
-            continue
-        if d >= start:
-            daily[d] = daily.get(d, 0.0) + float(lot.get("pnl") or 0)
+class CalendarCard(QFrame):
+    """Collapsible P&L calendar with hover details, expiration + earnings markers."""
 
-    if not daily:
-        return None
+    NUM_WEEKS = 53
 
-    start_dow = start.weekday()
-    num_weeks = 53
-    grid = np.full((7, num_weeks), np.nan)
-    for day_off in range((today - start).days + 1):
-        d   = start + timedelta(days=day_off)
-        col = (day_off + start_dow) // 7
-        row = d.weekday()
-        if col < num_weeks:
-            grid[row, col] = daily.get(d, np.nan)
+    def __init__(self, history, metrics=None, parent=None):
+        super().__init__(parent)
+        self._metrics  = metrics or {}
+        self._expanded = False
 
-    fig, ax = plt.subplots(figsize=(14, 1.8))
-    fig.patch.set_facecolor("#161928")
-    ax.set_facecolor("#161928")
+        today = date.today()
+        self._start    = today - timedelta(weeks=52)
+        self._today    = today
+        self._start_dow = self._start.weekday()
 
-    vmax = max(abs(v) for v in daily.values())
-    vmax = max(vmax, 1)
+        # Precompute daily totals and per-day trade lists
+        self._daily   = {}   # date -> float (total P&L)
+        self._entries = {}   # date -> list[lot]
+        for lot in history:
+            raw = lot.get("closed_at") or lot.get("close_date") or ""
+            try:
+                d = date.fromisoformat(str(raw)[:10])
+            except ValueError:
+                continue
+            if d >= self._start:
+                self._daily[d]   = self._daily.get(d, 0.0) + float(lot.get("pnl") or 0)
+                self._entries.setdefault(d, []).append(lot)
 
-    norm    = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
-    masked  = np.ma.masked_invalid(grid)
-    ax.imshow(masked, cmap="RdYlGn", norm=norm, aspect="auto",
-              interpolation="nearest")
+        self._expirations = self._calc_expirations()
+        self._earnings    = self._calc_earnings()
 
-    nan_overlay = np.where(np.isnan(grid), 1.0, np.nan)
-    ax.imshow(nan_overlay, cmap=ListedColormap(["#1a1d2e"]),
-              aspect="auto", interpolation="nearest", vmin=0, vmax=1)
+        self.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 12px; }}"
+        )
+        main_lay = QVBoxLayout(self)
+        main_lay.setContentsMargins(0, 0, 0, 0)
+        main_lay.setSpacing(0)
 
-    # Month labels
-    cur_month, month_labels, month_cols = None, [], []
-    for day_off in range((today - start).days + 1):
-        d   = start + timedelta(days=day_off)
-        col = (day_off + start_dow) // 7
-        if d.month != cur_month and col < num_weeks:
-            month_labels.append(d.strftime("%b"))
-            month_cols.append(col)
-            cur_month = d.month
-    ax.set_xticks(month_cols)
-    ax.set_xticklabels(month_labels, color="#64748b", fontsize=8)
-    ax.set_yticks(range(7))
-    ax.set_yticklabels(["M", "T", "W", "T", "F", "S", "S"],
-                       color="#64748b", fontsize=8)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.tick_params(length=0)
-    fig.tight_layout(pad=0.3)
+        main_lay.addWidget(self._build_header())
 
-    canvas = FigureCanvas(fig)
-    canvas.setFixedHeight(130)
-    canvas.setStyleSheet("background: transparent;")
-    plt.close(fig)
-    return canvas
+        # Collapsible content
+        self._content_w = QWidget()
+        self._content_w.setStyleSheet("background: transparent;")
+        c_lay = QVBoxLayout(self._content_w)
+        c_lay.setContentsMargins(18, 4, 18, 16)
+        c_lay.setSpacing(6)
+
+        if self._daily:
+            canvas, fig = self._build_canvas()
+            if canvas:
+                c_lay.addWidget(canvas)
+                plt.close(fig)
+        else:
+            empty = QLabel("No closed trades yet — P&L calendar will appear once trades close.")
+            empty.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
+            c_lay.addWidget(empty)
+
+        # Hover detail label
+        self._hover_lbl = QLabel("Hover over a day to see details")
+        self._hover_lbl.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none;"
+        )
+        c_lay.addWidget(self._hover_lbl)
+
+        # Legend
+        c_lay.addLayout(self._build_legend())
+
+        self._content_w.setVisible(False)
+        main_lay.addWidget(self._content_w)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+
+    def _build_header(self):
+        hdr = QFrame()
+        hdr.setStyleSheet("background: transparent; border: none; border-radius: 12px;")
+        hdr.setCursor(Qt.CursorShape.PointingHandCursor)
+        hl = QHBoxLayout(hdr)
+        hl.setContentsMargins(18, 14, 18, 14)
+        hl.setSpacing(8)
+
+        self._chevron = QLabel("▶")
+        self._chevron.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 10px; border: none;"
+        )
+        hl.addWidget(self._chevron)
+
+        title = QLabel("P&L CALENDAR  (closed trades · last 52 weeks)")
+        title.setStyleSheet(
+            f"color: {T.LABEL}; font-size: 11px; font-weight: bold; "
+            f"letter-spacing: 0.8px; border: none;"
+        )
+        hl.addWidget(title)
+        hl.addStretch()
+
+        if self._daily:
+            n_days   = len(self._daily)
+            n_profit = sum(1 for v in self._daily.values() if v > 0)
+            summary  = QLabel(f"{n_profit}/{n_days} profitable days")
+            summary.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 11px; border: none;"
+            )
+            hl.addWidget(summary)
+
+        hdr.mousePressEvent = lambda _e: self._toggle()
+        return hdr
+
+    def _toggle(self):
+        self._expanded = not self._expanded
+        self._content_w.setVisible(self._expanded)
+        self._chevron.setText("▼" if self._expanded else "▶")
+
+    # ── Canvas ────────────────────────────────────────────────────────────────
+
+    def _build_canvas(self):
+        start     = self._start
+        today     = self._today
+        start_dow = self._start_dow
+        nw        = self.NUM_WEEKS
+
+        # Build grid
+        grid = np.full((7, nw), np.nan)
+        for day_off in range((today - start).days + 1):
+            d   = start + timedelta(days=day_off)
+            col = (day_off + start_dow) // 7
+            row = d.weekday()
+            if col < nw:
+                grid[row, col] = self._daily.get(d, np.nan)
+
+        # Store grid metadata for hover lookup
+        self._grid     = grid
+        self._start_dow = start_dow
+
+        fig, ax = plt.subplots(figsize=(14, 2.0))
+        fig.patch.set_facecolor("#161928")
+        ax.set_facecolor("#161928")
+
+        vmax = max((abs(v) for v in self._daily.values()), default=1)
+        vmax = max(vmax, 1)
+        norm = TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+
+        masked = np.ma.masked_invalid(grid)
+        ax.imshow(masked, cmap="RdYlGn", norm=norm, aspect="auto",
+                  interpolation="nearest")
+
+        # Empty-cell overlay
+        nan_ov = np.where(np.isnan(grid), 1.0, np.nan)
+        ax.imshow(nan_ov, cmap=ListedColormap(["#1a1d2e"]),
+                  aspect="auto", interpolation="nearest", vmin=0, vmax=1)
+
+        # ── Expiration markers (white dot, top-right of cell) ─────────────
+        for d in self._expirations:
+            if start <= d <= today:
+                day_off = (d - start).days
+                col = (day_off + start_dow) // 7
+                row = d.weekday()
+                if 0 <= col < nw:
+                    ax.plot(col + 0.35, row - 0.35, "o", color="white",
+                            markersize=3, markeredgewidth=0, zorder=5)
+
+        # ── Earnings markers (yellow dot, bottom-right of cell) ───────────
+        earn_xs, earn_ys, earn_labels = [], [], []
+        for d, tickers in self._earnings.items():
+            if start <= d <= today + timedelta(days=60):
+                day_off = (d - start).days
+                col = (day_off + start_dow) // 7
+                row = d.weekday()
+                if 0 <= col < nw:
+                    earn_xs.append(col + 0.35)
+                    earn_ys.append(row + 0.35)
+                    earn_labels.append(", ".join(tickers[:2]))
+        if earn_xs:
+            ax.scatter(earn_xs, earn_ys, s=18, color="#fbbf24",
+                       zorder=6, linewidths=0)
+
+        # Month labels
+        cur_month = None
+        month_cols, month_lbls = [], []
+        for day_off in range((today - start).days + 1):
+            d   = start + timedelta(days=day_off)
+            col = (day_off + start_dow) // 7
+            if d.month != cur_month and col < nw:
+                month_cols.append(col)
+                month_lbls.append(d.strftime("%b"))
+                cur_month = d.month
+        ax.set_xticks(month_cols)
+        ax.set_xticklabels(month_lbls, color="#64748b", fontsize=8)
+        ax.set_yticks(range(7))
+        ax.set_yticklabels(["M", "T", "W", "T", "F", "S", "S"],
+                           color="#64748b", fontsize=8)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.tick_params(length=0)
+        ax.set_xlim(-0.5, nw - 0.5)
+        ax.set_ylim(6.5, -0.5)
+        fig.tight_layout(pad=0.2)
+
+        canvas = FigureCanvas(fig)
+        canvas.setFixedHeight(140)
+        canvas.setStyleSheet("background: transparent;")
+
+        # Hover event
+        def on_motion(event):
+            if event.inaxes != ax or event.xdata is None:
+                self._hover_lbl.setText("Hover over a day to see details")
+                return
+            col = int(round(event.xdata))
+            row = int(round(event.ydata))
+            if not (0 <= col < nw and 0 <= row < 7):
+                self._hover_lbl.setText("Hover over a day to see details")
+                return
+            day_off = col * 7 + row - start_dow
+            if day_off < 0:
+                return
+            d = start + timedelta(days=day_off)
+            if d > today:
+                self._hover_lbl.setText("")
+                return
+
+            parts = [f"<b>{d.strftime('%a %b %d, %Y')}</b>"]
+
+            pnl = self._daily.get(d)
+            if pnl is not None:
+                sign = "+" if pnl >= 0 else ""
+                parts.append(f"P&L: {sign}${pnl:,.2f}")
+                trades = self._entries.get(d, [])
+                if trades:
+                    roots = sorted({t.get('root') or '' for t in trades if t.get('root')})
+                    parts.append(f"{len(trades)} trade{'s' if len(trades)>1 else ''}: {', '.join(roots[:4])}")
+            else:
+                parts.append("No closed trades")
+
+            if d in self._expirations:
+                parts.append("● Options expiration")
+            earn = self._earnings.get(d)
+            if earn:
+                parts.append(f"● Earnings: {', '.join(earn)}")
+
+            self._hover_lbl.setText("  ·  ".join(parts))
+
+        canvas.mpl_connect("motion_notify_event", on_motion)
+        return canvas, fig
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _calc_expirations(self):
+        """Third Friday of each month = standard monthly expiration."""
+        exps = set()
+        start  = self._start - timedelta(days=31)
+        end    = self._today + timedelta(days=90)
+        year, month = start.year, start.month
+        while date(year, month, 1) <= end:
+            first = date(year, month, 1)
+            days_to_fri = (4 - first.weekday()) % 7
+            third_fri   = first + timedelta(days=days_to_fri) + timedelta(weeks=2)
+            exps.add(third_fri)
+            month += 1
+            if month > 12:
+                month = 1
+                year += 1
+        return exps
+
+    def _calc_earnings(self):
+        """Return {date: [ticker]} from portfolio metrics earnings field."""
+        result = {}
+        for ticker, m in self._metrics.items():
+            earn = (m or {}).get("earnings") or {}
+            raw  = earn.get("expected-report-date") or ""
+            if not raw:
+                continue
+            try:
+                d = date.fromisoformat(str(raw)[:10])
+                result.setdefault(d, []).append(ticker)
+            except ValueError:
+                pass
+        return result
+
+    def _build_legend(self):
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        row.addStretch()
+        for color, label in [
+            ("#f87171", "Loss day"),
+            ("#1a1d2e", "No trades"),
+            ("#4ade80", "Profit day"),
+            ("white",   "● Expiration"),
+            ("#fbbf24", "● Earnings"),
+        ]:
+            dot = QFrame()
+            dot.setFixedSize(10, 10)
+            dot.setStyleSheet(
+                f"background: {color}; border-radius: 2px; border: 1px solid #333;"
+            )
+            row.addWidget(dot)
+            lbl = QLabel(label)
+            lbl.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 10px; border: none; margin-right: 6px;"
+            )
+            row.addWidget(lbl)
+        return row
 
 
 # ── Risk page ─────────────────────────────────────────────────────────────────
@@ -189,8 +419,9 @@ class RiskPage(QWidget):
                       for r in self.portfolio.strategies_raw
                       if r.get("capital_override") is not None}
 
+        metrics = acct.get("metrics") or {}
         self._build_allocation(instances, unassigned, overrides)
-        self._build_heatmap()
+        self._build_heatmap(metrics)
         self.body.addStretch()
 
     # ── Allocation by strategy ────────────────────────────────────────────────
@@ -336,35 +567,6 @@ class RiskPage(QWidget):
 
     # ── P&L Heatmap ───────────────────────────────────────────────────────────
 
-    def _build_heatmap(self):
-        self.body.addWidget(self._section_header("P&L CALENDAR  (closed trades, last 52 weeks)"))
-        card, lay = self._card()
-
-        canvas = build_heatmap_canvas(self.portfolio.history)
-        if canvas:
-            lay.addWidget(canvas)
-
-            # Legend
-            legend_row = QHBoxLayout()
-            legend_row.addStretch()
-            for color, label in [("#f87171", "Loss"), ("#1a1d2e", "No trades"), ("#4ade80", "Profit")]:
-                dot = QFrame()
-                dot.setFixedSize(10, 10)
-                dot.setStyleSheet(
-                    f"background: {color}; border-radius: 2px; border: none;"
-                )
-                legend_row.addWidget(dot)
-                lbl = QLabel(label)
-                lbl.setStyleSheet(
-                    f"color: {T.MUTED}; font-size: 10px; border: none; margin-right: 8px;"
-                )
-                legend_row.addWidget(lbl)
-            lay.addLayout(legend_row)
-        else:
-            empty = QLabel("No closed trades yet — P&L calendar will appear here.")
-            empty.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 12px; border: none;"
-            )
-            lay.addWidget(empty)
-
+    def _build_heatmap(self, metrics=None):
+        card = CalendarCard(self.portfolio.history, metrics=metrics)
         self.body.addWidget(card)
