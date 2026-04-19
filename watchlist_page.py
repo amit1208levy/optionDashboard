@@ -451,14 +451,14 @@ class _TickerRow(QFrame):
         lay.addWidget(size_btn)
         lay.addSpacing(8)
 
-        rm_btn = QPushButton("🗑")
-        rm_btn.setFixedSize(32, 32)
+        rm_btn = QPushButton("✕")
+        rm_btn.setFixedSize(28, 28)
         rm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        rm_btn.setToolTip(f"Remove {ticker} from watchlist")
+        rm_btn.setToolTip(f"Remove {ticker}")
         rm_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; color: {T.RED}; "
-            f"border: 1px solid {T.RED}; border-radius: 6px; font-size: 14px; }}"
-            f"QPushButton:hover {{ background: {T.RED}; color: white; }}"
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: none; font-size: 15px; font-weight: bold; border-radius: 6px; }}"
+            f"QPushButton:hover {{ background: #3d1a1a; color: {T.RED}; }}"
         )
         rm_btn.clicked.connect(lambda: self.remove_clicked.emit(self.ticker))
         lay.addWidget(rm_btn)
