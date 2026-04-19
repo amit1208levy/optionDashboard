@@ -108,12 +108,13 @@ class Position:
         self.pnl_pct      = (self.pnl / notional_open * 100.0) if notional_open else 0.0
 
         # Filled in later from market-data endpoint (optional)
-        self.delta = None
-        self.gamma = None
-        self.theta = None
-        self.vega  = None
-        self.iv    = None
+        self.delta           = None
+        self.gamma           = None
+        self.theta           = None
+        self.vega            = None
+        self.iv              = None
         self.underlying_price = None
+        self.probability_otm = None   # from TastyTrade market-data API
 
     def _recompute(self):
         notional_open = self.quantity * self.multiplier * self.avg_open_price
@@ -133,12 +134,19 @@ class Position:
             try: return float(v)
             except (TypeError, ValueError): return None
 
-        self.delta = f("delta")
-        self.gamma = f("gamma")
-        self.theta = f("theta")
-        self.vega  = f("vega")
-        self.iv    = f("implied-volatility")
+        self.delta            = f("delta")
+        self.gamma            = f("gamma")
+        self.theta            = f("theta")
+        self.vega             = f("vega")
+        self.iv               = f("implied-volatility")
         self.underlying_price = f("underlying-price")
+
+        # TastyTrade returns probability-otm (0–1 scale) per option quote.
+        # This is the most accurate source — uses their own model with skew.
+        raw_potm = f("probability-otm")
+        if raw_potm is not None:
+            # Normalise: API usually returns 0–1 but guard against 0–100
+            self.probability_otm = raw_potm if raw_potm <= 1.0 else raw_potm / 100.0
 
         # Live mark — positions endpoint often returns 0 for futures options;
         # stocks return last/bid/ask rather than mark
@@ -407,16 +415,85 @@ def _iv_from_delta(delta, s0, strike, dte, is_call):
 
 def probability_of_profit(strategy, iv_fallback=0.20):
     """
-    Estimate P(strategy P&L > 0 at expiration) as a percentage, or None if
-    we lack the inputs. Uses a log-normal model for the underlying at expiry.
+    Return P(strategy profitable at expiration) as a %, or None.
+
+    Priority order:
+      1. TastyTrade 'probability-otm' from the market-data API — most accurate,
+         uses their own model with vol skew and term structure.
+      2. Delta-based approximation: P(OTM) ≈ 1 − |delta|.
+      3. Full log-normal model using IV (self-contained, least accurate).
+
+    For two-sided short strategies (strangles, condors, straddles):
+        POP = P(inner_put OTM) + P(inner_call OTM) − 100
+    This is mathematically exact for any continuous distribution:
+        P(K_put < S < K_call) = P(S < K_call) − P(S ≤ K_put)
+                               = P(call OTM) − (1 − P(put OTM))
+                               = P(put OTM) + P(call OTM) − 1
+    For one-sided shorts:  POP = P(short leg OTM)
+    For long options:      POP = P(ITM) = 1 − P(OTM) ≈ |delta|
     """
     legs = [l for l in strategy.legs if l.is_option]
     if not legs:
         return None
 
-    # Underlying price from any leg's quote
+    # ── Identify key legs ─────────────────────────────────────────────────
+    short_puts  = [l for l in legs if l.call_put == "P" and not l.is_long]
+    short_calls = [l for l in legs if l.call_put == "C" and not l.is_long]
+    long_opts   = [l for l in legs if l.is_long]
+
+    # Use the INNER short strikes (closest to ATM) to define the profitable zone.
+    inner_put  = max(short_puts,  key=lambda l: l.strike or 0)           if short_puts  else None
+    inner_call = min(short_calls, key=lambda l: l.strike or float("inf")) if short_calls else None
+
+    # ── Helper: best available P(OTM) for a leg ───────────────────────────
+    def _potm_pct(leg):
+        """Return P(option expires OTM) as 0–100, or None."""
+        if leg.probability_otm is not None:
+            return leg.probability_otm * 100.0          # stored as 0–1
+        if leg.delta is not None:
+            return (1.0 - abs(leg.delta)) * 100.0       # delta ≈ P(ITM)
+        return None
+
+    # ── Attempt API/delta-based calculation ───────────────────────────────
+    if inner_put and inner_call:
+        # Two-sided: strangle / straddle / condor
+        p_put  = _potm_pct(inner_put)
+        p_call = _potm_pct(inner_call)
+        if p_put is not None and p_call is not None:
+            return max(0.0, min(100.0, p_put + p_call - 100.0))
+
+    elif inner_put:
+        p = _potm_pct(inner_put)
+        if p is not None:
+            return max(0.0, min(100.0, p))
+
+    elif inner_call:
+        p = _potm_pct(inner_call)
+        if p is not None:
+            return max(0.0, min(100.0, p))
+
+    elif long_opts:
+        # Long option: POP = P(ITM at expiry) = 1 − P(OTM)
+        l = long_opts[0]
+        if l.probability_otm is not None:
+            return max(0.0, min(100.0, (1.0 - l.probability_otm) * 100.0))
+        if l.delta is not None:
+            return max(0.0, min(100.0, abs(l.delta) * 100.0))
+
+    # ── Fallback: full log-normal model ───────────────────────────────────
+    return _pop_lognormal(strategy, iv_fallback)
+
+
+def _pop_lognormal(strategy, iv_fallback=0.20):
+    """
+    Self-contained log-normal POP estimate.  Used only when neither
+    probability-otm nor delta is available from the API.
+    """
+    legs = [l for l in strategy.legs if l.is_option]
+    if not legs:
+        return None
+
     s0 = next((l.underlying_price for l in legs if l.underlying_price), None)
-    # Fallback 1: infer from ATM leg (smallest |delta - 0.5| gives strike closest to spot)
     if s0 is None:
         best = None
         for l in legs:
@@ -426,38 +503,29 @@ def probability_of_profit(strategy, iv_fallback=0.20):
                     best = (score, l.strike)
         if best:
             s0 = best[1]
-    # Fallback 2: midpoint of strikes
     if s0 is None:
         strikes = [l.strike for l in legs if l.strike]
         if strikes:
             s0 = (min(strikes) + max(strikes)) / 2.0
 
     dte = strategy.dte
-
-    # Volatility: use leg IV directly, else infer from delta, else fallback
     ivs = [l.iv for l in legs if l.iv and l.iv > 0]
     if ivs:
         iv = sum(ivs) / len(ivs)
     elif s0 and dte:
-        # Infer IV from delta for each leg that has both delta and strike
         inferred = []
         for l in legs:
             if l.delta is not None and l.strike and s0:
-                iv_est = _iv_from_delta(
-                    l.delta, s0, l.strike, dte,
-                    is_call=(l.call_put == "C"),
-                )
+                iv_est = _iv_from_delta(l.delta, s0, l.strike, dte,
+                                        is_call=(l.call_put == "C"))
                 if iv_est:
                     inferred.append(iv_est)
         iv = sum(inferred) / len(inferred) if inferred else iv_fallback
     else:
         iv = iv_fallback
 
-    dte = strategy.dte
-
     if s0 is None or dte is None or dte < 0 or iv <= 0:
         return None
-
     if dte == 0:
         return 100.0 if payoff_at(strategy, s0) > 0 else 0.0
 
@@ -469,7 +537,6 @@ def probability_of_profit(strategy, iv_fallback=0.20):
     if not xs:
         return None
 
-    # Find profitable intervals with linear interpolation at boundaries
     intervals = []
     start = None
     for i, y in enumerate(ys):
@@ -493,8 +560,6 @@ def probability_of_profit(strategy, iv_fallback=0.20):
     prob = 0.0
     for lo, hi in intervals:
         prob += lncdf(hi) - lncdf(lo)
-
-    # Unbounded profit tails (payoff still > 0 at extremes of our sampled range)
     if ys[-1] > 0:
         prob += 1.0 - lncdf(xs[-1])
     if ys[0] > 0:
@@ -920,24 +985,77 @@ def portfolio_greeks(positions, metrics_by_root=None):
     }
 
 
+# ── SPAN scan-range table ────────────────────────────────────────────────────
+# Approximate per-contract initial margin (USD) for common futures products.
+# SPAN margin is exchange-set and NOT proportional to notional — currency futures
+# can have ~$800 margin on $79K notional (1 %), while equity-index futures have
+# ~$12K on $260K notional (5 %).  Using these product-specific values gives far
+# more accurate distribution than any notional-based formula.
+# Values are approximate CME/ICE typical initial margins; update as needed.
+
+_FUTURES_SPAN = {
+    # Currency futures (CME)
+    "6A": 900,   "6B": 1800,  "6C": 650,   "6E": 1300,
+    "6J": 1100,  "6M": 1300,  "6N": 650,   "6S": 1600,
+    "6Z": 1200,  "DX": 1200,
+    # Equity index (CME/CBOT)
+    "ES":  12000, "NQ": 15000, "RTY": 6000, "YM": 5000,
+    "MES": 1200,  "MNQ": 1500, "M2K": 600,  "MYM": 500,
+    "EMD": 5000,  "VX":  3500,
+    # Interest rates (CBOT/CME)
+    "ZB": 2000, "ZN": 1100, "ZF": 650, "ZT": 400,
+    "GE": 400,  "SR1": 250, "SR3": 300, "ZQ": 150,
+    "UB": 3000,
+    # Energy (NYMEX)
+    "CL": 4000, "NG": 2200, "RB": 2200, "HO": 2200,
+    "QM": 2000, "MCL": 400,
+    # Metals (COMEX/NYMEX)
+    "GC": 6500, "SI": 3500, "HG": 3000, "PL": 1800, "PA": 5000,
+    "MGC": 650, "SIL": 2000,
+    # Agriculture (CBOT/CME/ICE)
+    "ZC": 1000, "ZS": 1600, "ZW": 1100, "ZL": 600,  "ZM": 900,
+    "KC": 2500, "CC": 900,  "CT": 1400, "SB": 500,
+    "OJ": 1000,
+    # Livestock (CME)
+    "LE": 1500, "HE": 1500, "GF": 1000,
+    # Crypto (CME)
+    "BTC": 11000, "MBT": 1100, "ETH": 4500, "MET": 450,
+}
+
+_SPAN_FALLBACK_PCT = 0.015   # 1.5 % of notional for unknown products
+
+
+def _span_per_contract(leg):
+    """
+    Return the approximate SPAN initial margin per contract for a futures-option leg.
+    Uses the product table first; falls back to 1.5 % of underlying notional.
+    """
+    root = leg.root or ""
+    val = _FUTURES_SPAN.get(root)
+    if val:
+        return float(val)
+    # Fallback: 1.5 % of notional
+    ref = leg.underlying_price or leg.strike or 0
+    return ref * (leg.multiplier or 1) * _SPAN_FALLBACK_PCT
+
+
 def _notional_capital(strategy):
     """
     Margin estimate for undefined-risk strategies.
 
-    Futures options  → underlying_price × multiplier × 12% × qty  (SPAN approximation)
-    Equity options   → strike × 100 × 20% × qty                   (naked margin rule)
+    Futures options  → SPAN scan-range table (per product) × qty
+    Equity options   → strike × 100 × 20% × qty  (Reg-T naked rule)
     Stock positions  → abs(market_value)
 
-    We take the LARGEST single short leg (not their sum) since the broker
-    nets offsetting positions (strangle = one margin block, not two).
+    For strangles / straddles we take the LARGEST short-leg margin block
+    (not a sum) because brokers net the two sides.
     Long legs add their cost basis on top.
     """
     best = 0.0
     long_cost = 0.0
 
     for leg in strategy.legs:
-        mult = leg.multiplier or 1
-        qty  = leg.quantity
+        qty = leg.quantity
 
         if not leg.is_option:
             best += abs(leg.market_value)
@@ -949,12 +1067,10 @@ def _notional_capital(strategy):
 
         # --- short option ---
         if leg.instrument_type == "Future Option":
-            # SPAN-style: ~12% of underlying notional per contract
-            ref = leg.underlying_price or leg.strike or 0
-            cap = ref * mult * 0.12 * qty
+            cap = _span_per_contract(leg) * qty
         else:
-            # Naked equity option: ~20% of strike × 100 shares
-            cap = (leg.strike or 0) * min(mult, 100) * 0.20 * qty
+            # Naked equity option: ~20 % of strike × 100 shares
+            cap = (leg.strike or 0) * min(leg.multiplier or 100, 100) * 0.20 * qty
 
         best = max(best, cap)
 
@@ -971,6 +1087,50 @@ def _capital_for(strategy):
 def capital_for_strategy(strategy):
     """Public wrapper around _capital_for."""
     return _capital_for(strategy)
+
+
+def distribute_futures_margin(strategies, unassigned_groups, total_futures_margin):
+    """
+    Distribute the account's total futures-margin-requirement (from the balances API)
+    proportionally across strategies that contain Future Option legs.
+
+    Weighting uses the SPAN scan-range table (_FUTURES_SPAN) rather than raw
+    notional so that low-notional / low-volatility currency futures (e.g. /6A)
+    aren't drowned out by high-notional equity-index futures (e.g. /ES).
+
+    For multi-leg strategies (strangles, condors) we take the LARGEST single
+    short-leg weight — matching how brokers typically calculate SPAN margin for
+    short option combinations.
+
+    Returns {strategy.key: allocated_margin_float}.
+    Returns an empty dict if there are no futures-option legs or the total is ≤ 0.
+    """
+    if not total_futures_margin or total_futures_margin <= 0:
+        return {}
+
+    weights = {}
+    for s in list(strategies) + list(unassigned_groups):
+        key = s.key
+        # For each strategy use the LARGEST short-leg SPAN estimate
+        # (plus any long-leg cost — longs reduce net margin at the portfolio level
+        #  but we keep them out of the weight for simplicity)
+        max_short = 0.0
+        for leg in s.legs:
+            if leg.instrument_type != "Future Option":
+                continue
+            if leg.is_long:
+                continue
+            w = _span_per_contract(leg) * leg.quantity
+            if w > max_short:
+                max_short = w
+        if max_short > 0:
+            weights[key] = max_short
+
+    total_w = sum(weights.values())
+    if total_w <= 0:
+        return {}
+
+    return {k: total_futures_margin * (w / total_w) for k, w in weights.items()}
 
 
 def strategy_allocation(instances, unassigned_groups, overrides_by_id=None):

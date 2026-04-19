@@ -75,7 +75,7 @@ class PositionSizerDialog(QDialog):
     def __init__(self, ticker, price, nlv, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"Position Sizer — {ticker}")
-        self.setMinimumWidth(400)
+        self.setMinimumWidth(460)
         self.setStyleSheet(f"background: {T.BG}; color: {T.TEXT};")
 
         lay = QVBoxLayout(self)
@@ -109,7 +109,7 @@ class PositionSizerDialog(QDialog):
             "Long Option  (debit)",
             "Stock / ETF  (equity)",
         ])
-        self.strategy_combo.currentIndexChanged.connect(self._update_hint)
+        self.strategy_combo.currentIndexChanged.connect(self._recalc)
         lay.addWidget(self.strategy_combo)
 
         # Max allocation slider
@@ -128,53 +128,130 @@ class PositionSizerDialog(QDialog):
         pct_row.addWidget(self.pct_val)
         lay.addLayout(pct_row)
 
-        # Capital per contract
-        self._lbl(lay, "Capital required per contract  ($BP used)")
-        self.cap_spin = QDoubleSpinBox()
-        self.cap_spin.setRange(1, 999_999)
-        self.cap_spin.setDecimals(0)
-        self.cap_spin.setSingleStep(50)
-        default = max(round(price * 100 * 0.10 / 50) * 50, 200)
-        self.cap_spin.setValue(default)
-        self.cap_spin.setStyleSheet(
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet(f"background: {T.BORDER}; max-height: 1px; border: none;")
+        lay.addWidget(sep2)
+
+        # ── Premium per contract ──────────────────────────────────────────────
+        self._lbl(lay, "Premium per contract  (option price as shown on chain)")
+        cp_row = QHBoxLayout()
+        self.cp_spin = QDoubleSpinBox()
+        self.cp_spin.setRange(0.01, 99_999)
+        self.cp_spin.setDecimals(2)
+        self.cp_spin.setSingleStep(0.10)
+        # Default: ~2 % of underlying (rough ATM option value)
+        default_cp = max(round(price * 0.02 * 4) / 4, 0.05)
+        self.cp_spin.setValue(default_cp)
+        self.cp_spin.setStyleSheet(
             f"QDoubleSpinBox {{ background: {T.CARD}; color: {T.TEXT}; "
             f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 4px 8px; }}"
         )
-        self.cap_spin.valueChanged.connect(self._recalc)
-        lay.addWidget(self.cap_spin)
+        self.cp_spin.valueChanged.connect(self._recalc)
+        cp_row.addWidget(self.cp_spin)
 
-        self.hint_lbl = QLabel("")
-        self.hint_lbl.setStyleSheet(
-            f"color: {T.MUTED}; font-size: 10px; border: none;"
+        mult_lbl = QLabel("×")
+        mult_lbl.setStyleSheet(f"color: {T.MUTED}; border: none;")
+        cp_row.addWidget(mult_lbl)
+
+        self.mult_spin = QDoubleSpinBox()
+        self.mult_spin.setRange(1, 100_000)
+        self.mult_spin.setDecimals(0)
+        self.mult_spin.setSingleStep(100)
+        self.mult_spin.setValue(100)
+        self.mult_spin.setFixedWidth(90)
+        self.mult_spin.setToolTip("Contract multiplier (100 for equity options; varies for futures)")
+        self.mult_spin.setStyleSheet(
+            f"QDoubleSpinBox {{ background: {T.CARD}; color: {T.TEXT}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 4px 8px; }}"
         )
-        lay.addWidget(self.hint_lbl)
+        self.mult_spin.valueChanged.connect(self._recalc)
+        cp_row.addWidget(self.mult_spin)
 
-        # Results card
+        self.cp_total_lbl = QLabel()
+        self.cp_total_lbl.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 12px; font-weight: bold; border: none; margin-left: 8px;"
+        )
+        cp_row.addWidget(self.cp_total_lbl)
+        cp_row.addStretch()
+        lay.addLayout(cp_row)
+
+        # ── Delta ─────────────────────────────────────────────────────────────
+        self._lbl(lay, "Delta  (of the option leg, e.g. 20 = 20Δ)")
+        delta_row = QHBoxLayout()
+        self.delta_slider = QSlider(Qt.Orientation.Horizontal)
+        self.delta_slider.setRange(1, 50)
+        self.delta_slider.setValue(20)
+        self.delta_slider.valueChanged.connect(self._recalc)
+        self.delta_val = QLabel("20Δ")
+        self.delta_val.setFixedWidth(42)
+        self.delta_val.setStyleSheet(
+            f"color: {T.ACCENT}; font-weight: bold; border: none;"
+        )
+        delta_row.addWidget(self.delta_slider)
+        delta_row.addWidget(self.delta_val)
+        lay.addLayout(delta_row)
+
+        # ── DTE ───────────────────────────────────────────────────────────────
+        self._lbl(lay, "Estimated DTE  (days to expiration)")
+        dte_row = QHBoxLayout()
+        self.dte_slider = QSlider(Qt.Orientation.Horizontal)
+        self.dte_slider.setRange(1, 180)
+        self.dte_slider.setValue(45)
+        self.dte_slider.valueChanged.connect(self._recalc)
+        self.dte_val = QLabel("45d")
+        self.dte_val.setFixedWidth(42)
+        self.dte_val.setStyleSheet(
+            f"color: {T.ACCENT}; font-weight: bold; border: none;"
+        )
+        dte_row.addWidget(self.dte_slider)
+        dte_row.addWidget(self.dte_val)
+        lay.addLayout(dte_row)
+
+        # ── Results card ──────────────────────────────────────────────────────
         res = QFrame()
         res.setStyleSheet(
             f"background: {T.CARD}; border-radius: 8px; border: 1px solid {T.BORDER};"
         )
         res_lay = QVBoxLayout(res)
-        res_lay.setContentsMargins(16, 14, 16, 14)
-        res_lay.setSpacing(4)
+        res_lay.setContentsMargins(16, 14, 16, 16)
+        res_lay.setSpacing(6)
+
+        # Top: contracts + total premium side by side
+        top_row = QHBoxLayout()
+        top_row.setSpacing(24)
 
         self.contracts_lbl = QLabel()
         self.contracts_lbl.setStyleSheet(
             f"color: {T.TEXT}; font-size: 22px; font-weight: bold; border: none;"
         )
-        res_lay.addWidget(self.contracts_lbl)
+        top_row.addWidget(self.contracts_lbl)
 
-        self.capital_lbl = QLabel()
-        self.capital_lbl.setStyleSheet(
-            f"color: {T.MUTED}; font-size: 12px; border: none;"
+        self.total_prem_lbl = QLabel()
+        self.total_prem_lbl.setStyleSheet(
+            f"color: {T.GREEN}; font-size: 22px; font-weight: bold; border: none;"
         )
+        top_row.addWidget(self.total_prem_lbl)
+        top_row.addStretch()
+        res_lay.addLayout(top_row)
+
+        # Detail lines
+        self.capital_lbl = QLabel()
+        self.capital_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
         res_lay.addWidget(self.capital_lbl)
 
         self.bp_lbl = QLabel()
-        self.bp_lbl.setStyleSheet(
-            f"color: {T.MUTED}; font-size: 12px; border: none;"
-        )
+        self.bp_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
         res_lay.addWidget(self.bp_lbl)
+
+        self.theta_lbl = QLabel()
+        self.theta_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
+        res_lay.addWidget(self.theta_lbl)
+
+        self.pop_lbl = QLabel()
+        self.pop_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
+        res_lay.addWidget(self.pop_lbl)
+
         lay.addWidget(res)
 
         close_btn = QPushButton("Close")
@@ -190,7 +267,6 @@ class PositionSizerDialog(QDialog):
 
         self.nlv   = nlv
         self.price = price
-        self._update_hint()
         self._recalc()
 
     def _lbl(self, parent_lay, text):
@@ -201,36 +277,119 @@ class PositionSizerDialog(QDialog):
         )
         parent_lay.addWidget(lbl)
 
-    def _update_hint(self):
-        idx = self.strategy_combo.currentIndex()
-        hints = [
-            "Tip: BP used ≈ short-strike × 100 × ~20% for strangles",
-            "Tip: BP used = max-loss = width × 100",
-            "Tip: BP used ≈ strike × 100 × ~20% for naked puts",
-            "Tip: BP used = premium paid × 100",
-            "Tip: BP used = share price × shares",
-        ]
-        self.hint_lbl.setText(hints[idx])
-        self._recalc()
+    def _cap_per_contract(self, cp_dollars, delta_frac, dte, strategy_idx):
+        """
+        Estimate capital (BP) required per contract.
+
+        idx 0  Short Strangle/Straddle  → naked-style both sides:
+                 20 % of underlying × mult  minus  premium collected
+        idx 1  Iron Condor / Spread      → max-loss = width × mult
+                 approximate width from delta: OTM width ≈ (0.5-delta) × price × 0.35
+        idx 2  Naked Put or Call         → same as half of strangle
+        idx 3  Long Option  (debit)      → just the premium paid
+        idx 4  Stock / ETF               → full notional  (price × 1 share)
+        """
+        mult = float(self.mult_spin.value()) or 100
+        S = self.price
+
+        if strategy_idx == 4:          # equity / ETF
+            return S * mult
+
+        if strategy_idx == 3:          # long option — cost is the premium
+            return cp_dollars
+
+        # Naked-margin approximation (Reg-T style):
+        #   20 % of underlying notional  minus  OTM discount  plus  premium
+        # OTM discount ≈ (0.5 − delta) × price × mult × 0.06
+        notional   = S * mult
+        otm_disc   = (0.5 - delta_frac) * notional * 0.06
+        naked_cap  = notional * 0.20 - otm_disc + cp_dollars
+
+        if strategy_idx == 1:          # defined risk / spread
+            # Estimate wing width from delta positioning:
+            # width ≈ (0.5 − delta) × price × 0.20
+            width = max((0.5 - delta_frac) * S * 0.20, S * 0.02)
+            return width * mult
+
+        if strategy_idx == 0:          # strangle / straddle — single margin block (not doubled)
+            return max(naked_cap, cp_dollars * 1.5)
+
+        # idx 2 — naked single leg
+        return max(naked_cap, cp_dollars * 1.5)
 
     def _recalc(self):
-        pct = self.pct_slider.value()
-        self.pct_val.setText(f"{pct}%")
-        max_cap = self.nlv * pct / 100.0
-        cap_per = max(float(self.cap_spin.value()), 1.0)
-        contracts = int(max_cap / cap_per)
-        total     = contracts * cap_per
-        pct_used  = total / self.nlv * 100 if self.nlv else 0
-        remaining = self.nlv - total
+        pct       = self.pct_slider.value()
+        delta_raw = self.delta_slider.value()          # 1-50 integer
+        dte       = self.dte_slider.value()
+        cp        = float(self.cp_spin.value())
+        mult      = float(self.mult_spin.value()) or 100
+        idx       = self.strategy_combo.currentIndex()
+        delta_frac = delta_raw / 100.0
 
-        label = "contract" if contracts == 1 else "contracts"
-        self.contracts_lbl.setText(f"{contracts} {label}")
+        # Update slider labels
+        self.pct_val.setText(f"{pct}%")
+        self.delta_val.setText(f"{delta_raw}Δ")
+        self.dte_val.setText(f"{dte}d")
+
+        # Premium per contract in dollars (what the broker shows as credit/debit)
+        prem_per_contract = cp * mult
+        self.cp_total_lbl.setText(f"= ${prem_per_contract:,.2f} / contract")
+
+        # For a strangle we collect two legs; show that in premium total
+        sides = 2 if idx == 0 else 1   # strangle = 2 legs, everything else = 1
+        cp_dollars = prem_per_contract * sides   # total premium per position
+
+        # Capital per contract
+        cap_per = max(self._cap_per_contract(cp_dollars, delta_frac, dte, idx), 1.0)
+
+        max_cap   = self.nlv * pct / 100.0
+        contracts = max(int(max_cap / cap_per), 0)
+        total_cap = contracts * cap_per
+        total_prem = contracts * cp_dollars
+        pct_used   = total_cap / self.nlv * 100 if self.nlv else 0
+        remaining  = self.nlv - total_cap
+
+        # Theta estimate: total_premium / (DTE × ~1.7)  (not linear, rough approx)
+        theta_est = total_prem / (dte * 1.7) if dte > 0 and contracts > 0 else 0
+
+        # P(profit) for short strategies: Δ ≈ P(expiring ITM), so P(OTM) = 1 − Δ
+        # For a strangle both sides: both must stay OTM
+        if idx in (0, 2):       # undefined short
+            pop = (1 - delta_frac) * 100
+        elif idx == 3:          # long option — P(ITM) ≈ delta
+            pop = delta_frac * 100
+        else:
+            pop = None
+
+        # ── Update labels ──────────────────────────────────────────────────────
+        c_label = "contract" if contracts == 1 else "contracts"
+        self.contracts_lbl.setText(f"{contracts} {c_label}")
+
+        if total_prem > 0:
+            prefix = "Total credit:" if idx in (0, 2) else ("Total cost:" if idx == 3 else "Total prem:")
+            self.total_prem_lbl.setText(f"${total_prem:,.0f}")
+            self.total_prem_lbl.setStyleSheet(
+                f"color: {T.GREEN if idx in (0, 2) else T.RED if idx == 3 else T.TEXT}; "
+                f"font-size: 22px; font-weight: bold; border: none;"
+            )
+        else:
+            self.total_prem_lbl.setText("—")
+
         self.capital_lbl.setText(
-            f"Total BP: ${total:,.0f}   ·   Per contract: ${cap_per:,.0f}"
+            f"Capital per contract: ${cap_per:,.0f}   ·   Total BP: ${total_cap:,.0f}"
         )
         self.bp_lbl.setText(
             f"{pct_used:.1f}% of NLV used   ·   Remaining BP: ${remaining:,.0f}"
         )
+        theta_text = f"~${theta_est:,.2f}/day" if theta_est > 0 else "—"
+        roc = (total_prem / total_cap * 100) if total_cap > 0 and total_prem > 0 else 0
+        self.theta_lbl.setText(
+            f"Theta est.: {theta_text}   ·   Return on capital: {roc:.1f}% (if held to exp.)"
+        )
+        if pop is not None:
+            self.pop_lbl.setText(f"P(profit) ≈ {pop:.0f}%  (1 − delta, single side)")
+        else:
+            self.pop_lbl.setText("")
 
 
 # ── Ticker row ────────────────────────────────────────────────────────────────
@@ -290,14 +449,16 @@ class _TickerRow(QFrame):
             lambda: self.size_clicked.emit(self.ticker, self._price, self.nlv)
         )
         lay.addWidget(size_btn)
+        lay.addSpacing(8)
 
-        rm_btn = QPushButton("×")
-        rm_btn.setFixedSize(28, 28)
+        rm_btn = QPushButton("🗑")
+        rm_btn.setFixedSize(32, 32)
         rm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        rm_btn.setToolTip(f"Remove {ticker} from watchlist")
         rm_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; color: {T.MUTED}; border: none; "
-            f"font-size: 16px; font-weight: bold; }}"
-            f"QPushButton:hover {{ color: {T.RED}; }}"
+            f"QPushButton {{ background: transparent; color: {T.RED}; "
+            f"border: 1px solid {T.RED}; border-radius: 6px; font-size: 14px; }}"
+            f"QPushButton:hover {{ background: {T.RED}; color: white; }}"
         )
         rm_btn.clicked.connect(lambda: self.remove_clicked.emit(self.ticker))
         lay.addWidget(rm_btn)

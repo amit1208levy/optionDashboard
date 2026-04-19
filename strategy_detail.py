@@ -11,7 +11,7 @@ import theme as T
 from models import (
     StrategyInstance, strategy_extremes, probability_of_profit, capital_for_strategy,
     strategy_performance, symbol_ivr, symbol_ivp, symbol_beta, symbol_hv30,
-    scenario_pnl
+    scenario_pnl, distribute_futures_margin, unassigned_positions, group_unassigned,
 )
 from payoff_chart import PayoffChart
 from history_chart import HistoryChart
@@ -317,8 +317,8 @@ class StrategyDetailPage(QWidget):
              "Unlimited" if max_loss == float("-inf") else money(max_loss, signed=True),
              T.RED if max_loss and max_loss != 0 else T.MUTED)
 
-        cap_required = self._capital_required()
-        cap_box = self._capital_box(cap_required)
+        cap_required, cap_source = self._capital_required_with_source()
+        cap_box = self._capital_box(cap_required, cap_source)
         grid.addWidget(cap_box, 0, 2)
 
         be_text = "  /  ".join(f"${b:,.2f}" for b in breakevens[:2]) if breakevens else "—"
@@ -333,16 +333,64 @@ class StrategyDetailPage(QWidget):
     # ── Capital required (auto + override) ──────────────────────────────────
 
     def _capital_required(self):
-        """Return the active capital requirement value (override if set)."""
+        """Return the active capital requirement value."""
+        val, _ = self._capital_required_with_source()
+        return val
+
+    def _capital_required_with_source(self):
+        """
+        Returns (value, source) where source is one of:
+          'override'    – user-set manual override
+          'max_loss'    – defined-risk strategy (max loss from payoff diagram)
+          'distributed' – actual TastyTrade futures margin, distributed proportionally
+          'estimate'    – SPAN / notional approximation (least accurate)
+          None          – no value available
+        """
         override = self._capital_override()
         if override is not None:
-            return override
+            return override, "override"
+
         _, max_loss, _ = strategy_extremes(self.strategy)
         if max_loss is not None and max_loss != float("-inf"):
-            return abs(max_loss)
-        # Undefined-risk: use notional estimate (short-strike margin approx)
+            return abs(max_loss), "max_loss"
+
+        # For futures-option strategies, use the actual margin from TastyTrade
+        has_future_opts = any(
+            l.instrument_type == "Future Option" for l in self.strategy.legs
+        )
+        if has_future_opts:
+            dist = self._get_distributed_futures_margin()
+            if dist is not None and dist > 0:
+                return dist, "distributed"
+
+        # Undefined-risk equity options: notional/SPAN approximation
         est = capital_for_strategy(self.strategy)
-        return est if est else None
+        return (est if est else None), "estimate"
+
+    def _get_distributed_futures_margin(self):
+        """
+        Look up this strategy's pro-rata share of the account's
+        futures-margin-requirement (from the balances API).
+        Returns a float or None.
+        """
+        acct = self.portfolio.current_account() if self.portfolio else None
+        if not acct:
+            return None
+        try:
+            total_fm = float(acct["balances"].get("futures-margin-requirement") or 0)
+        except (TypeError, ValueError):
+            return None
+        if total_fm <= 0:
+            return None
+
+        positions = acct["positions"]
+        strat_raw = self.portfolio.strategies_raw
+        instances = [StrategyInstance(d, positions) for d in strat_raw]
+        leftover  = unassigned_positions(positions, strat_raw)
+        unassigned = group_unassigned(leftover)
+
+        dist = distribute_futures_margin(instances, unassigned, total_fm)
+        return dist.get(self.strategy.key)
 
     def _capital_override(self):
         if not isinstance(self.strategy, StrategyInstance):
@@ -359,12 +407,13 @@ class StrategyDetailPage(QWidget):
         except (TypeError, ValueError):
             return None
 
-    def _capital_box(self, cap_required):
-        is_override = self._capital_override() is not None
+    def _capital_box(self, cap_required, source="estimate"):
+        is_override = (source == "override")
+        border_color = T.PURPLE if is_override else T.BORDER
         w = QFrame()
         w.setStyleSheet(
             f"QFrame {{ background: #12151d; border: 1px solid "
-            f"{T.PURPLE if is_override else T.BORDER}; border-radius: 8px; }}"
+            f"{border_color}; border-radius: 8px; }}"
         )
         lay = QVBoxLayout(w)
         lay.setContentsMargins(12, 10, 12, 10)
@@ -394,10 +443,10 @@ class StrategyDetailPage(QWidget):
         lay.addLayout(top)
 
         if cap_required is None:
-            text = "Undefined"
+            text  = "Undefined"
             color = T.MUTED
         else:
-            text = money(cap_required)
+            text  = money(cap_required)
             color = T.PURPLE if is_override else T.TEXT_DIM
         v = QLabel(text)
         v.setStyleSheet(
@@ -405,10 +454,21 @@ class StrategyDetailPage(QWidget):
             f"background: transparent; border: none;"
         )
         lay.addWidget(v)
-        if is_override:
-            badge = QLabel("manual")
+
+        # Source badge
+        if source == "override":
+            badge_text, badge_color = "manual", T.PURPLE
+        elif source == "distributed":
+            badge_text, badge_color = "actual margin", T.TEAL
+        elif source == "estimate":
+            badge_text, badge_color = "estimate", T.MUTED
+        else:
+            badge_text, badge_color = None, None
+
+        if badge_text:
+            badge = QLabel(badge_text)
             badge.setStyleSheet(
-                f"color: {T.PURPLE}; font-size: 9px; font-weight: bold; "
+                f"color: {badge_color}; font-size: 9px; font-weight: bold; "
                 f"background: transparent; border: none;"
             )
             lay.addWidget(badge)
@@ -545,11 +605,32 @@ class StrategyDetailPage(QWidget):
                                     capital_req=self._capital_required())
         entries = [h for h in history if h.get("strategy_id") == self.strategy.id]
 
-        frame, lay = self._section_frame("Performance History")
+        # Build the card frame directly so we can put the Import button
+        # inline with the section title (avoids fragile layout-item moves).
+        frame = QFrame()
+        frame.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 14px; }}"
+        )
+        lay = QVBoxLayout(frame)
+        lay.setContentsMargins(22, 18, 22, 20)
+        lay.setSpacing(10)
 
-        # Import history button in the header row
+        # ── Title row ──────────────────────────────────────────────────────
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
+
+        title_lbl = QLabel("Performance History")
+        title_lbl.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 14px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        title_row.addWidget(title_lbl)
+        title_row.addStretch()
+
         import_btn = QPushButton("⬇  Import History")
-        import_btn.setFixedHeight(30)
+        import_btn.setFixedHeight(28)
         import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         import_btn.setStyleSheet(
             f"QPushButton {{ background: transparent; color: {T.MUTED}; "
@@ -558,16 +639,9 @@ class StrategyDetailPage(QWidget):
             f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
         )
         import_btn.clicked.connect(self._import_history)
-        # Insert it into the section header row
-        hdr_w = lay.itemAt(0).widget()
-        if hdr_w:
-            hdr_row = QHBoxLayout()
-            hdr_row.setContentsMargins(0, 0, 0, 0)
-            hdr_row.addWidget(hdr_w)
-            hdr_row.addStretch()
-            hdr_row.addWidget(import_btn)
-            lay.insertLayout(0, hdr_row)
-            lay.takeAt(1)  # remove original label (now at index 1 after insert)
+        title_row.addWidget(import_btn)
+
+        lay.addLayout(title_row)
 
         if not entries:
             empty = QLabel(
