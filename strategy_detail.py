@@ -2,7 +2,8 @@
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
-    QPushButton, QScrollArea, QSizePolicy, QInputDialog, QDialog, QSlider
+    QPushButton, QScrollArea, QSizePolicy, QInputDialog, QDialog, QSlider,
+    QMessageBox,
 )
 
 import api
@@ -15,6 +16,7 @@ from models import (
 from payoff_chart import PayoffChart
 from history_chart import HistoryChart
 from strategy_card import money, pct, fmt_num, pnl_color, dte_color
+from strategies_page import PastLegPickerDialog
 
 
 # ── Leg row (read-only) ─────────────────────────────────────────────────────
@@ -545,11 +547,32 @@ class StrategyDetailPage(QWidget):
 
         frame, lay = self._section_frame("Performance History")
 
+        # Import history button in the header row
+        import_btn = QPushButton("⬇  Import History")
+        import_btn.setFixedHeight(30)
+        import_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        import_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 0 12px; "
+            f"font-size: 11px; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+        )
+        import_btn.clicked.connect(self._import_history)
+        # Insert it into the section header row
+        hdr_w = lay.itemAt(0).widget()
+        if hdr_w:
+            hdr_row = QHBoxLayout()
+            hdr_row.setContentsMargins(0, 0, 0, 0)
+            hdr_row.addWidget(hdr_w)
+            hdr_row.addStretch()
+            hdr_row.addWidget(import_btn)
+            lay.insertLayout(0, hdr_row)
+            lay.takeAt(1)  # remove original label (now at index 1 after insert)
+
         if not entries:
             empty = QLabel(
                 "No closed legs yet. When a position leaves the portfolio "
-                "(expired, closed, or rolled), it'll be logged here automatically. "
-                "You can also backfill past trades from Configure → Activity Import."
+                "(expired, closed, or rolled), it'll be logged here automatically."
             )
             empty.setWordWrap(True)
             empty.setStyleSheet(
@@ -641,6 +664,27 @@ class StrategyDetailPage(QWidget):
             lay.addWidget(row)
 
         return frame
+
+    def _import_history(self):
+        if not isinstance(self.strategy, StrategyInstance):
+            return
+        dlg = PastLegPickerDialog(
+            self.strategy.id, self.portfolio.history,
+            self.portfolio.strategies_raw, parent=self
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        syms = set(dlg.selected_symbols())
+        if not syms:
+            return
+        for h in self.portfolio.history:
+            if h["symbol"] in syms:
+                h["strategy_id"] = self.strategy.id
+        self.portfolio.save_history()
+        QMessageBox.information(
+            self, "Saved", f"Assigned {len(syms)} closed leg(s) to this strategy."
+        )
+        self.reopen_requested.emit(self.strategy)
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 

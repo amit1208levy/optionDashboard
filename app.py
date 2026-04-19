@@ -277,8 +277,10 @@ class PortfolioScreen(QWidget):
     watchlist_requested = pyqtSignal()
     risk_requested      = pyqtSignal()
 
-    BALANCE_CARDS = [
-        ("net-liquidating-value",   "Net Liq"),
+    PRIMARY_CARDS = [
+        ("net-liquidating-value", "Net Liq"),
+    ]
+    MORE_CARDS = [
         ("cash-balance",            "Cash"),
         ("derivative-buying-power", "Option BP"),
         ("equity-buying-power",     "Equity BP"),
@@ -520,74 +522,95 @@ class PortfolioScreen(QWidget):
         )
         return l
 
-    def _build_balance_row(self):
-        row = QHBoxLayout()
-        row.setSpacing(12)
-        self.bal_cards = {}
-        for key, label in self.BALANCE_CARDS:
-            w = QFrame()
-            w.setStyleSheet(
-                f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
-                f"border-radius: 12px; }}"
-            )
-            lay = QVBoxLayout(w)
-            lay.setContentsMargins(20, 14, 20, 16)
-            lay.setSpacing(4)
-            lbl = QLabel(label.upper())
-            lbl.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 10px; font-weight: bold; letter-spacing: 0.7px; "
-                f"border: none; background: transparent;"
-            )
-            val = QLabel("—")
-            val.setStyleSheet(
-                f"color: {T.TEXT}; font-size: 22px; font-weight: bold; "
-                f"border: none; background: transparent;"
-            )
-            lay.addWidget(lbl); lay.addWidget(val)
-            self.bal_cards[key] = val
-            row.addWidget(w)
-
-        cap_card = QFrame()
-        cap_card.setStyleSheet(
+    def _bal_tile(self, label):
+        w = QFrame()
+        w.setStyleSheet(
             f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; border-radius: 12px; }}"
         )
-        clay = QVBoxLayout(cap_card)
-        clay.setContentsMargins(20, 14, 20, 16)
-        clay.setSpacing(4)
-        clbl = QLabel("CAPITAL USED")
-        clbl.setStyleSheet(
-            f"color: {T.MUTED}; font-size: 10px; font-weight: bold; letter-spacing: 0.7px; "
-            f"border: none; background: transparent;"
-        )
-        self.cap_used_lbl = QLabel("—")
-        self.cap_used_lbl.setStyleSheet(
-            f"color: {T.TEXT}; font-size: 22px; font-weight: bold; "
-            f"border: none; background: transparent;"
-        )
-        clay.addWidget(clbl); clay.addWidget(self.cap_used_lbl)
-        row.addWidget(cap_card)
-
-        pnl_card = QFrame()
-        pnl_card.setStyleSheet(
-            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; border-radius: 12px; }}"
-        )
-        lay = QVBoxLayout(pnl_card)
+        lay = QVBoxLayout(w)
         lay.setContentsMargins(20, 14, 20, 16)
         lay.setSpacing(4)
-        lbl = QLabel("OPEN P&L")
+        lbl = QLabel(label.upper())
         lbl.setStyleSheet(
             f"color: {T.MUTED}; font-size: 10px; font-weight: bold; letter-spacing: 0.7px; "
             f"border: none; background: transparent;"
         )
-        self.pnl_total_lbl = QLabel("—")
-        self.pnl_total_lbl.setStyleSheet(
+        val = QLabel("—")
+        val.setStyleSheet(
             f"color: {T.TEXT}; font-size: 22px; font-weight: bold; "
             f"border: none; background: transparent;"
         )
-        lay.addWidget(lbl); lay.addWidget(self.pnl_total_lbl)
-        row.addWidget(pnl_card)
+        lay.addWidget(lbl); lay.addWidget(val)
+        return w, val
 
-        return row
+    def _build_balance_row(self):
+        outer = QVBoxLayout()
+        outer.setSpacing(8)
+
+        # ── Primary row ────────────────────────────────────────────────────
+        primary = QHBoxLayout()
+        primary.setSpacing(12)
+        self.bal_cards = {}
+
+        for key, label in self.PRIMARY_CARDS:
+            w, val = self._bal_tile(label)
+            self.bal_cards[key] = val
+            primary.addWidget(w)
+
+        # Capital Used
+        w, self.cap_used_lbl = self._bal_tile("Portfolio Used")
+        primary.addWidget(w)
+
+        # Open P&L
+        w, self.pnl_total_lbl = self._bal_tile("Open P&L")
+        primary.addWidget(w)
+
+        # Day P&L
+        w, self.day_pnl_lbl = self._bal_tile("Day P&L")
+        primary.addWidget(w)
+
+        # YTD P&L (with fees)
+        w, self.ytd_pnl_lbl = self._bal_tile("YTD P&L")
+        primary.addWidget(w)
+
+        # More button
+        self._more_expanded = False
+        self._more_btn = QPushButton("More  ▼")
+        self._more_btn.setFixedSize(80, 62)
+        self._more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._more_btn.setStyleSheet(
+            f"QPushButton {{ background: {T.CARD}; color: {T.MUTED}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 12px; "
+            f"font-size: 11px; font-weight: bold; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+        )
+        self._more_btn.clicked.connect(self._toggle_more)
+        primary.addWidget(self._more_btn)
+
+        outer.addLayout(primary)
+
+        # ── Secondary row (hidden by default) ─────────────────────────────
+        self._more_row_w = QWidget()
+        self._more_row_w.setStyleSheet("background: transparent;")
+        more_row = QHBoxLayout(self._more_row_w)
+        more_row.setContentsMargins(0, 0, 0, 0)
+        more_row.setSpacing(12)
+
+        for key, label in self.MORE_CARDS:
+            w, val = self._bal_tile(label)
+            self.bal_cards[key] = val
+            more_row.addWidget(w)
+        more_row.addStretch()
+
+        self._more_row_w.setVisible(False)
+        outer.addWidget(self._more_row_w)
+
+        return outer
+
+    def _toggle_more(self):
+        self._more_expanded = not self._more_expanded
+        self._more_row_w.setVisible(self._more_expanded)
+        self._more_btn.setText("Less  ▲" if self._more_expanded else "More  ▼")
 
     # ── Data loading / close detection ──────────────────────────────────────
 
@@ -745,6 +768,31 @@ class PortfolioScreen(QWidget):
                 self.cap_used_lbl.setText("—")
         except (ValueError, TypeError):
             self.cap_used_lbl.setText("—")
+
+        # Day P&L (realized + unrealized change today)
+        try:
+            day_r = float(bal.get("realized-day-gain") or 0)
+            day_u = float(bal.get("day-unrealized-profit-loss") or 0)
+            day_pnl = day_r + day_u
+            self.day_pnl_lbl.setText(money(day_pnl, signed=True))
+            self.day_pnl_lbl.setStyleSheet(
+                f"color: {pnl_color(day_pnl)}; font-size: 22px; font-weight: bold; "
+                f"border: none; background: transparent;"
+            )
+        except (ValueError, TypeError):
+            self.day_pnl_lbl.setText("—")
+
+        # YTD P&L (realized year gain — includes fees on TastyTrade)
+        try:
+            ytd = float(bal.get("year-realized-profit-loss") or
+                        bal.get("realized-year-gain") or 0)
+            self.ytd_pnl_lbl.setText(money(ytd, signed=True))
+            self.ytd_pnl_lbl.setStyleSheet(
+                f"color: {pnl_color(ytd)}; font-size: 22px; font-weight: bold; "
+                f"border: none; background: transparent;"
+            )
+        except (ValueError, TypeError):
+            self.ytd_pnl_lbl.setText("—")
 
         self._clear_layout(self.my_container)
         self._clear_layout(self.ua_container)
