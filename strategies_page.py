@@ -666,14 +666,6 @@ class ActiveStrategyRow(QFrame):
         )
         top.addWidget(badge)
 
-        state, msg = instance.validation_state()
-        vcolor = {"ok": T.GREEN, "warn": T.YELLOW, "error": T.RED}[state]
-        vlabel = QLabel(msg)
-        vlabel.setStyleSheet(
-            f"color: {vcolor}; font-size: 11px; border: none; background: transparent;"
-        )
-        top.addWidget(vlabel)
-
         top.addStretch()
 
         pnl = instance.pnl
