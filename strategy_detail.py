@@ -697,8 +697,27 @@ class StrategyDetailPage(QWidget):
             spin.setDecimals(decimals)
             spin.setMinimum(0.0)
             spin.setMaximum(999999.0)
-            spin.setSingleStep(1.0 if decimals == 0 else 0.0001)
-            spin.setValue(float(ep.get(ep_key) or 0))
+
+            # Step size: adapt to the magnitude of the price (or default_val)
+            ref_price = float(default_val or 0)
+            if decimals == 0:
+                step = 1.0
+            elif ref_price >= 1000:
+                step = 5.0
+            elif ref_price >= 100:
+                step = 0.5
+            elif ref_price >= 10:
+                step = 0.1
+            elif ref_price >= 1:
+                step = 0.01
+            else:
+                step = 0.0001
+            spin.setSingleStep(step)
+
+            # Use saved value if set; otherwise fall back to default_val
+            # (for Stop Below/Above this is the current underlying price)
+            saved = ep.get(ep_key)
+            spin.setValue(float(saved) if saved else float(default_val or 0))
             spin.setToolTip(tooltip)
             spin.setFixedWidth(100)
             spin.setStyleSheet(
@@ -799,12 +818,12 @@ class StrategyDetailPage(QWidget):
         ))
 
         right.addLayout(_row(
-            "Stop Below", "underlying_below", 0, "(underlying)",
+            "Stop Below", "underlying_below", underlying or 0, "(underlying)",
             4, "Stop out if underlying price falls to or below this level",
             below_ctx, "below",
         ))
         right.addLayout(_row(
-            "Stop Above", "underlying_above", 0, "(underlying)",
+            "Stop Above", "underlying_above", underlying or 0, "(underlying)",
             4, "Stop out if underlying price rises to or above this level",
             above_ctx, "above",
         ))
