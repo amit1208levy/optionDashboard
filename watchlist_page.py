@@ -234,9 +234,13 @@ class _SuggestPopup(QFrame):
     _GAP = 4
 
     def __init__(self, anchor: QLineEdit, page: QWidget):
-        super().__init__(page)   # child of WatchlistPage → overlays everything
+        # Frameless tool window → floats above everything using global coordinates.
+        # No z-order/clipping issues with sibling QScrollArea or other children.
+        super().__init__(None,
+                         Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._anchor = anchor
-        self._hovered = -1
         self._rows: list[QFrame] = []
 
         self.setObjectName("suggestBox")
@@ -244,8 +248,6 @@ class _SuggestPopup(QFrame):
             f"QFrame#suggestBox {{ background: {T.CARD}; "
             f"border: 1px solid {T.PURPLE}; border-radius: 10px; }}"
         )
-        # Shadow-like effect via a slightly larger invisible border
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
 
         self._lay = QVBoxLayout(self)
         self._lay.setContentsMargins(5, 5, 5, 5)
@@ -269,7 +271,6 @@ class _SuggestPopup(QFrame):
             self._rows.append(row)
             self._reposition()
             self.show()
-            self.raise_()
             return
 
         for r in results:
@@ -279,7 +280,6 @@ class _SuggestPopup(QFrame):
 
         self._reposition()
         self.show()
-        self.raise_()
 
     def hide_popup(self):
         self.hide()
@@ -349,10 +349,10 @@ class _SuggestPopup(QFrame):
         return row
 
     def _reposition(self):
-        parent = self.parentWidget()
-        # Bottom-left of the anchor in parent (WatchlistPage) coordinates
-        anchor_bl = self._anchor.mapTo(parent,
-                                       QPoint(0, self._anchor.height() + self._GAP))
+        # Global coordinates — correct for a top-level tool window
+        anchor_bl = self._anchor.mapToGlobal(
+            QPoint(0, self._anchor.height() + self._GAP)
+        )
         self.move(anchor_bl)
         self.setFixedWidth(max(460, self._anchor.width()))
         self.adjustSize()
