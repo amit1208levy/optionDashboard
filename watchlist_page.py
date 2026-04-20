@@ -234,13 +234,13 @@ class _SuggestPopup(QFrame):
     _GAP = 4
 
     def __init__(self, anchor: QLineEdit, page: QWidget):
-        # Frameless tool window → floats above everything using global coordinates.
-        # No z-order/clipping issues with sibling QScrollArea or other children.
-        super().__init__(None,
-                         Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        # Child widget of WatchlistPage, absolutely positioned and raised above
+        # the scroll area.  Avoids macOS top-level-window quirks (Tool windows
+        # can disappear behind the main window or never appear at all).
+        super().__init__(page)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._anchor = anchor
+        self._page   = page
         self._rows: list[QFrame] = []
 
         self.setObjectName("suggestBox")
@@ -271,6 +271,7 @@ class _SuggestPopup(QFrame):
             self._rows.append(row)
             self._reposition()
             self.show()
+            self.raise_()
             return
 
         for r in results:
@@ -280,6 +281,7 @@ class _SuggestPopup(QFrame):
 
         self._reposition()
         self.show()
+        self.raise_()
 
     def hide_popup(self):
         self.hide()
@@ -349,11 +351,14 @@ class _SuggestPopup(QFrame):
         return row
 
     def _reposition(self):
-        # Global coordinates — correct for a top-level tool window
+        # Map anchor's bottom-left to WatchlistPage local coordinates, then
+        # move there.  Works as a child widget; raise_() in show_results()
+        # ensures we're painted above the scroll area.
         anchor_bl = self._anchor.mapToGlobal(
             QPoint(0, self._anchor.height() + self._GAP)
         )
-        self.move(anchor_bl)
+        local = self._page.mapFromGlobal(anchor_bl)
+        self.move(local)
         self.setFixedWidth(max(460, self._anchor.width()))
         self.adjustSize()
 
@@ -1155,7 +1160,9 @@ class WatchlistPage(QWidget):
         self.add_input.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
-        self.add_input.setFixedHeight(32)
+        # 40px: base-style has padding:8px top+bottom + font-size:14px ≈ 17px
+        # total ≈ 35px; 40px gives comfortable room without clipping descenders.
+        self.add_input.setFixedHeight(40)
         self.add_input.returnPressed.connect(self._add_ticker)
         hl.addWidget(self.add_input)
 
