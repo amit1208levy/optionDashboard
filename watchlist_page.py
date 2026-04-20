@@ -181,30 +181,47 @@ class _SuggestWorker(QThread):
     def run(self):
         q = self.query
         results = []
-        seen = set()
+        seen    = set()
 
-        def _add(sym, desc, kind):
+        def _add(sym, desc, kind, priority=1):
             if sym not in seen:
                 seen.add(sym)
-                results.append({"symbol": sym, "description": desc, "type": kind})
+                results.append({"symbol": sym, "description": desc,
+                                 "type": kind, "_p": priority})
 
-        # ── Offline: indices & popular ETFs ───────────────────────────────────
-        for sym, desc in sorted(_INDEX_SYMBOLS.items()):
+        # Build combined offline table
+        offline = {}
+        for sym, desc in _INDEX_SYMBOLS.items():
+            offline[sym] = (desc, "Index/ETF")
+        for sym, desc in _FUTURES_ROOTS.items():
+            offline[sym] = (desc, "Futures")
+
+        # Priority 0 – prefix match (strongest)
+        for sym, (desc, kind) in sorted(offline.items()):
             if sym.startswith(q):
-                _add(sym, desc, "Index/ETF")
+                _add(sym, desc, kind, 0)
 
-        # ── Offline: futures roots ────────────────────────────────────────────
-        for root, desc in sorted(_FUTURES_ROOTS.items()):
-            if root.startswith(q):
-                _add(root, desc, "Futures")
+        # Priority 1 – substring match (e.g. "MFTS" finds nothing, but "FTS" → MFTS)
+        for sym, (desc, kind) in sorted(offline.items()):
+            if q in sym and not sym.startswith(q):
+                _add(sym, desc, kind, 1)
 
-        # ── Online: TastyTrade equity search ──────────────────────────────────
+        # Priority 2 – description word match (e.g. "gold" → GC/GLD)
+        for sym, (desc, kind) in sorted(offline.items()):
+            if q.lower() in desc.lower() and sym not in seen:
+                _add(sym, desc, kind, 2)
+
+        # ── Online: TastyTrade equity / ETF search ────────────────────────────
         try:
             for e in api.search_instruments(self.token, q, per_page=12):
-                _add(e["symbol"], e.get("description") or "", e.get("type") or "Equity")
+                _add(e["symbol"], e.get("description") or "",
+                     e.get("type") or "Equity", 2)
         except Exception:
             pass
 
+        results.sort(key=lambda r: r["_p"])
+        for r in results:
+            r.pop("_p", None)
         self.done.emit(results[:12])
 
 
@@ -246,7 +263,13 @@ class _SuggestPopup(QFrame):
         self._hovered = -1
 
         if not results:
-            self.hide()
+            # Show feedback instead of silently hiding
+            row = self._make_no_results_row()
+            self._lay.addWidget(row)
+            self._rows.append(row)
+            self._reposition()
+            self.show()
+            self.raise_()
             return
 
         for r in results:
@@ -308,6 +331,21 @@ class _SuggestPopup(QFrame):
         for w in (row, sym_lbl, desc_lbl, kind_lbl):
             w.mousePressEvent = lambda _e, s=sym: self._pick(s)
 
+        return row
+
+    def _make_no_results_row(self) -> QFrame:
+        row = QFrame()
+        row.setStyleSheet(
+            f"QFrame {{ background: transparent; border: none; border-radius: 6px; }}"
+        )
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(14, 10, 14, 10)
+        lbl = QLabel("No matches found")
+        lbl.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 12px; font-style: italic; "
+            f"border: none; background: transparent;"
+        )
+        rl.addWidget(lbl)
         return row
 
     def _reposition(self):
@@ -946,7 +984,7 @@ class WatchlistPage(QWidget):
 
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(280)   # ms debounce
+        self._search_timer.setInterval(180)   # ms debounce
         self._search_timer.timeout.connect(self._do_suggest)
 
         self.add_input.textChanged.connect(self._on_input_changed)
@@ -1162,9 +1200,12 @@ class WatchlistPage(QWidget):
         if not query:
             self._popup.hide_popup()
             return
-        # Cancel previous in-flight worker
-        if self._suggest_worker and self._suggest_worker.isRunning():
-            self._suggest_worker.done.disconnect()
+        # Always safely disconnect the old worker (whether still running or finished)
+        if self._suggest_worker:
+            try:
+                self._suggest_worker.done.disconnect()
+            except (TypeError, RuntimeError):
+                pass
         self._suggest_worker = _SuggestWorker(self.token, query, self)
         self._suggest_worker.done.connect(self._popup.show_results)
         self._suggest_worker.start()
