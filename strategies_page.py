@@ -476,7 +476,14 @@ def _history_label(h):
     side = "Long" if (h.get("sign") or 0) > 0 else "Short"
     cp = {"C": "Call", "P": "Put"}.get(h.get("call_put"), "Stock")
     k  = f"{h.get('strike', 0):g}" if h.get("strike") else ""
-    return (f"{h.get('closed_at', '—')}  ·  {side} {int(h.get('qty') or 0)} "
+    # Format date as "Jan 15, 2025" instead of raw ISO string
+    raw_date = h.get("closed_at") or ""
+    try:
+        dt = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+        date_str = dt.strftime("%b %d, %Y")
+    except Exception:
+        date_str = raw_date[:10] if raw_date else "—"
+    return (f"{date_str}  ·  {side} {int(h.get('qty') or 0)} "
             f"{h.get('root') or ''} {cp} {k}")
 
 

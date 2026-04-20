@@ -671,32 +671,20 @@ def _tx_dollar_value(t):
     Return the signed dollar value of a transaction.
     Credit = money in (positive), Debit = money out (negative).
 
-    For futures and futures-options TastyTrade's `value` field is often just
-    price × qty with NO contract multiplier applied.  We always use
-    price × qty × multiplier explicitly for those instruments.
-    For equity options `value` is already the full dollar amount.
+    TastyTrade's transactions API does NOT include the contract multiplier for
+    most instruments — the `value` and `multiplier` fields are unreliable.
+    We always compute: sign × qty × price × _contract_multiplier(root, instr).
     """
-    qty   = abs(float(t.get("quantity") or 0))
-    price = float(t.get("price") or 0)
-    mult  = float(t.get("multiplier") or 1) or 1
-    instr = (t.get("instrument-type") or "").lower()
+    qty    = abs(float(t.get("quantity") or 0))
+    price  = float(t.get("price") or 0)
+    instr  = t.get("instrument-type") or ""
     effect = (t.get("value-effect") or "").lower()
-    sign = 1 if "credit" in effect else -1
+    sign   = 1 if "credit" in effect else -1
 
-    # For futures / future-options always compute from first principles so the
-    # contract multiplier (e.g. 100,000 for /6A) is never dropped.
-    if "future" in instr:
-        return sign * qty * price * mult
+    root_sym = t.get("underlying-symbol") or t.get("symbol") or ""
+    root = normalize_root(root_sym) or root_sym.lstrip("/")
 
-    # Equity options: `value` is already the full dollar amount.
-    raw = t.get("value")
-    if raw is not None:
-        try:
-            v = abs(float(raw))
-            return sign * v
-        except (TypeError, ValueError):
-            pass
-    # fallback
+    mult = _contract_multiplier(root, instr)
     return sign * qty * price * mult
 
 
@@ -716,12 +704,12 @@ def transactions_to_closed_lots(transactions):
         al     = action.lower()
         qty    = abs(float(t.get("quantity") or 0))
         price  = float(t.get("price") or 0)
-        mult   = float(t.get("multiplier") or 1) or 1
-        when   = t.get("executed-at")
+        when     = t.get("executed-at")
         root_sym = t.get("underlying-symbol") or ""
-        root   = normalize_root(root_sym) or root_sym
-        cp, k  = parse_option_symbol(sym)
-        instr  = t.get("instrument-type") or ""
+        root     = normalize_root(root_sym) or root_sym
+        cp, k    = parse_option_symbol(sym)
+        instr    = t.get("instrument-type") or ""
+        mult     = _contract_multiplier(root, instr)   # effective $/pt multiplier
         # Signed dollar value: positive = cash received, negative = cash paid
         dollar_val = _tx_dollar_value(t)
 
@@ -915,6 +903,57 @@ def repair_history_pnl(history_all):
                     h["pnl"] = correct_pnl
                     changed = True
             except (TypeError, ValueError):
+                continue
+    return changed
+
+
+def repair_pnl_missing_multiplier(history_all):
+    """
+    Fix imported history entries whose P&L was stored without the contract
+    multiplier.  This happens because TastyTrade's transactions API does not
+    include the multiplier field — so previously every entry was computed as
+    price × qty × 1 instead of price × qty × correct_multiplier.
+
+    Detection: stored P&L ≈ sign × (cp − op) × qty × 1  (i.e. multiplier=1).
+    Fix:        stored P&L → sign × (cp − op) × qty × correct_multiplier.
+
+    Mutates history_all in-place.  Returns True if any entries were changed.
+    """
+    changed = False
+    for entries in history_all.values():
+        for h in entries:
+            if h.get("source") != "import":
+                continue
+            instr = h.get("instrument") or ""
+            root  = h.get("root") or ""
+            correct_mult = _contract_multiplier(root, instr)
+            if correct_mult <= 1:
+                continue   # stocks/unknown — nothing to fix
+
+            stored_mult = float(h.get("multiplier") or 1)
+            if stored_mult >= correct_mult * 0.9:
+                continue   # already correct
+
+            try:
+                sign = int(h.get("sign") or 0)
+                qty  = float(h.get("qty") or 0)
+                op   = float(h.get("open_price") or 0)
+                cp   = float(h.get("close_price") or 0)
+                # Verify the stored P&L matches the wrong (mult=1) calculation
+                # before overwriting, to avoid double-correcting.
+                wrong_pnl   = sign * (cp - op) * qty * 1
+                correct_pnl = sign * (cp - op) * qty * correct_mult
+                stored_pnl  = float(h.get("pnl") or 0)
+                # Only fix if stored P&L is close to the wrong value
+                if abs(wrong_pnl) < 1e-9:
+                    continue
+                ratio = stored_pnl / wrong_pnl
+                if not (0.8 < ratio < 1.2):
+                    continue   # doesn't match the "missing multiplier" pattern
+                h["pnl"]        = correct_pnl
+                h["multiplier"] = correct_mult
+                changed = True
+            except (TypeError, ValueError, ZeroDivisionError):
                 continue
     return changed
 
@@ -1182,6 +1221,58 @@ _FUTURES_SPAN = {
 }
 
 _SPAN_FALLBACK_PCT = 0.015   # 1.5 % of notional for unknown products
+
+
+# ── Contract dollar multipliers ──────────────────────────────────────────────
+# Dollar value of ONE UNIT of quoted option price × one contract.
+# TastyTrade's transactions API does NOT include this; we look it up by root.
+#   Equity options: always 100 (hardcoded, not in this table).
+#   Futures options: product-specific below.
+# Equity-index (CME): price in index points
+# Currency (CME): price in USD per foreign-currency unit × units per contract
+# Energy (NYMEX): price in $/unit × units per contract
+# Metals (COMEX): price in $/unit × units per contract
+# Rates (CBOT): price in %/100 of face × face_per_contract → expressed as $/1%
+
+_CONTRACT_MULT = {
+    # Equity index (CME)
+    "ES": 50,   "MES": 5,   "NQ": 20,   "MNQ": 2,
+    "RTY": 50,  "M2K": 5,   "YM": 5,    "MYM": 0.5,
+    "EMD": 100, "VX": 1000,
+    # Currency (CME) — units per contract × USD/unit already in price
+    "6A": 100000, "6B": 62500,  "6C": 100000, "6E": 125000,
+    "6J": 12500000, "6M": 500000, "6N": 100000, "6S": 125000,
+    "6Z": 500000,   "DX": 1000,
+    # Energy (NYMEX)
+    "CL": 1000, "MCL": 100, "NG": 10000, "RB": 42000, "HO": 42000, "QM": 500,
+    # Metals (COMEX/NYMEX)
+    "GC": 100, "MGC": 10,  "SI": 5000, "SIL": 1000,
+    "HG": 25000, "PL": 50, "PA": 100,
+    # Interest rates (CBOT/CME)  price = decimal points; 1 pt = $1,000
+    "ZB": 1000, "UB": 1000, "ZN": 1000, "ZF": 1000, "ZT": 2000,
+    "ZQ": 4167,
+    # Agriculture (CBOT/CME/ICE)
+    "ZC": 50,  "ZS": 50,  "ZW": 50,  "ZL": 600, "ZM": 100,
+    "KC": 375, "CC": 10,  "CT": 500, "SB": 1120, "OJ": 150,
+    # Livestock (CME)
+    "LE": 400, "HE": 400, "GF": 500,
+    # Crypto (CME)
+    "BTC": 5, "MBT": 0.1, "ETH": 50, "MET": 0.1,
+}
+
+
+def _contract_multiplier(root, instr):
+    """
+    Return the dollar value of 1.0 of quoted price for one contract.
+    Equity options → always 100.
+    Futures / futures options → look up by root, default 1 if unknown.
+    """
+    il = (instr or "").lower()
+    if "equity option" in il or il == "equity-option":
+        return 100.0
+    if "future" in il:
+        return float(_CONTRACT_MULT.get(root or "", 1))
+    return 1.0
 
 
 def _span_per_contract(leg):

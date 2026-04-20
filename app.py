@@ -18,7 +18,7 @@ from version import VERSION
 from models import (
     Position, StrategyInstance, unassigned_positions, group_unassigned,
     build_snapshot, detect_closures, portfolio_greeks, repair_history_pnl,
-    check_exit_conditions,
+    repair_pnl_missing_multiplier, check_exit_conditions,
 )
 from strategy_card import StrategyCard, pnl_color, money, fmt_num
 from strategies_page import ConfigurePage
@@ -353,9 +353,11 @@ class PortfolioScreen(QWidget):
 
         self.strategies_all = api.load_strategies()   # {acct_num: [entries]}
         self.history_all    = api.load_history()      # {acct_num: [entries]}
-        # One-time fix: futures option history imported before the multiplier fix
-        # had P&L ≈ price×qty instead of price×qty×mult.  Repair and re-save.
-        if repair_history_pnl(self.history_all):
+        # One-time fix: history imported before the multiplier fix had P&L stored
+        # without the contract multiplier (price×qty×1 instead of price×qty×mult).
+        _fixed = repair_history_pnl(self.history_all)
+        _fixed |= repair_pnl_missing_multiplier(self.history_all)
+        if _fixed:
             api.save_history(self.history_all)
         self.snapshots      = api.load_snapshots()
         self._account_names = api.load_account_names()
