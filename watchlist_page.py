@@ -117,6 +117,57 @@ _FUTURES_ROOTS = {
 }
 
 
+# ── Known index / ETF symbols (offline, instant lookup) ──────────────────────
+
+_INDEX_SYMBOLS = {
+    # Cash indices (option underlyings)
+    "SPX":  "S&P 500 Index",          "SPXW": "S&P 500 Weekly Index",
+    "NDX":  "NASDAQ-100 Index",       "NQX":  "NASDAQ-100 Reduced Value Index",
+    "RUT":  "Russell 2000 Index",     "RUA":  "Russell 3000 Index",
+    "VIX":  "CBOE Volatility Index",  "VIX9D":"CBOE VIX 9-Day",
+    "DJX":  "Dow Jones Index",        "XSP":  "Mini-SPX Index",
+    "MXEA": "MSCI EAFE Index",        "MXEF": "MSCI EM Index",
+    # Mega-cap & widely-traded equities
+    "AAPL": "Apple",                  "MSFT": "Microsoft",
+    "NVDA": "NVIDIA",                 "AMZN": "Amazon",
+    "GOOGL":"Alphabet A",             "GOOG": "Alphabet C",
+    "META": "Meta Platforms",         "TSLA": "Tesla",
+    "BRK":  "Berkshire Hathaway",     "JPM":  "JPMorgan Chase",
+    "V":    "Visa",                   "MA":   "Mastercard",
+    "UNH":  "UnitedHealth",           "XOM":  "Exxon Mobil",
+    "LLY":  "Eli Lilly",              "AVGO": "Broadcom",
+    "AMD":  "Advanced Micro Devices", "INTC": "Intel",
+    "NFLX": "Netflix",                "CRM":  "Salesforce",
+    "ORCL": "Oracle",                 "ADBE": "Adobe",
+    "SHOP": "Shopify",                "PLTR": "Palantir",
+    "COIN": "Coinbase",               "HOOD": "Robinhood",
+    "SOFI": "SoFi Technologies",      "UBER": "Uber",
+    # Popular ETFs
+    "SPY":  "SPDR S&P 500 ETF",       "IVV":  "iShares S&P 500 ETF",
+    "VOO":  "Vanguard S&P 500 ETF",   "QQQ":  "Invesco NASDAQ-100 ETF",
+    "IWM":  "iShares Russell 2000 ETF","DIA":  "SPDR Dow Jones ETF",
+    "GLD":  "SPDR Gold ETF",          "IAU":  "iShares Gold ETF",
+    "SLV":  "iShares Silver ETF",     "GDX":  "VanEck Gold Miners ETF",
+    "USO":  "United States Oil ETF",  "XLE":  "Energy Select SPDR",
+    "XLF":  "Financial Select SPDR",  "XLK":  "Technology Select SPDR",
+    "XLV":  "Health Care Select SPDR","XLI":  "Industrial Select SPDR",
+    "XLY":  "Consumer Discret. SPDR", "XLP":  "Consumer Staples SPDR",
+    "XLB":  "Materials Select SPDR",  "XLRE": "Real Estate Select SPDR",
+    "XLU":  "Utilities Select SPDR",  "XLC":  "Communication SPDR",
+    "TLT":  "iShares 20+ T-Bond ETF", "IEF":  "iShares 7-10 T-Bond ETF",
+    "HYG":  "iShares High Yield ETF", "LQD":  "iShares Corp Bond ETF",
+    "EEM":  "iShares MSCI EM ETF",    "EFA":  "iShares MSCI EAFE ETF",
+    "SMH":  "VanEck Semiconductor ETF","SOXX": "iShares Semiconductor ETF",
+    "ARKK": "ARK Innovation ETF",     "ARKG": "ARK Genomic ETF",
+    "UVXY": "ProShares Ultra VIX ETF", "SVXY": "ProShares Short VIX ETF",
+    "TQQQ": "ProShares UltraPro QQQ", "SQQQ": "ProShares UltraPro Short QQQ",
+    "UPRO": "ProShares UltraPro S&P", "SPXU": "ProShares UltraPro Short S&P",
+    "SOXL": "Direxion Semi Bull 3X",  "SOXS": "Direxion Semi Bear 3X",
+    "LABU": "Direxion Bio Bull 3X",   "LABD": "Direxion Bio Bear 3X",
+    "FNGU": "MicroSectors FANG+ Bull","FNGD": "MicroSectors FANG+ Bear",
+}
+
+
 # ── Suggest worker ────────────────────────────────────────────────────────────
 
 class _SuggestWorker(QThread):
@@ -130,23 +181,31 @@ class _SuggestWorker(QThread):
     def run(self):
         q = self.query
         results = []
+        seen = set()
+
+        def _add(sym, desc, kind):
+            if sym not in seen:
+                seen.add(sym)
+                results.append({"symbol": sym, "description": desc, "type": kind})
+
+        # ── Offline: indices & popular ETFs ───────────────────────────────────
+        for sym, desc in sorted(_INDEX_SYMBOLS.items()):
+            if sym.startswith(q):
+                _add(sym, desc, "Index/ETF")
 
         # ── Offline: futures roots ────────────────────────────────────────────
         for root, desc in sorted(_FUTURES_ROOTS.items()):
             if root.startswith(q):
-                results.append({"symbol": root, "description": desc, "type": "Futures"})
+                _add(root, desc, "Futures")
 
         # ── Online: TastyTrade equity search ──────────────────────────────────
         try:
-            equity = api.search_instruments(self.token, q, per_page=10)
-            fut_syms = {r["symbol"] for r in results}
-            for e in equity:
-                if e["symbol"] not in fut_syms:
-                    results.append(e)
+            for e in api.search_instruments(self.token, q, per_page=12):
+                _add(e["symbol"], e.get("description") or "", e.get("type") or "Equity")
         except Exception:
             pass
 
-        self.done.emit(results[:10])
+        self.done.emit(results[:12])
 
 
 # ── Suggest popup ─────────────────────────────────────────────────────────────
@@ -257,7 +316,7 @@ class _SuggestPopup(QFrame):
         anchor_bl = self._anchor.mapTo(parent,
                                        QPoint(0, self._anchor.height() + self._GAP))
         self.move(anchor_bl)
-        self.setFixedWidth(max(420, self._anchor.width()))
+        self.setFixedWidth(max(460, self._anchor.width()))
         self.adjustSize()
 
     # ── Interaction ───────────────────────────────────────────────────────────
@@ -746,9 +805,11 @@ class _TickerRow(QFrame):
         rm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         rm_btn.setToolTip(f"Remove {ticker}")
         rm_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
-            f"border: none; font-size: 15px; font-weight: bold; border-radius: 6px; }}"
-            f"QPushButton:hover {{ background: #3d1a1a; color: {T.RED}; }}"
+            f"QPushButton {{ background: rgba(239,68,68,0.12); color: {T.RED}; "
+            f"border: 1px solid rgba(239,68,68,0.25); font-size: 13px; "
+            f"font-weight: bold; border-radius: 6px; }}"
+            f"QPushButton:hover {{ background: rgba(239,68,68,0.28); "
+            f"border-color: {T.RED}; }}"
         )
         rm_btn.clicked.connect(lambda: self.remove_clicked.emit(self.ticker))
         lay.addWidget(rm_btn)
@@ -1050,8 +1111,12 @@ class WatchlistPage(QWidget):
         hl.addStretch()
 
         self.add_input = QLineEdit()
-        self.add_input.setPlaceholderText("Add ticker  (e.g. AAPL, MES, 6A)")
-        self.add_input.setFixedWidth(220)
+        self.add_input.setPlaceholderText("Add ticker  (e.g. AAPL, SPX, MES, 6A)")
+        self.add_input.setMinimumWidth(280)
+        self.add_input.setMaximumWidth(460)
+        self.add_input.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
         self.add_input.setFixedHeight(32)
         self.add_input.returnPressed.connect(self._add_ticker)
         hl.addWidget(self.add_input)
