@@ -351,15 +351,17 @@ class _SuggestPopup(QFrame):
         return row
 
     def _reposition(self):
-        # Map anchor's bottom-left to WatchlistPage local coordinates, then
-        # move there.  Works as a child widget; raise_() in show_results()
-        # ensures we're painted above the scroll area.
-        anchor_bl = self._anchor.mapToGlobal(
-            QPoint(0, self._anchor.height() + self._GAP)
+        # Use mapTo() to walk the widget hierarchy directly — avoids the
+        # global-coord round-trip and any DPI/window-offset surprises.
+        pos = self._anchor.mapTo(
+            self._page,
+            QPoint(0, self._anchor.height() + self._GAP),
         )
-        local = self._page.mapFromGlobal(anchor_bl)
-        self.move(local)
+        self.move(pos)
         self.setFixedWidth(max(460, self._anchor.width()))
+        # Force the layout to compute its geometry BEFORE we query sizeHint,
+        # otherwise adjustSize() may see height=0 on a not-yet-shown widget.
+        self.layout().activate()
         self.adjustSize()
 
     # ── Interaction ───────────────────────────────────────────────────────────
