@@ -99,6 +99,10 @@ class HistoryChart(FigureCanvasQTAgg):
         )
         self.draw()
 
+    def wheelEvent(self, event):
+        """Forward scroll events to the parent so the page scrolls normally."""
+        event.ignore()
+
     def _on_motion(self, event):
         if event.inaxes != self._ax or not self._xs or event.xdata is None:
             if self._cursor is not None:

@@ -3,7 +3,7 @@ from PyQt6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QLabel
 from PyQt6.QtCore import Qt, pyqtSignal
 
 import theme as T
-from models import probability_of_profit, symbol_ivr
+from models import probability_of_profit, symbol_ivr, check_exit_conditions
 
 
 def money(v, signed=False, na="—"):
@@ -86,6 +86,27 @@ class StrategyCard(QFrame):
             ivr_c = T.GREEN if ivr >= 50 else (T.YELLOW if ivr >= 25 else T.RED)
             sub_row.addWidget(self._badge(f"IVR {ivr:.0f}", ivr_c, outlined=True))
 
+        # Exit-plan alert badge
+        from models import StrategyInstance as _SI
+        if isinstance(strategy, _SI) and strategy.exit_plan:
+            conds = check_exit_conditions(strategy, strategy.exit_plan)
+            hit   = [c for c in conds if c["severity"] == "hit"]
+            near  = [c for c in conds if c["severity"] == "near"]
+            if hit:
+                badge_txt   = f"⚡ {hit[0]['label']}"
+                badge_style = (
+                    f"color: {T.RED}; background: #2d1515; border: 1px solid {T.RED}; "
+                    f"border-radius: 6px; padding: 2px 8px; font-size: 11px; font-weight: bold;"
+                )
+                sub_row.addWidget(self._badge_raw(badge_txt, badge_style))
+            elif near:
+                badge_txt   = f"◐ {near[0]['label']}"
+                badge_style = (
+                    f"color: {T.YELLOW}; background: #2a2010; border: 1px solid {T.YELLOW}; "
+                    f"border-radius: 6px; padding: 2px 8px; font-size: 11px; font-weight: bold;"
+                )
+                sub_row.addWidget(self._badge_raw(badge_txt, badge_style))
+
         sub_row.addStretch()
         left.addLayout(sub_row)
 
@@ -121,6 +142,11 @@ class StrategyCard(QFrame):
         h.addWidget(chevron)
 
     # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _badge_raw(self, text, stylesheet):
+        l = QLabel(text)
+        l.setStyleSheet(stylesheet)
+        return l
 
     def _badge(self, text, color, outlined=False):
         l = QLabel(text)

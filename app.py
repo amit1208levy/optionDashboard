@@ -1,11 +1,13 @@
 """Options Dashboard — setup + portfolio + configure screens."""
+import os
 import sys
 from datetime import datetime, timezone
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QStackedWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QComboBox,
-    QDialog, QDialogButtonBox, QFormLayout, QMessageBox, QTextEdit
+    QDialog, QDialogButtonBox, QFormLayout, QMessageBox, QTextEdit,
+    QCheckBox,
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
@@ -15,7 +17,8 @@ import updater
 from version import VERSION
 from models import (
     Position, StrategyInstance, unassigned_positions, group_unassigned,
-    build_snapshot, detect_closures, portfolio_greeks,
+    build_snapshot, detect_closures, portfolio_greeks, repair_history_pnl,
+    check_exit_conditions,
 )
 from strategy_card import StrategyCard, pnl_color, money, fmt_num
 from strategies_page import ConfigurePage
@@ -212,22 +215,34 @@ class SetupScreen(QWidget):
 # ── Account Settings dialog ──────────────────────────────────────────────────
 
 class AccountSettingsDialog(QDialog):
-    def __init__(self, accounts, overrides, parent=None):
+    # All optional Greek columns that can appear in the legs table
+    LEG_GREEK_OPTIONS = [
+        ("delta", "Δ  Delta"),
+        ("theta", "Θ  Theta"),
+        ("gamma", "Γ  Gamma"),
+        ("vega",  "V  Vega"),
+        ("iv",    "IV  Implied Volatility"),
+    ]
+
+    def __init__(self, accounts, overrides, settings, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Account Settings")
+        self.setWindowTitle("Settings")
         self.setStyleSheet(T.BASE_STYLE)
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(500)
         self._fields = {}
+        self._greek_checks = {}
+        enabled_greeks = settings.get("leg_greeks", ["delta", "theta", "iv"])
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 22, 24, 22)
-        root.setSpacing(14)
+        root.setSpacing(18)
 
-        title = QLabel("Rename accounts")
-        title.setStyleSheet(
-            f"color: {T.ACCENT}; font-size: 16px; font-weight: bold; border: none;"
+        # ── Account names ────────────────────────────────────────────────────
+        acct_title = QLabel("Rename accounts")
+        acct_title.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 15px; font-weight: bold; border: none;"
         )
-        root.addWidget(title)
+        root.addWidget(acct_title)
 
         hint = QLabel("Leave blank to use the default nickname from TastyTrade.")
         hint.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
@@ -252,6 +267,43 @@ class AccountSettingsDialog(QDialog):
             form.addRow(lbl, edit)
         root.addLayout(form)
 
+        # ── Divider ──────────────────────────────────────────────────────────
+        div = QFrame()
+        div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet(f"color: {T.BORDER};")
+        root.addWidget(div)
+
+        # ── Leg column visibility ────────────────────────────────────────────
+        col_title = QLabel("Leg column visibility")
+        col_title.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 15px; font-weight: bold; border: none;"
+        )
+        root.addWidget(col_title)
+
+        col_hint = QLabel(
+            "Choose which Greek columns appear in the Legs table on every strategy."
+        )
+        col_hint.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
+        col_hint.setWordWrap(True)
+        root.addWidget(col_hint)
+
+        checks_row = QHBoxLayout()
+        checks_row.setSpacing(18)
+        for key, label in self.LEG_GREEK_OPTIONS:
+            cb = QCheckBox(label)
+            cb.setChecked(key in enabled_greeks)
+            cb.setStyleSheet(
+                f"QCheckBox {{ color: {T.TEXT}; font-size: 13px; border: none; }}"
+                f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
+                f"border: 1px solid {T.BORDER}; background: {T.BG_ALT}; }}"
+                f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+            )
+            self._greek_checks[key] = cb
+            checks_row.addWidget(cb)
+        checks_row.addStretch()
+        root.addLayout(checks_row)
+
+        # ── Buttons ──────────────────────────────────────────────────────────
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -266,6 +318,11 @@ class AccountSettingsDialog(QDialog):
             if txt:
                 out[num] = txt
         return out
+
+    def result_leg_greeks(self):
+        """Return list of enabled Greek column keys in canonical order."""
+        order = [key for key, _ in self.LEG_GREEK_OPTIONS]
+        return [key for key in order if self._greek_checks[key].isChecked()]
 
 
 # ── Portfolio screen ─────────────────────────────────────────────────────────
@@ -292,9 +349,14 @@ class PortfolioScreen(QWidget):
         self.token = token
         self._worker = None
         self._accounts = []
+        self._alerted  = {}   # {(strategy_id, condition_type): severity} — prevents repeat alerts
 
         self.strategies_all = api.load_strategies()   # {acct_num: [entries]}
         self.history_all    = api.load_history()      # {acct_num: [entries]}
+        # One-time fix: futures option history imported before the multiplier fix
+        # had P&L ≈ price×qty instead of price×qty×mult.  Repair and re-save.
+        if repair_history_pnl(self.history_all):
+            api.save_history(self.history_all)
         self.snapshots      = api.load_snapshots()
         self._account_names = api.load_account_names()
         self._settings      = api.load_settings()
@@ -635,6 +697,7 @@ class PortfolioScreen(QWidget):
 
         # Detect closures + update snapshots for every account
         self._process_snapshots()
+        self._check_exit_alerts()
 
         self._refresh_account_combo()
         if self._accounts:
@@ -664,6 +727,48 @@ class PortfolioScreen(QWidget):
             api.save_history(self.history_all)
         if changed:
             api.save_snapshots(self.snapshots)
+
+    # ── Exit-plan alert checking ─────────────────────────────────────────────
+
+    def _check_exit_alerts(self):
+        """
+        After each refresh, evaluate every strategy's exit plan and fire a
+        macOS notification the first time a condition moves to 'hit' or 'near'.
+        """
+        for acct in self._accounts:
+            positions = acct["positions"]
+            for raw in self.strategies_all.get(acct["number"], []):
+                ep = raw.get("exit_plan") or {}
+                if not ep:
+                    continue
+                inst = StrategyInstance(raw, positions)
+                conds = check_exit_conditions(inst, ep)
+                for c in conds:
+                    key = (raw["id"], c["type"])
+                    prev_sev = self._alerted.get(key, "ok")
+                    new_sev  = c["severity"]
+                    # Only fire when escalating (ok→near, ok/near→hit)
+                    if new_sev in ("hit", "near") and new_sev != prev_sev:
+                        self._alerted[key] = new_sev
+                        self._notify(inst.name, c["message"], new_sev)
+                    elif new_sev == "ok":
+                        # Reset so it can re-fire if condition re-triggers
+                        self._alerted.pop(key, None)
+
+    @staticmethod
+    def _notify(strategy_name, message, severity):
+        """Fire a macOS notification (silent failure on non-Mac or sandboxed)."""
+        try:
+            icon = "⚡" if severity == "hit" else "◐"
+            title   = f"{icon} Exit Alert — {strategy_name}"
+            script  = (
+                f'display notification "{message}" '
+                f'with title "{title}" '
+                f'sound name "Basso"'
+            )
+            os.system(f"osascript -e '{script}'")
+        except Exception:
+            pass
 
     # ── Per-account strategies / history accessors ──────────────────────────
 
@@ -769,11 +874,18 @@ class PortfolioScreen(QWidget):
         except (ValueError, TypeError):
             self.cap_used_lbl.setText("—")
 
+        # TastyTrade gain fields are unsigned; direction is in *-effect (Credit/Debit/None)
+        def _signed_gain(key):
+            try:
+                raw = float(bal.get(key) or 0)
+                effect = (bal.get(f"{key}-effect") or "").lower()
+                return -raw if "debit" in effect else raw
+            except (TypeError, ValueError):
+                return 0.0
+
         # Day P&L (realized + unrealized change today)
         try:
-            day_r = float(bal.get("realized-day-gain") or 0)
-            day_u = float(bal.get("day-unrealized-profit-loss") or 0)
-            day_pnl = day_r + day_u
+            day_pnl = _signed_gain("realized-day-gain") + _signed_gain("unrealized-day-gain")
             self.day_pnl_lbl.setText(money(day_pnl, signed=True))
             self.day_pnl_lbl.setStyleSheet(
                 f"color: {pnl_color(day_pnl)}; font-size: 22px; font-weight: bold; "
@@ -784,8 +896,7 @@ class PortfolioScreen(QWidget):
 
         # YTD P&L (realized year gain — includes fees on TastyTrade)
         try:
-            ytd = float(bal.get("year-realized-profit-loss") or
-                        bal.get("realized-year-gain") or 0)
+            ytd = _signed_gain("realized-year-gain")
             self.ytd_pnl_lbl.setText(money(ytd, signed=True))
             self.ytd_pnl_lbl.setStyleSheet(
                 f"color: {pnl_color(ytd)}; font-size: 22px; font-weight: bold; "
@@ -1003,10 +1114,14 @@ class PortfolioScreen(QWidget):
     def _open_settings(self):
         if not self._accounts:
             return
-        dlg = AccountSettingsDialog(self._accounts, self._account_names, parent=self)
+        dlg = AccountSettingsDialog(
+            self._accounts, self._account_names, self._settings, parent=self
+        )
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._account_names = dlg.result_names()
             api.save_account_names(self._account_names)
+            self._settings["leg_greeks"] = dlg.result_leg_greeks()
+            api.save_settings(self._settings)
             self._refresh_account_combo()
 
     def _logout(self):

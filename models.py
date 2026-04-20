@@ -585,12 +585,17 @@ class StrategyInstance(Strategy):
             custom_name=(data.get("name") or None),
             is_custom=True,
         )
+        self._raw           = data   # live reference — mutations persist until save
         self.id             = data["id"]
         self.template_key   = data.get("template") or ""
         self.template       = _strategies_mod.get_template(self.template_key)
         self.notes          = data.get("notes", "")
         self.instance_created_at = _parse_iso(data.get("created_at"))
         self.missing_legs   = [s for s in self.leg_symbols if s not in by_sym]
+
+    @property
+    def exit_plan(self):
+        return self._raw.get("exit_plan") or {}
 
     @property
     def name(self):
@@ -664,23 +669,35 @@ def build_snapshot(positions):
 def _tx_dollar_value(t):
     """
     Return the signed dollar value of a transaction.
-    TastyTrade's `value` field is the authoritative dollar amount.
     Credit = money in (positive), Debit = money out (negative).
-    Falls back to price × qty × multiplier if value is missing.
+
+    For futures and futures-options TastyTrade's `value` field is often just
+    price × qty with NO contract multiplier applied.  We always use
+    price × qty × multiplier explicitly for those instruments.
+    For equity options `value` is already the full dollar amount.
     """
+    qty   = abs(float(t.get("quantity") or 0))
+    price = float(t.get("price") or 0)
+    mult  = float(t.get("multiplier") or 1) or 1
+    instr = (t.get("instrument-type") or "").lower()
+    effect = (t.get("value-effect") or "").lower()
+    sign = 1 if "credit" in effect else -1
+
+    # For futures / future-options always compute from first principles so the
+    # contract multiplier (e.g. 100,000 for /6A) is never dropped.
+    if "future" in instr:
+        return sign * qty * price * mult
+
+    # Equity options: `value` is already the full dollar amount.
     raw = t.get("value")
     if raw is not None:
         try:
             v = abs(float(raw))
-            effect = (t.get("value-effect") or "").lower()
-            return v if "credit" in effect else -v
+            return sign * v
         except (TypeError, ValueError):
             pass
     # fallback
-    qty  = abs(float(t.get("quantity") or 0))
-    price = float(t.get("price") or 0)
-    mult  = float(t.get("multiplier") or 1) or 1
-    return qty * price * mult
+    return sign * qty * price * mult
 
 
 def transactions_to_closed_lots(transactions):
@@ -758,6 +775,148 @@ def transactions_to_closed_lots(transactions):
                 if lot["qty"] <= 1e-9:
                     open_q.pop(0)
     return lots
+
+
+def check_exit_conditions(strategy, exit_plan):
+    """
+    Evaluate a strategy's exit plan against its current live values.
+
+    Returns a list of condition dicts:
+      { type, label, target, current, pct_done, severity, message }
+      severity: "hit" | "near" | "ok"
+
+    An empty exit_plan returns [].
+    """
+    if not exit_plan:
+        return []
+
+    results  = []
+    pnl      = strategy.pnl
+    credit   = strategy.credit_debit          # + = credit received, − = debit paid
+    ref      = abs(credit) if credit else None # reference amount for % calcs
+    dte      = strategy.dte
+    underlying = next(
+        (l.underlying_price for l in strategy.legs if l.underlying_price), None
+    )
+
+    # ── Profit target (% of credit / ref) ────────────────────────────────
+    pp = exit_plan.get("profit_pct")
+    if pp and ref:
+        target  = ref * pp / 100.0
+        done    = min(1.0, pnl / target) if target else 0.0
+        hit     = pnl >= target
+        near    = (not hit) and pnl >= target * 0.85
+        results.append({
+            "type":     "profit",
+            "label":    "Profit Target",
+            "target":   target,
+            "current":  pnl,
+            "pct_done": done,
+            "severity": "hit" if hit else ("near" if near else "ok"),
+            "message":  f"Profit target {pp:.0f}% of credit reached",
+        })
+
+    # ── Stop loss (% of credit) ───────────────────────────────────────────
+    sp = exit_plan.get("stop_pct")
+    if sp and ref:
+        stop   = -(ref * sp / 100.0)
+        hit    = pnl <= stop
+        near   = (not hit) and pnl <= stop * 0.85
+        done   = min(1.0, pnl / stop) if stop else 0.0
+        results.append({
+            "type":     "stop",
+            "label":    "Stop Loss",
+            "target":   stop,
+            "current":  pnl,
+            "pct_done": done,
+            "severity": "hit" if hit else ("near" if near else "ok"),
+            "message":  f"Stop loss {sp:.0f}% of credit triggered",
+        })
+
+    # ── DTE exit ──────────────────────────────────────────────────────────
+    de = exit_plan.get("dte_exit")
+    if de is not None and dte is not None:
+        hit  = dte <= de
+        near = (not hit) and dte <= de + 7
+        results.append({
+            "type":     "dte",
+            "label":    "DTE Exit",
+            "target":   de,
+            "current":  dte,
+            "pct_done": None,
+            "severity": "hit" if hit else ("near" if near else "ok"),
+            "message":  f"DTE target ≤{de}d reached (now {dte}d)",
+        })
+
+    # ── Underlying below ──────────────────────────────────────────────────
+    ub = exit_plan.get("underlying_below")
+    if ub and underlying is not None:
+        hit  = underlying <= ub
+        near = (not hit) and underlying <= ub * 1.02
+        results.append({
+            "type":     "below",
+            "label":    "Stop Below",
+            "target":   ub,
+            "current":  underlying,
+            "pct_done": None,
+            "severity": "hit" if hit else ("near" if near else "ok"),
+            "message":  f"Underlying broke below {ub:g} (now {underlying:.4f})",
+        })
+
+    # ── Underlying above ──────────────────────────────────────────────────
+    ua = exit_plan.get("underlying_above")
+    if ua and underlying is not None:
+        hit  = underlying >= ua
+        near = (not hit) and underlying >= ua * 0.98
+        results.append({
+            "type":     "above",
+            "label":    "Stop Above",
+            "target":   ua,
+            "current":  underlying,
+            "pct_done": None,
+            "severity": "hit" if hit else ("near" if near else "ok"),
+            "message":  f"Underlying broke above {ua:g} (now {underlying:.4f})",
+        })
+
+    return results
+
+
+def repair_history_pnl(history_all):
+    """
+    One-time migration: fix imported futures-option history entries whose P&L
+    was recorded without the contract multiplier (e.g. /6A × 100,000).
+
+    Detects affected entries by comparing the stored pnl to the expected value
+    sign × qty × mult × (close_price − open_price).  If the stored value is
+    roughly 1/mult of what it should be, recomputes and flags the entry.
+
+    Mutates history_all in-place.  Returns True if any entries were changed.
+    """
+    changed = False
+    for entries in history_all.values():
+        for h in entries:
+            if h.get("source") != "import":
+                continue
+            instr = (h.get("instrument") or "").lower()
+            if "future" not in instr:
+                continue
+            mult = float(h.get("multiplier") or 1)
+            if mult <= 1:
+                continue
+            try:
+                sign = int(h.get("sign") or 0)
+                qty  = float(h.get("qty") or 0)
+                op   = float(h.get("open_price") or 0)
+                cp   = float(h.get("close_price") or 0)
+                correct_pnl = sign * qty * mult * (cp - op)
+                stored_pnl  = float(h.get("pnl") or 0)
+                # If stored P&L is ≈ correct_pnl / mult, the multiplier was dropped
+                if abs(correct_pnl) > 1 and abs(stored_pnl) < abs(correct_pnl) * 0.1:
+                    h["pnl"] = correct_pnl
+                    changed = True
+            except (TypeError, ValueError):
+                continue
+    return changed
 
 
 def _history_key(entry):
@@ -1154,7 +1313,7 @@ def strategy_allocation(instances, unassigned_groups, overrides_by_id=None):
         })
     for g in unassigned_groups:
         rows.append({
-            "id":      g.id,
+            "id":      g.key,   # Strategy uses .key; only StrategyInstance has .id
             "name":    g.auto_name,
             "root":    g.root or "—",
             "capital": _capital_for(g),
@@ -1232,11 +1391,13 @@ def scenario_pnl(strategy, price_pct=0.0, iv_pct=0.0, days_forward=0):
                    + t * days_forward)    # theta is per day
         pnl += leg_pnl * qty * mult * sign
 
-        # Rough shocked greeks (delta approx: d + gamma*dS; vega & theta decay linearly)
+        # Shocked Greeks — use the same qty×100×sign convention as Strategy._agg
+        # so the values are consistent with the main Greeks card display.
+        # (P&L above uses the real multiplier because it's in dollars.)
         shocked_d = d + g * dS
-        new_delta += shocked_d * qty * mult * sign
-        new_theta += t * qty * mult * sign
-        new_vega  += v * qty * mult * sign
+        new_delta += shocked_d * qty * 100 * sign
+        new_theta += t         * qty * 100 * sign
+        new_vega  += v         * qty * 100 * sign
 
     # First-order extrapolation can overshoot the theoretical bounds of the
     # payoff diagram. Clamp so a short option can't "profit" beyond the credit

@@ -404,25 +404,33 @@ class RiskPage(QWidget):
     # ── Build content ─────────────────────────────────────────────────────────
 
     def _populate(self):
-        acct = self.portfolio.current_account()
-        if not acct:
-            self.body.addWidget(QLabel("No account loaded."))
+        try:
+            acct = self.portfolio.current_account()
+            if not acct:
+                self.body.addWidget(QLabel("No account loaded."))
+                self.body.addStretch()
+                return
+
+            positions  = acct["positions"]
+            instances  = [StrategyInstance(d, positions)
+                          for d in self.portfolio.strategies_raw]
+            leftover   = unassigned_positions(positions, self.portfolio.strategies_raw)
+            unassigned = group_unassigned(leftover)
+            overrides  = {r["id"]: r["capital_override"]
+                          for r in self.portfolio.strategies_raw
+                          if r.get("capital_override") is not None}
+
+            metrics = acct.get("metrics") or {}
+            self._build_allocation(instances, unassigned, overrides)
+            self._build_heatmap(metrics)
             self.body.addStretch()
-            return
-
-        positions  = acct["positions"]
-        instances  = [StrategyInstance(d, positions)
-                      for d in self.portfolio.strategies_raw]
-        leftover   = unassigned_positions(positions, self.portfolio.strategies_raw)
-        unassigned = group_unassigned(leftover)
-        overrides  = {r["id"]: r["capital_override"]
-                      for r in self.portfolio.strategies_raw
-                      if r.get("capital_override") is not None}
-
-        metrics = acct.get("metrics") or {}
-        self._build_allocation(instances, unassigned, overrides)
-        self._build_heatmap(metrics)
-        self.body.addStretch()
+        except Exception as exc:
+            import traceback
+            err = QLabel(f"Error loading Risk page:\n{exc}\n\n{traceback.format_exc()}")
+            err.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
+            err.setWordWrap(True)
+            self.body.addWidget(err)
+            self.body.addStretch()
 
     # ── Allocation by strategy ────────────────────────────────────────────────
 

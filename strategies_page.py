@@ -189,19 +189,33 @@ class TemplateCard(QFrame):
 # ── Builder dialog: pick legs for a template ─────────────────────────────────
 
 class StrategyBuilderDialog(QDialog):
+    """
+    Two-section leg picker:
+      1. Open positions   – checkboxes for live portfolio legs (optional)
+      2. Planned legs     – type any symbol to plan the strategy before opening it
+
+    Creating with zero legs is allowed; the strategy will show a "0/N legs" warning
+    and can be fully assigned later from the main portfolio or by editing.
+    """
+
     def __init__(self, template, available_legs, existing=None, parent=None):
         super().__init__(parent)
-        self.template = template
+        self.template       = template
         self.available_legs = available_legs
-        self.existing = existing  # existing StrategyInstance (edit mode) or None
+        self.existing       = existing
+        self._planned_syms: list[str] = []   # manually entered planned symbols
+
         self.setStyleSheet(T.BASE_STYLE)
-        self.setWindowTitle(f"Create Strategy — {template.name}")
-        self.setMinimumSize(620, 520)
+        self.setWindowTitle(
+            f"{'Edit' if existing else 'Create'} Strategy — {template.name}"
+        )
+        self.setMinimumSize(640, 580)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(22, 20, 22, 20)
-        root.setSpacing(10)
+        root.setSpacing(8)
 
+        # ── Header ────────────────────────────────────────────────────────────
         title = QLabel(template.name)
         title.setStyleSheet(
             f"color: {T.ACCENT}; font-size: 18px; font-weight: bold; "
@@ -209,21 +223,32 @@ class StrategyBuilderDialog(QDialog):
         )
         root.addWidget(title)
 
-        sub = QLabel(f"{template.category}  ·  {template.outlook}  ·  {template.risk} risk")
+        sub = QLabel(
+            f"{template.category}  ·  {template.outlook}  ·  {template.risk} risk"
+        )
         sub.setStyleSheet(
             f"color: {T.MUTED}; font-size: 12px; border: none; background: transparent;"
         )
         root.addWidget(sub)
 
-        spec = QLabel("Required legs: " + "  ·  ".join(leg.label for leg in template.legs))
-        spec.setWordWrap(True)
-        spec.setStyleSheet(
-            f"color: {T.LABEL}; font-size: 12px; border: none; background: transparent;"
-        )
-        root.addWidget(spec)
-        root.addSpacing(6)
+        if template.legs:
+            spec = QLabel(
+                "Expected legs: " + "  ·  ".join(leg.label for leg in template.legs)
+            )
+            spec.setWordWrap(True)
+            spec.setStyleSheet(
+                f"color: {T.LABEL}; font-size: 12px; border: none; background: transparent;"
+            )
+            root.addWidget(spec)
 
-        root.addWidget(QLabel("Strategy name"))
+        root.addSpacing(4)
+
+        # ── Name ──────────────────────────────────────────────────────────────
+        name_hdr = QLabel("Strategy name")
+        name_hdr.setStyleSheet(
+            f"color: {T.LABEL}; font-size: 11px; font-weight: bold; border: none;"
+        )
+        root.addWidget(name_hdr)
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText(f"e.g. {template.name} on SPY")
         if existing and existing.custom_name:
@@ -231,23 +256,38 @@ class StrategyBuilderDialog(QDialog):
         root.addWidget(self.name_edit)
 
         root.addSpacing(6)
-        hdr = QLabel(f"Select legs from this account  "
-                     f"({len(available_legs)} available)")
-        hdr.setStyleSheet(
-            f"color: {T.LABEL}; font-size: 12px; font-weight: bold; "
-            f"border: none; background: transparent;"
+
+        # ── Work out which existing legs are live vs missing ──────────────────
+        avail_syms    = {p.symbol for p in available_legs}
+        pre_selected  = set()    # existing live legs to pre-check
+        pre_planned   = []       # existing legs no longer in portfolio
+
+        if existing:
+            for s in existing.leg_symbols:
+                if s in avail_syms:
+                    pre_selected.add(s)
+                else:
+                    pre_planned.append(s)
+
+        # ── Section 1: Open positions ─────────────────────────────────────────
+        pos_hdr = QLabel(
+            f"Assign open positions  "
+            f"({'%d available' % len(available_legs) if available_legs else 'none in portfolio'})"
         )
-        root.addWidget(hdr)
+        pos_hdr.setStyleSheet(
+            f"color: {T.LABEL}; font-size: 12px; font-weight: bold; border: none;"
+        )
+        root.addWidget(pos_hdr)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        box = QWidget()
-        vl = QVBoxLayout(box)
-        vl.setContentsMargins(4, 4, 4, 4)
-        vl.setSpacing(4)
+        pos_scroll = QScrollArea()
+        pos_scroll.setWidgetResizable(True)
+        pos_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        pos_box = QWidget()
+        pos_vl  = QVBoxLayout(pos_box)
+        pos_vl.setContentsMargins(4, 4, 4, 4)
+        pos_vl.setSpacing(4)
 
-        pre_selected = set(existing.leg_symbols) if existing else set()
-        self._checks = []
+        self._checks: list[QCheckBox] = []
         for leg in available_legs:
             cb = QCheckBox(_leg_summary(leg))
             cb.setProperty("symbol", leg.symbol)
@@ -259,19 +299,85 @@ class StrategyBuilderDialog(QDialog):
             if leg.symbol in pre_selected:
                 cb.setChecked(True)
             self._checks.append(cb)
-            vl.addWidget(cb)
+            pos_vl.addWidget(cb)
 
         if not available_legs:
-            note = QLabel("No unassigned legs in this account. Open a position first.")
-            note.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; padding: 20px;")
-            vl.addWidget(note)
+            note = QLabel(
+                "No open positions in portfolio right now.  "
+                "You can still create this strategy and assign legs later — "
+                "use the Planned legs section below, or come back and edit once "
+                "you've opened trades."
+            )
+            note.setWordWrap(True)
+            note.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 12px; padding: 12px; "
+                f"border: 1px dashed {T.BORDER}; border-radius: 8px; "
+                f"background: transparent;"
+            )
+            pos_vl.addWidget(note)
 
-        vl.addStretch()
-        scroll.setWidget(box)
-        root.addWidget(scroll, 1)
+        pos_vl.addStretch()
+        pos_scroll.setWidget(pos_box)
+        h = min(160, max(60, len(available_legs) * 40 + 16))
+        pos_scroll.setFixedHeight(h)
+        root.addWidget(pos_scroll)
 
+        root.addSpacing(6)
+
+        # ── Separator ─────────────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"background: {T.BORDER}; max-height: 1px; border: none;")
+        root.addWidget(sep)
+
+        root.addSpacing(2)
+
+        # ── Section 2: Planned legs ───────────────────────────────────────────
+        plan_hdr_row = QHBoxLayout()
+        plan_hdr = QLabel("Planned legs")
+        plan_hdr.setStyleSheet(
+            f"color: {T.LABEL}; font-size: 12px; font-weight: bold; border: none;"
+        )
+        plan_hdr_row.addWidget(plan_hdr)
+        plan_hint = QLabel(
+            "Add any symbol you plan to trade — they'll be linked automatically "
+            "once you open the position."
+        )
+        plan_hint.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none;"
+        )
+        plan_hdr_row.addWidget(plan_hint, 1)
+        root.addLayout(plan_hdr_row)
+
+        add_row = QHBoxLayout()
+        add_row.setSpacing(8)
+        self._sym_input = QLineEdit()
+        self._sym_input.setPlaceholderText(
+            "Ticker or full symbol  (e.g. SPY, AAPL, /MES, AAPL  241220C00200000)"
+        )
+        self._sym_input.returnPressed.connect(self._add_planned)
+        add_row.addWidget(self._sym_input)
+        add_btn = _btn("＋ Add")
+        add_btn.clicked.connect(self._add_planned)
+        add_row.addWidget(add_btn)
+        root.addLayout(add_row)
+
+        self._planned_frame = QFrame()
+        self._planned_frame.setStyleSheet("background: transparent; border: none;")
+        self._planned_vl = QVBoxLayout(self._planned_frame)
+        self._planned_vl.setContentsMargins(0, 2, 0, 0)
+        self._planned_vl.setSpacing(4)
+        root.addWidget(self._planned_frame)
+
+        # Pre-populate from missing existing legs
+        for sym in pre_planned:
+            self._add_planned_sym(sym, missing=True)
+
+        # ── Status + buttons ──────────────────────────────────────────────────
         self.status = QLabel("")
-        self.status.setStyleSheet(f"color: {T.YELLOW}; font-size: 11px; border: none;")
+        self.status.setStyleSheet(
+            f"color: {T.YELLOW}; font-size: 11px; border: none;"
+        )
         root.addWidget(self.status)
 
         btns = QDialogButtonBox(
@@ -281,23 +387,81 @@ class StrategyBuilderDialog(QDialog):
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
 
-    def _selected_symbols(self):
-        return [cb.property("symbol") for cb in self._checks if cb.isChecked()]
+    # ── Planned leg management ─────────────────────────────────────────────────
+
+    def _add_planned(self):
+        sym = self._sym_input.text().strip().upper()
+        if not sym:
+            return
+        self._sym_input.clear()
+        self._add_planned_sym(sym)
+
+    def _add_planned_sym(self, sym: str, missing: bool = False):
+        if sym in self._planned_syms:
+            return
+        self._planned_syms.append(sym)
+
+        row = QFrame()
+        row.setStyleSheet(
+            f"QFrame {{ background: #12151d; border: 1px solid {T.BORDER}; "
+            f"border-radius: 6px; }}"
+        )
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(10, 5, 6, 5)
+        rl.setSpacing(8)
+
+        lbl = QLabel(sym)
+        lbl.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 13px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        rl.addWidget(lbl)
+        rl.addStretch()
+
+        badge_text  = "was in portfolio" if missing else "planned"
+        badge_color = T.YELLOW if missing else T.MUTED
+        badge = QLabel(badge_text)
+        badge.setStyleSheet(
+            f"color: {badge_color}; font-size: 10px; border: none; background: transparent;"
+        )
+        rl.addWidget(badge)
+
+        rm = QPushButton("✕")
+        rm.setFixedSize(22, 22)
+        rm.setCursor(Qt.CursorShape.PointingHandCursor)
+        rm.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: none; font-size: 13px; border-radius: 4px; }}"
+            f"QPushButton:hover {{ color: {T.RED}; background: #2a1010; }}"
+        )
+        rm.clicked.connect(lambda _, s=sym, r=row: self._remove_planned(s, r))
+        rl.addWidget(rm)
+
+        self._planned_vl.addWidget(row)
+
+    def _remove_planned(self, sym: str, row_widget: QFrame):
+        if sym in self._planned_syms:
+            self._planned_syms.remove(sym)
+        row_widget.deleteLater()
+
+    # ── Accept ─────────────────────────────────────────────────────────────────
 
     def _on_ok(self):
-        syms = self._selected_symbols()
-        expected = len(self.template.legs)
-        if not syms:
-            self.status.setText("Select at least one leg.")
-            return
-        if expected > 0 and len(syms) != expected:
-            self.status.setStyleSheet(f"color: {T.YELLOW}; font-size: 11px; border: none;")
+        pos_syms  = [cb.property("symbol") for cb in self._checks if cb.isChecked()]
+        all_syms  = pos_syms + list(self._planned_syms)
+        expected  = len(self.template.legs)
+
+        if expected > 0 and len(all_syms) != expected:
+            arrow = "fewer" if len(all_syms) < expected else "more"
             self.status.setText(
-                f"Template expects {expected} legs, {len(syms)} selected — "
-                f"you can save anyway and fill the rest later."
+                f"Template expects {expected} leg{'s' if expected != 1 else ''}, "
+                f"you have {len(all_syms)} ({arrow}) — saving anyway. "
+                f"Edit anytime to complete the strategy."
             )
+            # Not blocking — save with whatever legs are configured
+
         self._result = {
-            "symbols": syms,
+            "symbols": all_syms,
             "name":    self.name_edit.text().strip(),
         }
         self.accept()

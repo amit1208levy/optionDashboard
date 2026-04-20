@@ -1,27 +1,19 @@
 """Full-page strategy detail: metrics, Greeks, legs, payoff chart, history."""
+from datetime import date as _date
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QPushButton, QScrollArea, QSizePolicy, QInputDialog, QDialog, QSlider,
-    QMessageBox,
+    QMessageBox, QDoubleSpinBox, QLineEdit, QDialogButtonBox,
 )
 
 import api
 import theme as T
-from models import (
-    StrategyInstance, strategy_extremes, probability_of_profit, capital_for_strategy,
-    strategy_performance, symbol_ivr, symbol_ivp, symbol_beta, symbol_hv30,
-    scenario_pnl, distribute_futures_margin, unassigned_positions, group_unassigned,
-)
-from payoff_chart import PayoffChart
-from history_chart import HistoryChart
-from strategy_card import money, pct, fmt_num, pnl_color, dte_color
-from strategies_page import PastLegPickerDialog
 
+# ── Leg column definitions ───────────────────────────────────────────────────
 
-# ── Leg row (read-only) ─────────────────────────────────────────────────────
-
-LEG_COLUMNS = [
+# Columns always shown
+_BASE_LEG_COLUMNS = [
     ("Side",    60),
     ("Type",    58),
     ("Strike",  72),
@@ -31,20 +23,50 @@ LEG_COLUMNS = [
     ("Mark",    68),
     ("Premium", 90),
     ("P&L",     96),
-    ("Δ",       56),
-    ("Θ",       56),
-    ("IV",      62),
 ]
 
+# Optional Greek columns: key → (header_label, width)
+_GREEK_COL_DEFS = {
+    "delta": ("Δ",  56),
+    "theta": ("Θ",  56),
+    "gamma": ("Γ",  56),
+    "vega":  ("V",  56),
+    "iv":    ("IV", 62),
+}
+_GREEK_ORDER = ["delta", "theta", "gamma", "vega", "iv"]
+
+
+def _active_leg_columns():
+    """Return the column list to render, respecting the user's settings."""
+    settings = api.load_settings()
+    enabled  = settings.get("leg_greeks", ["delta", "theta", "iv"])
+    cols = list(_BASE_LEG_COLUMNS)
+    for key in _GREEK_ORDER:
+        if key in enabled:
+            cols.append(_GREEK_COL_DEFS[key])
+    return cols, enabled
+from models import (
+    StrategyInstance, strategy_extremes, probability_of_profit, capital_for_strategy,
+    strategy_performance, symbol_ivr, symbol_ivp, symbol_beta, symbol_hv30,
+    scenario_pnl, distribute_futures_margin, unassigned_positions, group_unassigned,
+    check_exit_conditions,
+)
+from payoff_chart import PayoffChart
+from history_chart import HistoryChart
+from strategy_card import money, pct, fmt_num, pnl_color, dte_color
+from strategies_page import PastLegPickerDialog
+
+
+# ── Leg row (read-only) ─────────────────────────────────────────────────────
 
 class LegHeader(QFrame):
-    def __init__(self, parent=None):
+    def __init__(self, columns, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background: transparent; border: none;")
         h = QHBoxLayout(self)
         h.setContentsMargins(10, 4, 6, 6)
         h.setSpacing(8)
-        for label, width in LEG_COLUMNS:
+        for label, width in columns:
             l = QLabel(label.upper())
             l.setFixedWidth(width)
             l.setStyleSheet(
@@ -56,7 +78,7 @@ class LegHeader(QFrame):
 
 
 class LegRow(QFrame):
-    def __init__(self, leg, parent=None):
+    def __init__(self, leg, enabled_greeks, columns, parent=None):
         super().__init__(parent)
         self.setStyleSheet(
             f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
@@ -71,21 +93,31 @@ class LegRow(QFrame):
         type_color = T.GREEN if leg.call_put == "C" else (T.RED if leg.call_put == "P" else T.MUTED)
         prem_color = T.GREEN if leg.credit_debit > 0 else (T.RED if leg.credit_debit < 0 else T.MUTED)
 
+        # Fixed base cells
         cells = [
-            (leg.direction_label.upper(),       side_color, 700),
-            (leg.type_label,                    type_color, 700),
-            (f"${leg.strike:g}" if leg.strike else "—", T.TEXT, 600),
+            (leg.direction_label.upper(),          side_color,         700),
+            (leg.type_label,                       type_color,         700),
+            (f"${leg.strike:g}" if leg.strike else "—", T.TEXT,        600),
             (leg.expires_at.strftime("%b %d %y") if leg.expires_at else "—", T.TEXT_DIM, 400),
-            (f"{leg.quantity:g}",               T.TEXT,     500),
-            (money(leg.avg_open_price),         T.TEXT_DIM, 400),
-            (money(leg.mark_price),             T.TEXT,     500),
-            (money(leg.credit_debit, signed=True), prem_color, 600),
-            (money(leg.pnl, signed=True),       pnl_color(leg.pnl), 700),
-            (fmt_num(leg.delta, 2, signed=True), T.TEXT_DIM, 400),
-            (fmt_num(leg.theta, 2, signed=True), T.TEXT_DIM, 400),
-            (pct(leg.iv * 100 if leg.iv is not None else None, signed=False), T.TEXT_DIM, 400),
+            (f"{leg.quantity:g}",                  T.TEXT,             500),
+            (money(leg.avg_open_price),            T.TEXT_DIM,         400),
+            (money(leg.mark_price),                T.TEXT,             500),
+            (money(leg.credit_debit, signed=True), prem_color,         600),
+            (money(leg.pnl, signed=True),          pnl_color(leg.pnl), 700),
         ]
-        for (text, color, weight), (_, width) in zip(cells, LEG_COLUMNS):
+        # Optional Greek cells appended in canonical order
+        greek_vals = {
+            "delta": fmt_num(leg.delta, 2, signed=True),
+            "theta": fmt_num(leg.theta, 2, signed=True),
+            "gamma": fmt_num(leg.gamma, 2, signed=True),
+            "vega":  fmt_num(leg.vega,  2, signed=True),
+            "iv":    pct(leg.iv * 100 if leg.iv is not None else None, signed=False),
+        }
+        for key in _GREEK_ORDER:
+            if key in enabled_greeks:
+                cells.append((greek_vals[key], T.TEXT_DIM, 400))
+
+        for (text, color, weight), (_, width) in zip(cells, columns):
             l = QLabel(text)
             l.setFixedWidth(width)
             l.setStyleSheet(
@@ -132,6 +164,7 @@ class StrategyDetailPage(QWidget):
         body.addWidget(self._build_legs_card())
 
         if isinstance(self.strategy, StrategyInstance):
+            body.addWidget(self._build_exit_plan_card())
             body.addWidget(self._build_history_card())
 
         tmpl_card = self._build_template_card()
@@ -171,6 +204,19 @@ class StrategyDetailPage(QWidget):
         )
         hl.addWidget(title)
         hl.addStretch()
+
+        if isinstance(self.strategy, StrategyInstance):
+            close_btn = QPushButton("✓  Record Close")
+            close_btn.setFixedHeight(32)
+            close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            close_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+                f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 0 14px; "
+                f"font-size: 12px; }}"
+                f"QPushButton:hover {{ color: {T.GREEN}; border-color: {T.GREEN}; }}"
+            )
+            close_btn.clicked.connect(self._record_close)
+            hl.addWidget(close_btn)
 
         whatif = QPushButton("✦  What-if")
         whatif.setFixedHeight(32)
@@ -227,6 +273,27 @@ class StrategyDetailPage(QWidget):
     def _open_whatif(self):
         dlg = WhatIfDialog(self.strategy, self)
         dlg.exec()
+
+    def _record_close(self):
+        if not isinstance(self.strategy, StrategyInstance):
+            return
+        dlg = RecordCloseDialog(self.strategy, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        entries = dlg.build_history_entries(self.strategy.id)
+        if not entries:
+            return
+        acct = self.portfolio.current_account()
+        if not acct:
+            return
+        hist = self.portfolio.history_all.setdefault(acct["number"], [])
+        hist.extend(entries)
+        self.portfolio.save_history()
+        QMessageBox.information(
+            self, "Recorded",
+            f"Recorded close for {len(entries)} leg(s)."
+        )
+        self.reopen_requested.emit(self.strategy)
 
     # ── Summary tiles ───────────────────────────────────────────────────────
 
@@ -589,11 +656,243 @@ class StrategyDetailPage(QWidget):
     # ── Legs table ──────────────────────────────────────────────────────────
 
     def _build_legs_card(self):
+        columns, enabled_greeks = _active_leg_columns()
         frame, lay = self._section_frame(f"Legs ({len(self.strategy.legs)})")
-        lay.addWidget(LegHeader())
+        lay.addWidget(LegHeader(columns))
         for leg in self.strategy.legs:
-            lay.addWidget(LegRow(leg))
+            lay.addWidget(LegRow(leg, enabled_greeks, columns))
         return frame
+
+    # ── Exit Plan ────────────────────────────────────────────────────────────
+
+    def _build_exit_plan_card(self):
+        """Editable exit-plan card: profit target, stop loss, DTE, price bounds."""
+        frame, lay = self._section_frame("Exit Plan")
+        ep = self.strategy.exit_plan if isinstance(self.strategy, StrategyInstance) else {}
+        conds = check_exit_conditions(self.strategy, ep)
+        cond_map = {c["type"]: c for c in conds}
+
+        credit = self.strategy.credit_debit
+        ref    = abs(credit) if credit else None
+        underlying = next(
+            (l.underlying_price for l in self.strategy.legs if l.underlying_price), None
+        )
+
+        # ── Field builder helper ────────────────────────────────────────────
+        def _row(label, ep_key, default_val, suffix, decimals, tooltip,
+                 context_fn=None, cond_type=None):
+            """Returns a QHBoxLayout row with a spinner and live status."""
+            hl = QHBoxLayout()
+            hl.setSpacing(10)
+
+            lbl = QLabel(label.upper())
+            lbl.setFixedWidth(130)
+            lbl.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
+                f"letter-spacing: 0.5px; border: none;"
+            )
+            hl.addWidget(lbl)
+
+            spin = QDoubleSpinBox()
+            spin.setDecimals(decimals)
+            spin.setMinimum(0.0)
+            spin.setMaximum(999999.0)
+            spin.setSingleStep(1.0 if decimals == 0 else 0.0001)
+            spin.setValue(float(ep.get(ep_key) or 0))
+            spin.setToolTip(tooltip)
+            spin.setFixedWidth(100)
+            spin.setStyleSheet(
+                f"QDoubleSpinBox {{ background: {T.BG_ALT}; color: {T.TEXT}; "
+                f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 3px 6px; "
+                f"font-size: 13px; }}"
+                f"QDoubleSpinBox:focus {{ border-color: {T.ACCENT}; }}"
+            )
+            hl.addWidget(spin)
+
+            suf_lbl = QLabel(suffix)
+            suf_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
+            hl.addWidget(suf_lbl)
+
+            # Context text (target dollar amount, etc.)
+            ctx_lbl = QLabel("")
+            ctx_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 11px; border: none;")
+            hl.addWidget(ctx_lbl)
+
+            hl.addStretch()
+
+            # Status dot
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color: {T.MUTED}; font-size: 14px; border: none;")
+            hl.addWidget(dot)
+
+            # Populate dot and context from current condition
+            def _refresh_status():
+                v = spin.value()
+                # Update context
+                if context_fn:
+                    ctx_lbl.setText(context_fn(v))
+                # Recompute condition live
+                tmp_ep = dict(ep); tmp_ep[ep_key] = v if v > 0 else None
+                tmp_conds = {c["type"]: c for c in check_exit_conditions(self.strategy, tmp_ep)}
+                c = tmp_conds.get(cond_type) if cond_type else None
+                if c is None or v == 0:
+                    dot.setText("●")
+                    dot.setStyleSheet(f"color: {T.MUTED}; font-size: 14px; border: none;")
+                elif c["severity"] == "hit":
+                    dot.setText("⚡")
+                    dot.setStyleSheet(f"color: {T.RED}; font-size: 14px; border: none;")
+                elif c["severity"] == "near":
+                    dot.setText("●")
+                    dot.setStyleSheet(f"color: {T.YELLOW}; font-size: 14px; border: none;")
+                else:
+                    dot.setText("●")
+                    dot.setStyleSheet(f"color: {T.GREEN}; font-size: 14px; border: none;")
+
+            _refresh_status()
+            spin.valueChanged.connect(lambda _v: _refresh_status())
+            spin.editingFinished.connect(lambda: self._save_exit_field(ep_key, spin.value()))
+
+            return hl
+
+        # Context helpers
+        def profit_ctx(v):
+            if not v or not ref: return ""
+            t = ref * v / 100.0
+            return f"→  target {money(t, signed=True)}"
+
+        def stop_ctx(v):
+            if not v or not ref: return ""
+            t = -(ref * v / 100.0)
+            return f"→  stop at {money(t, signed=True)}"
+
+        def dte_ctx(v):
+            if not v: return ""
+            dte = self.strategy.dte
+            return f"→  now {dte}d" if dte is not None else ""
+
+        def below_ctx(v):
+            if not v or not underlying: return ""
+            return f"→  now {underlying:.4f}"
+
+        def above_ctx(v):
+            if not v or not underlying: return ""
+            return f"→  now {underlying:.4f}"
+
+        # ── Two-column grid ─────────────────────────────────────────────────
+        left  = QVBoxLayout(); left.setSpacing(10)
+        right = QVBoxLayout(); right.setSpacing(10)
+
+        left.addLayout(_row(
+            "Profit Target", "profit_pct", 50, "% of credit",
+            0, "Close when P&L reaches this % of premium received",
+            profit_ctx, "profit",
+        ))
+        left.addLayout(_row(
+            "Stop Loss", "stop_pct", 200, "% of credit",
+            0, "Stop out when loss exceeds this % of premium received",
+            stop_ctx, "stop",
+        ))
+        left.addLayout(_row(
+            "DTE Exit", "dte_exit", 21, "days",
+            0, "Close when days to expiration drops to this level",
+            dte_ctx, "dte",
+        ))
+
+        right.addLayout(_row(
+            "Stop Below", "underlying_below", 0, "(underlying)",
+            4, "Stop out if underlying price falls to or below this level",
+            below_ctx, "below",
+        ))
+        right.addLayout(_row(
+            "Stop Above", "underlying_above", 0, "(underlying)",
+            4, "Stop out if underlying price rises to or above this level",
+            above_ctx, "above",
+        ))
+        if underlying is not None:
+            spot_lbl = QLabel(f"Current underlying:  {underlying:.4f}")
+            spot_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none; margin-top: 4px;")
+            right.addWidget(spot_lbl)
+        right.addStretch()
+
+        cols = QHBoxLayout()
+        cols.setSpacing(32)
+        cols.addLayout(left,  1)
+        cols.addLayout(right, 1)
+        lay.addLayout(cols)
+
+        # ── Progress bar for profit target ─────────────────────────────────
+        profit_c = cond_map.get("profit")
+        if profit_c and profit_c["target"] > 0:
+            done_pct = max(0.0, min(1.0, profit_c["pct_done"] or 0.0))
+            bar_outer = QFrame()
+            bar_outer.setFixedHeight(6)
+            bar_outer.setStyleSheet(
+                f"QFrame {{ background: {T.BG_ALT}; border: none; border-radius: 3px; }}"
+            )
+            bar_lay = QHBoxLayout(bar_outer)
+            bar_lay.setContentsMargins(0, 0, 0, 0)
+            bar_lay.setSpacing(0)
+            fill = QFrame()
+            fill_color = T.GREEN if done_pct >= 1.0 else (T.YELLOW if done_pct >= 0.7 else T.TEAL)
+            fill.setStyleSheet(f"QFrame {{ background: {fill_color}; border: none; border-radius: 3px; }}")
+            bar_lay.addWidget(fill, int(done_pct * 1000))
+            bar_lay.addWidget(QFrame(), int((1.0 - done_pct) * 1000))
+            pct_lbl = QLabel(f"{done_pct*100:.0f}% to target")
+            pct_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 10px; border: none; margin-top: 2px;")
+            lay.addWidget(bar_outer)
+            lay.addWidget(pct_lbl)
+
+        # ── Alert banners for triggered / near conditions ───────────────────
+        hit_conds  = [c for c in conds if c["severity"] == "hit"]
+        near_conds = [c for c in conds if c["severity"] == "near"]
+        if hit_conds or near_conds:
+            sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setStyleSheet(f"color: {T.BORDER}; margin-top: 4px;")
+            lay.addWidget(sep)
+
+        for c in hit_conds:
+            banner = QFrame()
+            banner.setStyleSheet(
+                f"QFrame {{ background: #2d1515; border: 1px solid {T.RED}; border-radius: 8px; }}"
+            )
+            bl = QHBoxLayout(banner); bl.setContentsMargins(14, 8, 14, 8)
+            icon = QLabel("⚡"); icon.setStyleSheet(f"color: {T.RED}; font-size: 16px; border: none;")
+            txt  = QLabel(c["message"])
+            txt.setStyleSheet(f"color: {T.RED}; font-size: 13px; font-weight: bold; border: none;")
+            bl.addWidget(icon); bl.addWidget(txt); bl.addStretch()
+            lay.addWidget(banner)
+
+        for c in near_conds:
+            banner = QFrame()
+            banner.setStyleSheet(
+                f"QFrame {{ background: #2a2010; border: 1px solid {T.YELLOW}; border-radius: 8px; }}"
+            )
+            bl = QHBoxLayout(banner); bl.setContentsMargins(14, 8, 14, 8)
+            icon = QLabel("◐"); icon.setStyleSheet(f"color: {T.YELLOW}; font-size: 16px; border: none;")
+            txt  = QLabel(f"Approaching: {c['message']}")
+            txt.setStyleSheet(f"color: {T.YELLOW}; font-size: 12px; border: none;")
+            bl.addWidget(icon); bl.addWidget(txt); bl.addStretch()
+            lay.addWidget(banner)
+
+        return frame
+
+    def _save_exit_field(self, key, value):
+        """Persist a single exit-plan field to the raw strategy dict."""
+        if not isinstance(self.strategy, StrategyInstance):
+            return
+        raw = next(
+            (r for r in self.portfolio.strategies_raw if r["id"] == self.strategy.id), None
+        )
+        if raw is None:
+            return
+        ep = raw.setdefault("exit_plan", {})
+        if value > 0:
+            ep[key] = value
+        else:
+            ep.pop(key, None)
+        # Sync back to the live instance
+        self.strategy._raw["exit_plan"] = ep
+        self.portfolio.save_strategies()
 
     # ── History (always shown for StrategyInstance) ─────────────────────────
 
@@ -717,9 +1016,11 @@ class StrategyDetailPage(QWidget):
             row.setStyleSheet(
                 f"QFrame {{ background: #12151d; border: 1px solid {T.BORDER}; "
                 f"border-radius: 6px; }}"
+                f"QFrame:hover {{ border-color: {T.BORDER_H}; }}"
             )
             hl = QHBoxLayout(row)
-            hl.setContentsMargins(10, 6, 10, 6)
+            hl.setContentsMargins(10, 6, 6, 6)
+            hl.setSpacing(6)
             label = QLabel(
                 f"{(h.get('closed_at') or '—')[:10]}  ·  {side} {int(h.get('qty') or 0)} "
                 f"{h.get('root') or ''} {cp} {k}"
@@ -735,6 +1036,33 @@ class StrategyDetailPage(QWidget):
                 f"border: none; background: transparent;"
             )
             hl.addWidget(pl)
+
+            # Edit P&L button
+            edit_btn = QPushButton("✎")
+            edit_btn.setFixedSize(26, 26)
+            edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            edit_btn.setToolTip("Edit P&L")
+            edit_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+                f"border: none; font-size: 13px; border-radius: 5px; }}"
+                f"QPushButton:hover {{ background: #1e2438; color: {T.ACCENT}; }}"
+            )
+            edit_btn.clicked.connect(lambda _checked, entry=h, lbl=pl: self._edit_history_entry(entry, lbl))
+            hl.addWidget(edit_btn)
+
+            # Delete button
+            del_btn = QPushButton("✕")
+            del_btn.setFixedSize(26, 26)
+            del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            del_btn.setToolTip("Remove entry")
+            del_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+                f"border: none; font-size: 13px; font-weight: bold; border-radius: 5px; }}"
+                f"QPushButton:hover {{ background: #3d1a1a; color: {T.RED}; }}"
+            )
+            del_btn.clicked.connect(lambda _checked, entry=h, widget=row: self._delete_history_entry(entry, widget))
+            hl.addWidget(del_btn)
+
             lay.addWidget(row)
 
         return frame
@@ -759,6 +1087,52 @@ class StrategyDetailPage(QWidget):
             self, "Saved", f"Assigned {len(syms)} closed leg(s) to this strategy."
         )
         self.reopen_requested.emit(self.strategy)
+
+    def _edit_history_entry(self, entry, pnl_label):
+        """Edit the P&L value of a closed-leg history entry inline."""
+        current = float(entry.get("pnl") or 0.0)
+        val, ok = QInputDialog.getDouble(
+            self, "Edit P&L",
+            "Enter corrected P&L for this leg:",
+            value=current, min=-1e9, max=1e9, decimals=2,
+        )
+        if not ok:
+            return
+        entry["pnl"] = val
+        self.portfolio.save_history()
+        # Update the label live without a full rebuild
+        from strategy_card import money, pnl_color
+        pnl_label.setText(money(val, signed=True))
+        pnl_label.setStyleSheet(
+            f"color: {pnl_color(val)}; font-size: 12px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+
+    def _delete_history_entry(self, entry, row_widget):
+        """Remove a single closed-leg history entry after confirmation."""
+        side = "Long" if (entry.get("sign") or 0) > 0 else "Short"
+        cp   = {"C": "Call", "P": "Put"}.get(entry.get("call_put"), "Stock")
+        k    = f" {entry.get('strike', 0):g}" if entry.get("strike") else ""
+        date = (entry.get("closed_at") or "")[:10]
+        desc = f"{date}  {side} {int(entry.get('qty') or 0)} {entry.get('root') or ''} {cp}{k}"
+        reply = QMessageBox.question(
+            self, "Remove entry",
+            f"Remove this history entry?\n\n{desc}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        acct = self.portfolio.current_account()
+        if acct:
+            hist = self.portfolio.history_all.get(acct["number"], [])
+            try:
+                hist.remove(entry)
+            except ValueError:
+                pass
+        self.portfolio.save_history()
+        # Hide the row immediately — no full rebuild needed
+        row_widget.setVisible(False)
+        row_widget.setFixedHeight(0)
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -801,6 +1175,256 @@ class StrategyDetailPage(QWidget):
         )
         lay.addWidget(v)
         return w
+
+
+# ── Record Close dialog ─────────────────────────────────────────────────────
+
+class RecordCloseDialog(QDialog):
+    """
+    Let the user record that a strategy was closed.
+    Shows each leg with an editable close price, live P&L, and a close date.
+    """
+
+    def __init__(self, strategy, parent=None):
+        super().__init__(parent)
+        self.strategy = strategy
+        self.setWindowTitle("Record Close")
+        self.setStyleSheet(T.BASE_STYLE)
+        self.setMinimumWidth(620)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 20, 24, 20)
+        root.setSpacing(14)
+
+        # Title
+        hdr = QLabel(f"Record close — {strategy.name}")
+        hdr.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 15px; font-weight: bold; border: none;"
+        )
+        root.addWidget(hdr)
+
+        hint = QLabel(
+            "Enter the price at which each leg was closed (or 0 for expired worthless). "
+            "P&L is computed automatically."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
+        root.addWidget(hint)
+
+        # Date row
+        date_row = QHBoxLayout()
+        date_row.setSpacing(10)
+        date_lbl = QLabel("Close date:")
+        date_lbl.setStyleSheet(f"color: {T.LABEL}; font-size: 12px; border: none;")
+        date_row.addWidget(date_lbl)
+        self._date_edit = QLineEdit(_date.today().isoformat())
+        self._date_edit.setFixedWidth(120)
+        self._date_edit.setPlaceholderText("YYYY-MM-DD")
+        date_row.addWidget(self._date_edit)
+        today_btn = QPushButton("Today")
+        today_btn.setFixedHeight(26)
+        today_btn.setFixedWidth(60)
+        today_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        today_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 5px; font-size: 11px; }}"
+            f"QPushButton:hover {{ color: {T.TEXT}; border-color: {T.ACCENT}; }}"
+        )
+        today_btn.clicked.connect(lambda: self._date_edit.setText(_date.today().isoformat()))
+        date_row.addWidget(today_btn)
+        date_row.addStretch()
+        mark_btn = QPushButton("↓  Fill mark prices")
+        mark_btn.setFixedHeight(26)
+        mark_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        mark_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 5px; font-size: 11px; padding: 0 10px; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+        )
+        mark_btn.clicked.connect(self._fill_marks)
+        date_row.addWidget(mark_btn)
+        root.addLayout(date_row)
+
+        # Divider
+        div = QFrame(); div.setFrameShape(QFrame.Shape.HLine)
+        div.setStyleSheet(f"color: {T.BORDER};")
+        root.addWidget(div)
+
+        # Column headers
+        col_hdr = QHBoxLayout()
+        col_hdr.setSpacing(0)
+        for text, width, align in [
+            ("Leg",    280, Qt.AlignmentFlag.AlignLeft),
+            ("Open",    90, Qt.AlignmentFlag.AlignRight),
+            ("Close",  110, Qt.AlignmentFlag.AlignRight),
+            ("P&L",    110, Qt.AlignmentFlag.AlignRight),
+        ]:
+            l = QLabel(text.upper())
+            l.setFixedWidth(width)
+            l.setAlignment(align)
+            l.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
+                f"letter-spacing: 0.5px; border: none;"
+            )
+            col_hdr.addWidget(l)
+        root.addLayout(col_hdr)
+
+        # One row per option leg
+        self._leg_rows = []   # list of (leg, spin, pnl_lbl)
+        legs_frame = QFrame()
+        legs_frame.setStyleSheet("background: transparent; border: none;")
+        legs_lay = QVBoxLayout(legs_frame)
+        legs_lay.setContentsMargins(0, 0, 0, 0)
+        legs_lay.setSpacing(6)
+
+        for leg in strategy.legs:
+            if not leg.is_option:
+                continue
+            side_color = T.TEAL if leg.is_long else T.YELLOW
+            type_color = T.GREEN if leg.call_put == "C" else T.RED
+            k = f"${leg.strike:g}" if leg.strike else ""
+            exp = leg.expires_at.strftime("%b %d %y") if leg.expires_at else ""
+            desc = (
+                f"<span style='color:{side_color};font-weight:bold'>"
+                f"{'Long' if leg.is_long else 'Short'}</span>"
+                f"  <span style='color:{type_color}'>"
+                f"{'Call' if leg.call_put == 'C' else 'Put'}</span>"
+                f"  <span style='color:{T.TEXT}'>{leg.quantity:g} × {leg.root}  {k}  {exp}</span>"
+            )
+
+            row_w = QHBoxLayout()
+            row_w.setSpacing(0)
+
+            desc_lbl = QLabel(desc)
+            desc_lbl.setFixedWidth(280)
+            desc_lbl.setStyleSheet("border: none; background: transparent;")
+            row_w.addWidget(desc_lbl)
+
+            open_lbl = QLabel(f"${leg.avg_open_price:.4f}" if leg.avg_open_price else "—")
+            open_lbl.setFixedWidth(90)
+            open_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            open_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 12px; border: none;")
+            row_w.addWidget(open_lbl)
+
+            spin = QDoubleSpinBox()
+            spin.setFixedWidth(100)
+            spin.setDecimals(4)
+            spin.setMinimum(0.0)
+            spin.setMaximum(99999.0)
+            spin.setSingleStep(0.0001)
+            spin.setValue(leg.mark_price or 0.0)
+            spin.setStyleSheet(
+                f"QDoubleSpinBox {{ background: {T.BG_ALT}; color: {T.TEXT}; "
+                f"border: 1px solid {T.BORDER}; border-radius: 5px; padding: 2px 6px; "
+                f"font-size: 12px; }}"
+                f"QDoubleSpinBox:focus {{ border-color: {T.ACCENT}; }}"
+            )
+            row_w.addWidget(spin)
+            row_w.addSpacing(10)
+
+            pnl_lbl = QLabel("—")
+            pnl_lbl.setFixedWidth(100)
+            pnl_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            pnl_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; font-weight: bold; border: none;")
+            row_w.addWidget(pnl_lbl)
+
+            legs_lay.addLayout(row_w)
+            self._leg_rows.append((leg, spin, pnl_lbl))
+
+            # Live update
+            spin.valueChanged.connect(lambda _v, l=leg, s=spin, p=pnl_lbl: self._update_pnl(l, s, p))
+            self._update_pnl(leg, spin, pnl_lbl)
+
+        root.addWidget(legs_frame)
+
+        # Total P&L
+        div2 = QFrame(); div2.setFrameShape(QFrame.Shape.HLine)
+        div2.setStyleSheet(f"color: {T.BORDER};")
+        root.addWidget(div2)
+
+        total_row = QHBoxLayout()
+        total_row.addStretch()
+        total_row.addWidget(QLabel("Total P&L:"))
+        self._total_lbl = QLabel("—")
+        self._total_lbl.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 15px; font-weight: bold; border: none; margin-left: 10px;"
+        )
+        total_row.addWidget(self._total_lbl)
+        root.addLayout(total_row)
+        self._refresh_total()
+
+        # Connect all spins to total refresh
+        for _, spin, _ in self._leg_rows:
+            spin.valueChanged.connect(lambda _v: self._refresh_total())
+
+        # Buttons
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Record")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    def _pnl_for(self, leg, close_price):
+        op   = leg.avg_open_price or 0.0
+        mult = leg.multiplier or 100
+        return leg.sign * leg.quantity * mult * (close_price - op)
+
+    def _update_pnl(self, leg, spin, lbl):
+        pnl = self._pnl_for(leg, spin.value())
+        from strategy_card import money, pnl_color
+        lbl.setText(money(pnl, signed=True))
+        lbl.setStyleSheet(
+            f"color: {pnl_color(pnl)}; font-size: 12px; font-weight: bold; border: none;"
+        )
+
+    def _refresh_total(self):
+        total = sum(self._pnl_for(leg, spin.value()) for leg, spin, _ in self._leg_rows)
+        from strategy_card import money, pnl_color
+        self._total_lbl.setText(money(total, signed=True))
+        self._total_lbl.setStyleSheet(
+            f"color: {pnl_color(total)}; font-size: 15px; font-weight: bold; border: none; margin-left: 10px;"
+        )
+
+    def _fill_marks(self):
+        for leg, spin, _ in self._leg_rows:
+            if leg.mark_price is not None:
+                spin.setValue(leg.mark_price)
+
+    def build_history_entries(self, strategy_id):
+        """Return list of history-entry dicts ready to append to portfolio.history."""
+        raw_date = self._date_edit.text().strip()
+        try:
+            close_date = _date.fromisoformat(raw_date)
+        except ValueError:
+            close_date = _date.today()
+        closed_at = close_date.isoformat() + "T00:00:00+00:00"
+
+        entries = []
+        for leg, spin, _ in self._leg_rows:
+            close_price = spin.value()
+            pnl = self._pnl_for(leg, close_price)
+            entries.append({
+                "symbol":      leg.symbol,
+                "root":        leg.root,
+                "strategy_id": strategy_id,
+                "qty":         leg.quantity,
+                "sign":        leg.sign,
+                "open_price":  leg.avg_open_price or 0.0,
+                "close_price": close_price,
+                "multiplier":  leg.multiplier or 100,
+                "opened_at":   leg.created_at.isoformat() if leg.created_at else None,
+                "closed_at":   closed_at,
+                "pnl":         pnl,
+                "source":      "manual",
+                "call_put":    leg.call_put,
+                "strike":      leg.strike,
+                "instrument":  leg.instrument_type,
+            })
+        return entries
 
 
 # ── What-if scenario dialog ─────────────────────────────────────────────────

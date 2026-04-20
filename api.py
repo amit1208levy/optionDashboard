@@ -265,6 +265,38 @@ def get_market_metrics(token, symbols):
     return out
 
 
+def search_instruments(token, query, per_page=10):
+    """
+    Type-ahead symbol search.  Returns a list of dicts:
+      [{"symbol": str, "description": str, "type": "Equity"|"ETF"|"Index"}, ...]
+
+    Uses TastyTrade /instruments/equities?symbol-starts-with=<q>.
+    Returns [] silently on any error so the UI can degrade gracefully.
+    """
+    if not query:
+        return []
+    try:
+        r = requests.get(
+            f"{BASE}/instruments/equities",
+            headers=auth_headers(token),
+            params={"symbol-starts-with": query.upper(), "per-page": per_page},
+            timeout=5,
+        )
+        if r.status_code != 200:
+            return []
+        out = []
+        for item in r.json().get("data", {}).get("items", []) or []:
+            sym  = item.get("symbol") or ""
+            desc = (item.get("description") or
+                    item.get("short-description") or "")
+            kind = item.get("instrument-type") or "Equity"
+            if sym:
+                out.append({"symbol": sym, "description": desc, "type": kind})
+        return out
+    except Exception:
+        return []
+
+
 def get_market_data(token, equity_options=None, future_options=None, equities=None, futures=None):
     """
     Snapshot quotes + Greeks for options and stocks/futures. Returns {symbol: quote dict}.

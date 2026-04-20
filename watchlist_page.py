@@ -1,13 +1,17 @@
-"""Watchlist page — track tickers by IV rank and size potential trades."""
+"""Watchlist page — multiple named lists, pin/star, IVR stars, liquidity stars."""
 import re
+import time
+
 import api
-from models import symbol_ivr, symbol_ivp, symbol_beta, symbol_hv30
+from models import symbol_ivr, symbol_ivp, symbol_beta
 import theme as T
 
 _FUT_MONTH = "FGHJKMNQUVXZ"
 
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
 def _has_price(quote):
-    """Return True if the quote dict contains a usable price."""
     if not quote:
         return False
     for k in ("mark", "last", "bid", "ask"):
@@ -18,31 +22,255 @@ def _has_price(quote):
             pass
     return False
 
+
 def _normalize_ticker(text):
-    """
-    Collapse any futures contract symbol down to its root.
-    /MESU6 -> MES,  /6AH6 -> 6A,  AAPL -> AAPL
-    Also handles bare contract month: MESU6 -> MES
-    """
     t = text.strip().upper().lstrip("/")
-    # Strip trailing month-code + 1-2 digit year (e.g. U6, H26)
     m = re.match(rf"^([A-Z0-9]{{1,5}})[{_FUT_MONTH}]\d{{1,2}}$", t)
     if m:
         return m.group(1)
     return t
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
+def _stars_html(n, max_n=5, color=None):
+    """Return HTML ★/☆ string.  n is already the star count (0–max_n)."""
+    n = max(0, min(max_n, int(round(n or 0))))
+    if color is None:
+        if n == 0:
+            color = T.MUTED
+        elif n <= 1:
+            color = T.RED
+        elif n == 2:
+            color = "#f97316"
+        elif n == 3:
+            color = T.YELLOW
+        else:
+            color = T.GREEN
+    filled = f"<span style='color:{color}'>{'★' * n}</span>"
+    empty  = f"<span style='color:{T.MUTED}'>{'☆' * (max_n - n)}</span>"
+    return filled + empty
+
+
+def _liq_stars(rating):
+    """HTML stars for TastyTrade liquidity-rating (0-5 int)."""
+    if rating is None:
+        return f"<span style='color:{T.MUTED}'>—</span>"
+    return _stars_html(rating)
+
+
+def _ivr_stars(ivr):
+    """IVR 0-100 → 1-5 star HTML (shown next to numeric IVR)."""
+    if ivr is None:
+        return ""
+    n = min(5, max(1, round(ivr / 20)))
+    color = T.GREEN if ivr >= 60 else (T.YELLOW if ivr >= 30 else T.RED)
+    return _stars_html(n, color=color)
+
+
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QScrollArea, QDialog, QSlider,
-    QComboBox, QDoubleSpinBox, QSizePolicy,
+    QComboBox, QDoubleSpinBox, QSizePolicy, QInputDialog, QMessageBox,
 )
+
+
+# ── Known futures roots (offline, instant lookup) ────────────────────────────
+
+_FUTURES_ROOTS = {
+    # Equity index
+    "ES":  "E-mini S&P 500",       "MES": "Micro E-mini S&P 500",
+    "NQ":  "E-mini NASDAQ-100",    "MNQ": "Micro E-mini NASDAQ-100",
+    "RTY": "E-mini Russell 2000",  "M2K": "Micro E-mini Russell 2000",
+    "YM":  "E-mini Dow Jones",     "MYM": "Micro E-mini Dow Jones",
+    "EMD": "E-mini S&P MidCap",    "VX":  "CBOE VIX Futures",
+    # Currency
+    "6E":  "Euro FX",              "6B":  "British Pound",
+    "6J":  "Japanese Yen",         "6A":  "Australian Dollar",
+    "6C":  "Canadian Dollar",      "6S":  "Swiss Franc",
+    "6N":  "New Zealand Dollar",   "DX":  "US Dollar Index",
+    "6M":  "Mexican Peso",         "6Z":  "South African Rand",
+    # Energy
+    "CL":  "Crude Oil WTI",        "MCL": "Micro Crude Oil",
+    "NG":  "Natural Gas",          "RB":  "RBOB Gasoline",
+    "HO":  "Heating Oil",          "QM":  "E-mini Crude Oil",
+    # Metals
+    "GC":  "Gold",                 "MGC": "Micro Gold",
+    "SI":  "Silver",               "SIL": "E-mini Silver",
+    "HG":  "Copper",               "PL":  "Platinum",
+    "PA":  "Palladium",
+    # Agriculture
+    "ZC":  "Corn",                 "ZS":  "Soybeans",
+    "ZW":  "Wheat",                "ZL":  "Soybean Oil",
+    "ZM":  "Soybean Meal",         "KC":  "Coffee",
+    "CC":  "Cocoa",                "CT":  "Cotton",
+    "SB":  "Sugar No. 11",         "OJ":  "Orange Juice",
+    # Interest rates
+    "ZB":  "30-Year T-Bond",       "UB":  "Ultra T-Bond",
+    "ZN":  "10-Year T-Note",       "ZF":  "5-Year T-Note",
+    "ZT":  "2-Year T-Note",        "ZQ":  "30-Day Fed Funds",
+    # Livestock
+    "LE":  "Live Cattle",          "HE":  "Lean Hogs",
+    "GF":  "Feeder Cattle",
+    # Crypto
+    "BTC": "Bitcoin",              "MBT": "Micro Bitcoin",
+    "ETH": "Ether",                "MET": "Micro Ether",
+}
+
+
+# ── Suggest worker ────────────────────────────────────────────────────────────
+
+class _SuggestWorker(QThread):
+    done = pyqtSignal(list)   # list of {symbol, description, type}
+
+    def __init__(self, token, query, parent=None):
+        super().__init__(parent)
+        self.token = token
+        self.query = query.upper().lstrip("/")
+
+    def run(self):
+        q = self.query
+        results = []
+
+        # ── Offline: futures roots ────────────────────────────────────────────
+        for root, desc in sorted(_FUTURES_ROOTS.items()):
+            if root.startswith(q):
+                results.append({"symbol": root, "description": desc, "type": "Futures"})
+
+        # ── Online: TastyTrade equity search ──────────────────────────────────
+        try:
+            equity = api.search_instruments(self.token, q, per_page=10)
+            fut_syms = {r["symbol"] for r in results}
+            for e in equity:
+                if e["symbol"] not in fut_syms:
+                    results.append(e)
+        except Exception:
+            pass
+
+        self.done.emit(results[:10])
+
+
+# ── Suggest popup ─────────────────────────────────────────────────────────────
+
+class _SuggestPopup(QFrame):
+    chosen = pyqtSignal(str)   # symbol selected
+
+    # How many px below the anchor widget's bottom edge to appear
+    _GAP = 4
+
+    def __init__(self, anchor: QLineEdit, page: QWidget):
+        super().__init__(page)   # child of WatchlistPage → overlays everything
+        self._anchor = anchor
+        self._hovered = -1
+        self._rows: list[QFrame] = []
+
+        self.setObjectName("suggestBox")
+        self.setStyleSheet(
+            f"QFrame#suggestBox {{ background: {T.CARD}; "
+            f"border: 1px solid {T.PURPLE}; border-radius: 10px; }}"
+        )
+        # Shadow-like effect via a slightly larger invisible border
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(5, 5, 5, 5)
+        self._lay.setSpacing(1)
+        self.hide()
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def show_results(self, results: list):
+        # Clear previous rows
+        for r in self._rows:
+            self._lay.removeWidget(r)
+            r.deleteLater()
+        self._rows = []
+        self._hovered = -1
+
+        if not results:
+            self.hide()
+            return
+
+        for r in results:
+            row = self._make_row(r)
+            self._lay.addWidget(row)
+            self._rows.append(row)
+
+        self._reposition()
+        self.show()
+        self.raise_()
+
+    def hide_popup(self):
+        self.hide()
+
+    # ── Layout ────────────────────────────────────────────────────────────────
+
+    def _make_row(self, r: dict) -> QFrame:
+        sym  = r["symbol"]
+        desc = r.get("description") or ""
+        kind = r.get("type") or "Equity"
+
+        row = QFrame()
+        row.setCursor(Qt.CursorShape.PointingHandCursor)
+        row.setStyleSheet(
+            f"QFrame {{ background: transparent; border: none; border-radius: 6px; }}"
+            f"QFrame:hover {{ background: {T.BG_ALT}; }}"
+        )
+
+        rl = QHBoxLayout(row)
+        rl.setContentsMargins(10, 7, 10, 7)
+        rl.setSpacing(10)
+
+        sym_lbl = QLabel(sym)
+        sym_lbl.setFixedWidth(68)
+        sym_lbl.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 13px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        rl.addWidget(sym_lbl)
+
+        desc_lbl = QLabel(desc)
+        desc_lbl.setStyleSheet(
+            f"color: {T.LABEL}; font-size: 11px; "
+            f"border: none; background: transparent;"
+        )
+        # Truncate long descriptions visually
+        desc_lbl.setMaximumWidth(260)
+        rl.addWidget(desc_lbl, 1)
+
+        type_c = T.TEAL if kind == "Futures" else (T.PURPLE if "ETF" in kind else T.BLUE)
+        kind_lbl = QLabel(kind)
+        kind_lbl.setStyleSheet(
+            f"color: {type_c}; font-size: 10px; font-weight: 600; "
+            f"border: none; background: transparent;"
+        )
+        rl.addWidget(kind_lbl)
+
+        # Wire click on all sub-labels too
+        for w in (row, sym_lbl, desc_lbl, kind_lbl):
+            w.mousePressEvent = lambda _e, s=sym: self._pick(s)
+
+        return row
+
+    def _reposition(self):
+        parent = self.parentWidget()
+        # Bottom-left of the anchor in parent (WatchlistPage) coordinates
+        anchor_bl = self._anchor.mapTo(parent,
+                                       QPoint(0, self._anchor.height() + self._GAP))
+        self.move(anchor_bl)
+        self.setFixedWidth(max(420, self._anchor.width()))
+        self.adjustSize()
+
+    # ── Interaction ───────────────────────────────────────────────────────────
+
+    def _pick(self, symbol: str):
+        self.chosen.emit(symbol)
+        self.hide()
 
 
 # ── Fetch worker ──────────────────────────────────────────────────────────────
 
 class _FetchWorker(QThread):
-    done = pyqtSignal(dict, dict)  # metrics, quotes
+    done = pyqtSignal(dict, dict)   # metrics, quotes
 
     def __init__(self, token, tickers, parent=None):
         super().__init__(parent)
@@ -54,14 +282,12 @@ class _FetchWorker(QThread):
             self.done.emit({}, {})
             return
         metrics = api.get_market_metrics(self.token, self.tickers)
-        # Try equity quotes first
-        quotes = api.get_market_data(self.token, equities=self.tickers)
-        # For any ticker that got no price, retry as a futures root (/MES, /6A …)
-        missing = [t for t in self.tickers
-                   if not _has_price(quotes.get(t))]
+        quotes  = api.get_market_data(self.token, equities=self.tickers)
+        missing = [t for t in self.tickers if not _has_price(quotes.get(t))]
         if missing:
-            fut_syms = ["/" + t for t in missing]
-            fut_quotes = api.get_market_data(self.token, futures=fut_syms)
+            fut_quotes = api.get_market_data(
+                self.token, futures=["/" + t for t in missing]
+            )
             for sym, q in fut_quotes.items():
                 root = sym.lstrip("/")
                 if root in missing:
@@ -88,18 +314,12 @@ class PositionSizerDialog(QDialog):
         )
         lay.addWidget(title)
 
-        sub = QLabel(
-            f"Current price: ${price:,.2f}   ·   Account NLV: ${nlv:,.0f}"
-        )
+        sub = QLabel(f"Current price: ${price:,.2f}   ·   Account NLV: ${nlv:,.0f}")
         sub.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
         lay.addWidget(sub)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"background: {T.BORDER}; max-height: 1px; border: none;")
-        lay.addWidget(sep)
+        self._sep(lay)
 
-        # Strategy type
         self._lbl(lay, "Strategy type")
         self.strategy_combo = QComboBox()
         self.strategy_combo.addItems([
@@ -112,7 +332,6 @@ class PositionSizerDialog(QDialog):
         self.strategy_combo.currentIndexChanged.connect(self._recalc)
         lay.addWidget(self.strategy_combo)
 
-        # Max allocation slider
         self._lbl(lay, "Max capital allocation  (% of NLV)")
         pct_row = QHBoxLayout()
         self.pct_slider = QSlider(Qt.Orientation.Horizontal)
@@ -121,62 +340,50 @@ class PositionSizerDialog(QDialog):
         self.pct_slider.valueChanged.connect(self._recalc)
         self.pct_val = QLabel("5%")
         self.pct_val.setFixedWidth(36)
-        self.pct_val.setStyleSheet(
-            f"color: {T.ACCENT}; font-weight: bold; border: none;"
-        )
+        self.pct_val.setStyleSheet(f"color: {T.ACCENT}; font-weight: bold; border: none;")
         pct_row.addWidget(self.pct_slider)
         pct_row.addWidget(self.pct_val)
         lay.addLayout(pct_row)
 
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"background: {T.BORDER}; max-height: 1px; border: none;")
-        lay.addWidget(sep2)
+        self._sep(lay)
 
-        # ── Premium per contract ──────────────────────────────────────────────
         self._lbl(lay, "Premium per contract  (option price as shown on chain)")
         cp_row = QHBoxLayout()
         self.cp_spin = QDoubleSpinBox()
         self.cp_spin.setRange(0.01, 99_999)
         self.cp_spin.setDecimals(2)
         self.cp_spin.setSingleStep(0.10)
-        # Default: ~2 % of underlying (rough ATM option value)
-        default_cp = max(round(price * 0.02 * 4) / 4, 0.05)
-        self.cp_spin.setValue(default_cp)
+        self.cp_spin.setValue(max(round(price * 0.02 * 4) / 4, 0.05))
         self.cp_spin.setStyleSheet(
             f"QDoubleSpinBox {{ background: {T.CARD}; color: {T.TEXT}; "
             f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 4px 8px; }}"
         )
         self.cp_spin.valueChanged.connect(self._recalc)
         cp_row.addWidget(self.cp_spin)
-
-        mult_lbl = QLabel("×")
-        mult_lbl.setStyleSheet(f"color: {T.MUTED}; border: none;")
-        cp_row.addWidget(mult_lbl)
-
+        x = QLabel("×")
+        x.setStyleSheet(f"color: {T.MUTED}; border: none;")
+        cp_row.addWidget(x)
         self.mult_spin = QDoubleSpinBox()
         self.mult_spin.setRange(1, 100_000)
         self.mult_spin.setDecimals(0)
         self.mult_spin.setSingleStep(100)
         self.mult_spin.setValue(100)
         self.mult_spin.setFixedWidth(90)
-        self.mult_spin.setToolTip("Contract multiplier (100 for equity options; varies for futures)")
         self.mult_spin.setStyleSheet(
             f"QDoubleSpinBox {{ background: {T.CARD}; color: {T.TEXT}; "
             f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 4px 8px; }}"
         )
         self.mult_spin.valueChanged.connect(self._recalc)
         cp_row.addWidget(self.mult_spin)
-
         self.cp_total_lbl = QLabel()
         self.cp_total_lbl.setStyleSheet(
-            f"color: {T.ACCENT}; font-size: 12px; font-weight: bold; border: none; margin-left: 8px;"
+            f"color: {T.ACCENT}; font-size: 12px; font-weight: bold; "
+            f"border: none; margin-left: 8px;"
         )
         cp_row.addWidget(self.cp_total_lbl)
         cp_row.addStretch()
         lay.addLayout(cp_row)
 
-        # ── Delta ─────────────────────────────────────────────────────────────
         self._lbl(lay, "Delta  (of the option leg, e.g. 20 = 20Δ)")
         delta_row = QHBoxLayout()
         self.delta_slider = QSlider(Qt.Orientation.Horizontal)
@@ -185,14 +392,11 @@ class PositionSizerDialog(QDialog):
         self.delta_slider.valueChanged.connect(self._recalc)
         self.delta_val = QLabel("20Δ")
         self.delta_val.setFixedWidth(42)
-        self.delta_val.setStyleSheet(
-            f"color: {T.ACCENT}; font-weight: bold; border: none;"
-        )
+        self.delta_val.setStyleSheet(f"color: {T.ACCENT}; font-weight: bold; border: none;")
         delta_row.addWidget(self.delta_slider)
         delta_row.addWidget(self.delta_val)
         lay.addLayout(delta_row)
 
-        # ── DTE ───────────────────────────────────────────────────────────────
         self._lbl(lay, "Estimated DTE  (days to expiration)")
         dte_row = QHBoxLayout()
         self.dte_slider = QSlider(Qt.Orientation.Horizontal)
@@ -201,14 +405,11 @@ class PositionSizerDialog(QDialog):
         self.dte_slider.valueChanged.connect(self._recalc)
         self.dte_val = QLabel("45d")
         self.dte_val.setFixedWidth(42)
-        self.dte_val.setStyleSheet(
-            f"color: {T.ACCENT}; font-weight: bold; border: none;"
-        )
+        self.dte_val.setStyleSheet(f"color: {T.ACCENT}; font-weight: bold; border: none;")
         dte_row.addWidget(self.dte_slider)
         dte_row.addWidget(self.dte_val)
         lay.addLayout(dte_row)
 
-        # ── Results card ──────────────────────────────────────────────────────
         res = QFrame()
         res.setStyleSheet(
             f"background: {T.CARD}; border-radius: 8px; border: 1px solid {T.BORDER};"
@@ -216,17 +417,13 @@ class PositionSizerDialog(QDialog):
         res_lay = QVBoxLayout(res)
         res_lay.setContentsMargins(16, 14, 16, 16)
         res_lay.setSpacing(6)
-
-        # Top: contracts + total premium side by side
         top_row = QHBoxLayout()
         top_row.setSpacing(24)
-
         self.contracts_lbl = QLabel()
         self.contracts_lbl.setStyleSheet(
             f"color: {T.TEXT}; font-size: 22px; font-weight: bold; border: none;"
         )
         top_row.addWidget(self.contracts_lbl)
-
         self.total_prem_lbl = QLabel()
         self.total_prem_lbl.setStyleSheet(
             f"color: {T.GREEN}; font-size: 22px; font-weight: bold; border: none;"
@@ -234,24 +431,18 @@ class PositionSizerDialog(QDialog):
         top_row.addWidget(self.total_prem_lbl)
         top_row.addStretch()
         res_lay.addLayout(top_row)
-
-        # Detail lines
         self.capital_lbl = QLabel()
         self.capital_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
         res_lay.addWidget(self.capital_lbl)
-
         self.bp_lbl = QLabel()
         self.bp_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
         res_lay.addWidget(self.bp_lbl)
-
         self.theta_lbl = QLabel()
         self.theta_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
         res_lay.addWidget(self.theta_lbl)
-
         self.pop_lbl = QLabel()
         self.pop_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
         res_lay.addWidget(self.pop_lbl)
-
         lay.addWidget(res)
 
         close_btn = QPushButton("Close")
@@ -269,152 +460,253 @@ class PositionSizerDialog(QDialog):
         self.price = price
         self._recalc()
 
-    def _lbl(self, parent_lay, text):
-        lbl = QLabel(text)
-        lbl.setStyleSheet(
+    def _sep(self, lay):
+        s = QFrame()
+        s.setFrameShape(QFrame.Shape.HLine)
+        s.setStyleSheet(f"background: {T.BORDER}; max-height: 1px; border: none;")
+        lay.addWidget(s)
+
+    def _lbl(self, lay, text):
+        l = QLabel(text)
+        l.setStyleSheet(
             f"color: {T.LABEL}; font-size: 11px; font-weight: bold; "
             f"border: none; margin-top: 4px;"
         )
-        parent_lay.addWidget(lbl)
+        lay.addWidget(l)
 
-    def _cap_per_contract(self, cp_dollars, delta_frac, dte, strategy_idx):
-        """
-        Estimate capital (BP) required per contract.
-
-        idx 0  Short Strangle/Straddle  → naked-style both sides:
-                 20 % of underlying × mult  minus  premium collected
-        idx 1  Iron Condor / Spread      → max-loss = width × mult
-                 approximate width from delta: OTM width ≈ (0.5-delta) × price × 0.35
-        idx 2  Naked Put or Call         → same as half of strangle
-        idx 3  Long Option  (debit)      → just the premium paid
-        idx 4  Stock / ETF               → full notional  (price × 1 share)
-        """
+    def _cap_per_contract(self, cp_dollars, delta_frac, dte, idx):
         mult = float(self.mult_spin.value()) or 100
         S = self.price
-
-        if strategy_idx == 4:          # equity / ETF
-            return S * mult
-
-        if strategy_idx == 3:          # long option — cost is the premium
-            return cp_dollars
-
-        # Naked-margin approximation (Reg-T style):
-        #   20 % of underlying notional  minus  OTM discount  plus  premium
-        # OTM discount ≈ (0.5 − delta) × price × mult × 0.06
-        notional   = S * mult
-        otm_disc   = (0.5 - delta_frac) * notional * 0.06
-        naked_cap  = notional * 0.20 - otm_disc + cp_dollars
-
-        if strategy_idx == 1:          # defined risk / spread
-            # Estimate wing width from delta positioning:
-            # width ≈ (0.5 − delta) × price × 0.20
+        if idx == 4: return S * mult
+        if idx == 3: return cp_dollars
+        notional  = S * mult
+        otm_disc  = (0.5 - delta_frac) * notional * 0.06
+        naked_cap = notional * 0.20 - otm_disc + cp_dollars
+        if idx == 1:
             width = max((0.5 - delta_frac) * S * 0.20, S * 0.02)
             return width * mult
-
-        if strategy_idx == 0:          # strangle / straddle — single margin block (not doubled)
-            return max(naked_cap, cp_dollars * 1.5)
-
-        # idx 2 — naked single leg
         return max(naked_cap, cp_dollars * 1.5)
 
     def _recalc(self):
-        pct       = self.pct_slider.value()
-        delta_raw = self.delta_slider.value()          # 1-50 integer
-        dte       = self.dte_slider.value()
-        cp        = float(self.cp_spin.value())
-        mult      = float(self.mult_spin.value()) or 100
-        idx       = self.strategy_combo.currentIndex()
+        pct        = self.pct_slider.value()
+        delta_raw  = self.delta_slider.value()
+        dte        = self.dte_slider.value()
+        cp         = float(self.cp_spin.value())
+        mult       = float(self.mult_spin.value()) or 100
+        idx        = self.strategy_combo.currentIndex()
         delta_frac = delta_raw / 100.0
-
-        # Update slider labels
         self.pct_val.setText(f"{pct}%")
         self.delta_val.setText(f"{delta_raw}Δ")
         self.dte_val.setText(f"{dte}d")
-
-        # Premium per contract in dollars (what the broker shows as credit/debit)
-        prem_per_contract = cp * mult
-        self.cp_total_lbl.setText(f"= ${prem_per_contract:,.2f} / contract")
-
-        # For a strangle we collect two legs; show that in premium total
-        sides = 2 if idx == 0 else 1   # strangle = 2 legs, everything else = 1
-        cp_dollars = prem_per_contract * sides   # total premium per position
-
-        # Capital per contract
-        cap_per = max(self._cap_per_contract(cp_dollars, delta_frac, dte, idx), 1.0)
-
-        max_cap   = self.nlv * pct / 100.0
-        contracts = max(int(max_cap / cap_per), 0)
-        total_cap = contracts * cap_per
+        prem_per = cp * mult
+        self.cp_total_lbl.setText(f"= ${prem_per:,.2f} / contract")
+        sides      = 2 if idx == 0 else 1
+        cp_dollars = prem_per * sides
+        cap_per    = max(self._cap_per_contract(cp_dollars, delta_frac, dte, idx), 1.0)
+        max_cap    = self.nlv * pct / 100.0
+        contracts  = max(int(max_cap / cap_per), 0)
+        total_cap  = contracts * cap_per
         total_prem = contracts * cp_dollars
         pct_used   = total_cap / self.nlv * 100 if self.nlv else 0
         remaining  = self.nlv - total_cap
-
-        # Theta estimate: total_premium / (DTE × ~1.7)  (not linear, rough approx)
-        theta_est = total_prem / (dte * 1.7) if dte > 0 and contracts > 0 else 0
-
-        # P(profit) for short strategies: Δ ≈ P(expiring ITM), so P(OTM) = 1 − Δ
-        # For a strangle both sides: both must stay OTM
-        if idx in (0, 2):       # undefined short
-            pop = (1 - delta_frac) * 100
-        elif idx == 3:          # long option — P(ITM) ≈ delta
-            pop = delta_frac * 100
-        else:
-            pop = None
-
-        # ── Update labels ──────────────────────────────────────────────────────
+        theta_est  = total_prem / (dte * 1.7) if dte > 0 and contracts > 0 else 0
+        pop = ((1 - delta_frac) * 100 if idx in (0, 2) else
+               delta_frac * 100       if idx == 3 else None)
         c_label = "contract" if contracts == 1 else "contracts"
         self.contracts_lbl.setText(f"{contracts} {c_label}")
-
         if total_prem > 0:
-            prefix = "Total credit:" if idx in (0, 2) else ("Total cost:" if idx == 3 else "Total prem:")
             self.total_prem_lbl.setText(f"${total_prem:,.0f}")
             self.total_prem_lbl.setStyleSheet(
-                f"color: {T.GREEN if idx in (0, 2) else T.RED if idx == 3 else T.TEXT}; "
+                f"color: {T.GREEN if idx in (0,2) else T.RED if idx==3 else T.TEXT}; "
                 f"font-size: 22px; font-weight: bold; border: none;"
             )
         else:
             self.total_prem_lbl.setText("—")
-
         self.capital_lbl.setText(
             f"Capital per contract: ${cap_per:,.0f}   ·   Total BP: ${total_cap:,.0f}"
         )
         self.bp_lbl.setText(
             f"{pct_used:.1f}% of NLV used   ·   Remaining BP: ${remaining:,.0f}"
         )
-        theta_text = f"~${theta_est:,.2f}/day" if theta_est > 0 else "—"
         roc = (total_prem / total_cap * 100) if total_cap > 0 and total_prem > 0 else 0
+        theta_text = f"~${theta_est:,.2f}/day" if theta_est > 0 else "—"
         self.theta_lbl.setText(
-            f"Theta est.: {theta_text}   ·   Return on capital: {roc:.1f}% (if held to exp.)"
+            f"Theta est.: {theta_text}   ·   Return on capital: {roc:.1f}%"
         )
-        if pop is not None:
-            self.pop_lbl.setText(f"P(profit) ≈ {pop:.0f}%  (1 − delta, single side)")
+        self.pop_lbl.setText(
+            f"P(profit) ≈ {pop:.0f}%  (1 − delta, single side)" if pop is not None else ""
+        )
+
+
+# ── Tab strip ─────────────────────────────────────────────────────────────────
+
+class _TabStrip(QFrame):
+    """Horizontal strip for switching / managing watchlists."""
+    switched = pyqtSignal(str)       # watchlist id
+    renamed  = pyqtSignal(str, str)  # id, new name
+    deleted  = pyqtSignal(str)       # id
+    created  = pyqtSignal()
+
+    def __init__(self, watchlists, active_id, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(44)
+        self.setStyleSheet(
+            f"QFrame {{ background: {T.BG_ALT}; "
+            f"border-bottom: 1px solid {T.BORDER}; }}"
+        )
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(28, 5, 16, 0)
+        outer.setSpacing(4)
+
+        self._tabs_lay = QHBoxLayout()
+        self._tabs_lay.setContentsMargins(0, 0, 0, 0)
+        self._tabs_lay.setSpacing(2)
+        outer.addLayout(self._tabs_lay)
+        outer.addStretch()
+
+        new_btn = QPushButton("＋ New list")
+        new_btn.setFixedHeight(26)
+        new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 5px; "
+            f"font-size: 11px; padding: 0 10px; }}"
+            f"QPushButton:hover {{ color: {T.GREEN}; border-color: {T.GREEN}; }}"
+        )
+        new_btn.clicked.connect(self.created.emit)
+        outer.addWidget(new_btn)
+
+        self.rebuild(watchlists, active_id)
+
+    def rebuild(self, watchlists, active_id):
+        while self._tabs_lay.count():
+            item = self._tabs_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        multi = len(watchlists) > 1
+        for wl in watchlists:
+            self._tabs_lay.addWidget(
+                self._make_tab(wl, wl["id"] == active_id, multi)
+            )
+
+    def _make_tab(self, wl, active, can_delete):
+        f = QFrame()
+        f.setCursor(Qt.CursorShape.PointingHandCursor)
+        f.setFixedHeight(36)
+        if active:
+            f.setStyleSheet(
+                f"QFrame {{ background: {T.CARD}; "
+                f"border: 1px solid {T.BORDER}; border-bottom: 2px solid {T.PURPLE}; "
+                f"border-radius: 6px 6px 0 0; }}"
+            )
         else:
-            self.pop_lbl.setText("")
+            f.setStyleSheet(
+                f"QFrame {{ background: transparent; border: none; border-radius: 6px; }}"
+                f"QFrame:hover {{ background: {T.CARD_ALT}; }}"
+            )
+
+        lay = QHBoxLayout(f)
+        lay.setContentsMargins(12, 0, 7, 2)
+        lay.setSpacing(6)
+
+        ticker_count = len(wl.get("tickers", []))
+        name_text = wl["name"]
+        lbl = QLabel(
+            f"{name_text}  "
+            f"<span style='color:{T.MUTED};font-size:10px;'>{ticker_count}</span>"
+        )
+        lbl.setStyleSheet(
+            f"color: {T.TEXT if active else T.MUTED}; "
+            f"font-size: 12px; font-weight: {'600' if active else 'normal'}; "
+            f"border: none; background: transparent;"
+        )
+        lay.addWidget(lbl)
+
+        if can_delete:
+            x = QPushButton("×")
+            x.setFixedSize(15, 15)
+            x.setCursor(Qt.CursorShape.PointingHandCursor)
+            x.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+                f"border: none; font-size: 12px; border-radius: 3px; padding: 0; }}"
+                f"QPushButton:hover {{ color: {T.RED}; }}"
+            )
+            wl_id = wl["id"]
+            x.clicked.connect(lambda _, i=wl_id: self.deleted.emit(i))
+            lay.addWidget(x)
+
+        wl_id   = wl["id"]
+        wl_name = wl["name"]
+
+        def _click(e, i=wl_id):
+            if e.button() == Qt.MouseButton.LeftButton:
+                self.switched.emit(i)
+        f.mousePressEvent = _click
+        lbl.mousePressEvent = _click
+
+        def _dbl(e, i=wl_id, n=wl_name):
+            new_name, ok = QInputDialog.getText(
+                self, "Rename watchlist", "Name:", text=n
+            )
+            if ok and new_name.strip():
+                self.renamed.emit(i, new_name.strip())
+        f.mouseDoubleClickEvent = _dbl
+        lbl.mouseDoubleClickEvent = _dbl
+
+        return f
 
 
 # ── Ticker row ────────────────────────────────────────────────────────────────
 
+# Column definitions: (attr_name, header_label, width, sort_key)
+# sort_key None = not sortable
+_COLUMNS = [
+    ("price_lbl", "Price",  90,  "price"),
+    ("ivr_lbl",   "IVR ★", 100, "ivr"),
+    ("ivp_lbl",   "IVP",    60,  "ivp"),
+    ("beta_lbl",  "Beta",   55,  "beta"),
+    ("liq_lbl",   "Liq ★",  90,  "liq"),
+]
+
+# Mapping sort_key → (header_text, default_ascending)
+# Ticker sorts A→Z by default; numeric cols sort high→low by default
+_SORT_META = {
+    "ticker": ("Ticker", True),
+    "price":  ("Price",  False),
+    "ivr":    ("IVR ★",  False),
+    "ivp":    ("IVP",    False),
+    "beta":   ("Beta",   True),
+    "liq":    ("Liq ★",  False),
+}
+
+
 class _TickerRow(QFrame):
     remove_clicked = pyqtSignal(str)
-    size_clicked   = pyqtSignal(str, float, float)  # ticker, price, nlv
+    pin_clicked    = pyqtSignal(str)
+    size_clicked   = pyqtSignal(str, float, float)
 
-    def __init__(self, ticker, nlv, parent=None):
+    def __init__(self, ticker, nlv, pinned=False, parent=None):
         super().__init__(parent)
-        self.ticker = ticker
-        self.nlv    = nlv
-        self._price = 0.0
+        self.ticker  = ticker
+        self.nlv     = nlv
+        self._price  = 0.0
+        self._pinned = pinned
 
         self.setFixedHeight(54)
-        self.setStyleSheet(
-            f"QFrame {{ background: {T.CARD}; border-radius: 8px; "
-            f"border: 1px solid {T.BORDER}; }}"
-        )
 
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(18, 0, 12, 0)
+        lay.setContentsMargins(12, 0, 12, 0)
         lay.setSpacing(0)
 
-        # Ticker symbol
+        # ── Star / pin ────────────────────────────────────────────────────────
+        self._star_btn = QPushButton("★" if pinned else "☆")
+        self._star_btn.setFixedSize(28, 28)
+        self._star_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._star_btn.clicked.connect(lambda: self.pin_clicked.emit(self.ticker))
+        lay.addWidget(self._star_btn)
+        lay.addSpacing(6)
+
+        # ── Ticker symbol ─────────────────────────────────────────────────────
         sym = QLabel(ticker)
         sym.setFixedWidth(80)
         sym.setStyleSheet(
@@ -422,20 +714,17 @@ class _TickerRow(QFrame):
         )
         lay.addWidget(sym)
 
-        # Metric columns
-        self.price_lbl = self._col(90)
-        self.ivr_lbl   = self._col(70)
-        self.ivp_lbl   = self._col(70)
-        self.hv_lbl    = self._col(70)
-        self.beta_lbl  = self._col(60)
-        lay.addWidget(self.price_lbl)
-        lay.addWidget(self.ivr_lbl)
-        lay.addWidget(self.ivp_lbl)
-        lay.addWidget(self.hv_lbl)
-        lay.addWidget(self.beta_lbl)
+        # ── Metric columns ────────────────────────────────────────────────────
+        for attr, _hdr, width, _sk in _COLUMNS:
+            lbl = QLabel("—")
+            lbl.setFixedWidth(width)
+            lbl.setStyleSheet(f"color: {T.TEXT}; font-size: 12px; border: none;")
+            setattr(self, attr, lbl)
+            lay.addWidget(lbl)
 
         lay.addStretch()
 
+        # ── Size trade ────────────────────────────────────────────────────────
         size_btn = QPushButton("Size trade")
         size_btn.setFixedHeight(28)
         size_btn.setFixedWidth(80)
@@ -451,6 +740,7 @@ class _TickerRow(QFrame):
         lay.addWidget(size_btn)
         lay.addSpacing(8)
 
+        # ── Remove ────────────────────────────────────────────────────────────
         rm_btn = QPushButton("✕")
         rm_btn.setFixedSize(28, 28)
         rm_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -463,27 +753,61 @@ class _TickerRow(QFrame):
         rm_btn.clicked.connect(lambda: self.remove_clicked.emit(self.ticker))
         lay.addWidget(rm_btn)
 
-    def _col(self, width):
-        lbl = QLabel("—")
-        lbl.setFixedWidth(width)
-        lbl.setStyleSheet(f"color: {T.TEXT}; font-size: 12px; border: none;")
-        return lbl
+        self._apply_pin_style()
+
+    # ── Pin visual ────────────────────────────────────────────────────────────
+
+    def _apply_pin_style(self):
+        if self._pinned:
+            self._star_btn.setText("★")
+            self._star_btn.setToolTip("Unpin")
+            self._star_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.YELLOW}; "
+                f"border: none; font-size: 16px; border-radius: 6px; }}"
+                f"QPushButton:hover {{ background: rgba(251,191,36,0.12); }}"
+            )
+            self.setStyleSheet(
+                f"QFrame {{ background: {T.CARD}; border-radius: 8px; "
+                f"border: 1px solid {T.YELLOW}40; "
+                f"border-left: 3px solid {T.YELLOW}; }}"
+            )
+        else:
+            self._star_btn.setText("☆")
+            self._star_btn.setToolTip("Pin to top")
+            self._star_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+                f"border: none; font-size: 16px; border-radius: 6px; }}"
+                f"QPushButton:hover {{ color: {T.YELLOW}; "
+                f"background: rgba(251,191,36,0.08); }}"
+            )
+            self.setStyleSheet(
+                f"QFrame {{ background: {T.CARD}; border-radius: 8px; "
+                f"border: 1px solid {T.BORDER}; }}"
+            )
+
+    def set_pinned(self, pinned):
+        self._pinned = pinned
+        self._apply_pin_style()
+
+    # ── Data ──────────────────────────────────────────────────────────────────
 
     def update_data(self, metrics, quote):
+        m = metrics or {}
+        q = quote   or {}
+
         # Price
         price = None
         for key in ("mark", "last"):
-            v = quote.get(key) if quote else None
             try:
-                price = float(v)
-                break
+                v = float(q.get(key) or 0)
+                if v > 0:
+                    price = v
+                    break
             except (TypeError, ValueError):
                 pass
-        if price is None and quote:
-            bid = quote.get("bid")
-            ask = quote.get("ask")
+        if price is None:
             try:
-                price = (float(bid) + float(ask)) / 2
+                price = (float(q.get("bid") or 0) + float(q.get("ask") or 0)) / 2 or None
             except (TypeError, ValueError):
                 pass
         if price and price > 0:
@@ -492,25 +816,29 @@ class _TickerRow(QFrame):
         else:
             self.price_lbl.setText("—")
 
-        # IVR
-        ivr = symbol_ivr(metrics)
+        # IVR  (number + star rating)
+        ivr = symbol_ivr(m)
         if ivr is not None:
-            color = T.GREEN if ivr >= 50 else (T.YELLOW if ivr >= 25 else T.RED)
-            self.ivr_lbl.setText(f"<span style='color:{color}'>{ivr:.0f}</span>")
+            color = T.GREEN if ivr >= 60 else (T.YELLOW if ivr >= 30 else T.RED)
+            stars = _ivr_stars(ivr)
+            self.ivr_lbl.setText(
+                f"<span style='color:{color};font-weight:bold'>{ivr:.0f}</span>"
+                f"<span style='font-size:10px;'> {stars}</span>"
+            )
         else:
             self.ivr_lbl.setText("—")
 
         # IVP
-        ivp = symbol_ivp(metrics)
+        ivp = symbol_ivp(m)
         self.ivp_lbl.setText(f"{ivp:.0f}" if ivp is not None else "—")
 
-        # HV30
-        hv = symbol_hv30(metrics)
-        self.hv_lbl.setText(f"{hv:.0f}%" if hv is not None else "—")
-
         # Beta
-        beta = symbol_beta(metrics)
+        beta = symbol_beta(m)
         self.beta_lbl.setText(f"{beta:.2f}" if beta is not None else "—")
+
+        # Liquidity stars  (TastyTrade liquidity-rating: 0-5 int)
+        liq_raw = m.get("liquidity-rating")
+        self.liq_lbl.setText(_liq_stars(liq_raw))
 
 
 # ── Watchlist page ────────────────────────────────────────────────────────────
@@ -518,15 +846,22 @@ class _TickerRow(QFrame):
 class WatchlistPage(QWidget):
     back_requested = pyqtSignal()
 
+    # ── Init ──────────────────────────────────────────────────────────────────
+
     def __init__(self, token, nlv, parent=None):
         super().__init__(parent)
         self.token   = token
         self.nlv     = nlv
         self._rows   = {}    # ticker -> _TickerRow
         self._worker = None
+        self._last_metrics: dict = {}
+        self._last_quotes:  dict = {}
+        self._sort_col: str | None = None   # active sort key
+        self._sort_asc: bool       = True   # True = ascending
+        self._suggest_worker = None         # in-flight _SuggestWorker
 
-        settings = api.load_settings()
-        self._tickers = list(settings.get("watchlist_tickers", []))
+        self._watchlists, self._active_id = self._load_all()
+        self._wl = self._find_wl(self._active_id)
 
         self.setStyleSheet(T.BASE_STYLE)
         root = QVBoxLayout(self)
@@ -535,10 +870,27 @@ class WatchlistPage(QWidget):
 
         root.addWidget(self._build_header())
 
-        # Column header bar
+        self._tab_strip = _TabStrip(self._watchlists, self._active_id, self)
+        self._tab_strip.switched.connect(self._switch_to)
+        self._tab_strip.renamed.connect(self._rename_watchlist)
+        self._tab_strip.deleted.connect(self._delete_watchlist)
+        self._tab_strip.created.connect(self._create_watchlist)
+        root.addWidget(self._tab_strip)
+
         root.addWidget(self._build_col_header())
 
-        # Scrollable list
+        # Autocomplete popup — created after add_input exists (see _build_header)
+        self._popup = _SuggestPopup(self.add_input, self)
+        self._popup.chosen.connect(self._on_suggest_chosen)
+
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(280)   # ms debounce
+        self._search_timer.timeout.connect(self._do_suggest)
+
+        self.add_input.textChanged.connect(self._on_input_changed)
+        self.add_input.installEventFilter(self)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -551,8 +903,124 @@ class WatchlistPage(QWidget):
         root.addWidget(scroll)
 
         self._rebuild_rows()
-        if self._tickers:
+        if self._wl["tickers"]:
             self._fetch()
+
+    # ── Watchlist storage ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _load_all():
+        settings = api.load_settings()
+        if "watchlists_v2" in settings:
+            wls    = settings["watchlists_v2"] or []
+            active = settings.get("watchlist_active_id")
+            if not wls:
+                wls    = [{"id": "wl_1", "name": "Main", "tickers": [], "pinned": []}]
+                active = "wl_1"
+            if not active or not any(w["id"] == active for w in wls):
+                active = wls[0]["id"]
+            return wls, active
+        # ── Migrate from old single-list format ──
+        tickers = list(settings.get("watchlist_tickers") or [])
+        pinned  = list(settings.get("watchlist_pinned")  or [])
+        wl = {"id": "wl_1", "name": "Main", "tickers": tickers, "pinned": pinned}
+        return [wl], "wl_1"
+
+    def _find_wl(self, wl_id):
+        return next((w for w in self._watchlists if w["id"] == wl_id),
+                    self._watchlists[0])
+
+    def _save_all(self):
+        settings = api.load_settings()
+        settings["watchlists_v2"]       = self._watchlists
+        settings["watchlist_active_id"] = self._active_id
+        # Remove legacy keys
+        settings.pop("watchlist_tickers", None)
+        settings.pop("watchlist_pinned",  None)
+        api.save_settings(settings)
+
+    def _save_current(self):
+        """Flush current tickers/pinned back into the shared watchlists list."""
+        self._wl["tickers"] = list(self._tickers)
+        self._wl["pinned"]  = list(self._pinned)
+        self._save_all()
+
+    # ── Watchlist CRUD ────────────────────────────────────────────────────────
+
+    def _switch_to(self, wl_id):
+        if wl_id == self._active_id:
+            return
+        self._active_id    = wl_id
+        self._wl           = self._find_wl(wl_id)
+        self._last_metrics = {}
+        self._last_quotes  = {}
+        self._sort_col     = None   # reset sort for new list
+        self._sort_asc     = True
+        self._update_col_headers()
+        self._popup.hide_popup()
+        self._save_all()
+        self._tab_strip.rebuild(self._watchlists, self._active_id)
+        self._rebuild_rows()
+        if self._wl["tickers"]:
+            self._fetch()
+
+    def _create_watchlist(self):
+        name, ok = QInputDialog.getText(self, "New watchlist", "Name:")
+        if not ok or not name.strip():
+            return
+        new_id = f"wl_{int(time.time() * 1000)}"
+        self._watchlists.append(
+            {"id": new_id, "name": name.strip(), "tickers": [], "pinned": []}
+        )
+        self._save_all()
+        self._switch_to(new_id)
+
+    def _rename_watchlist(self, wl_id, new_name):
+        wl = self._find_wl(wl_id)
+        wl["name"] = new_name
+        self._save_all()
+        self._tab_strip.rebuild(self._watchlists, self._active_id)
+
+    def _delete_watchlist(self, wl_id):
+        wl = self._find_wl(wl_id)
+        n  = len(wl.get("tickers", []))
+        msg = (
+            f"Delete \"{wl['name']}\"?"
+            + (f"\n\n{n} ticker{'s' if n != 1 else ''} will be removed." if n else "")
+        )
+        if QMessageBox.question(
+            self, "Delete watchlist", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._watchlists = [w for w in self._watchlists if w["id"] != wl_id]
+        if not self._watchlists:
+            self._watchlists = [
+                {"id": "wl_1", "name": "Main", "tickers": [], "pinned": []}
+            ]
+        new_active = (self._active_id if any(w["id"] == self._active_id
+                                              for w in self._watchlists)
+                      else self._watchlists[0]["id"])
+        self._save_all()
+        self._switch_to(new_active)
+
+    # ── Convenience props for active watchlist ────────────────────────────────
+
+    @property
+    def _tickers(self):
+        return self._wl["tickers"]
+
+    @_tickers.setter
+    def _tickers(self, v):
+        self._wl["tickers"] = v
+
+    @property
+    def _pinned(self):
+        return set(self._wl.get("pinned") or [])
+
+    @_pinned.setter
+    def _pinned(self, v):
+        self._wl["pinned"] = list(v)
 
     # ── Header ────────────────────────────────────────────────────────────────
 
@@ -560,7 +1028,8 @@ class WatchlistPage(QWidget):
         hdr = QFrame()
         hdr.setFixedHeight(60)
         hdr.setStyleSheet(
-            f"QFrame {{ background: {T.CARD}; border-bottom: 1px solid {T.BORDER}; border-radius: 0; }}"
+            f"QFrame {{ background: {T.CARD}; "
+            f"border-bottom: 1px solid {T.BORDER}; border-radius: 0; }}"
         )
         hl = QHBoxLayout(hdr)
         hl.setContentsMargins(28, 0, 28, 0)
@@ -601,6 +1070,45 @@ class WatchlistPage(QWidget):
 
         return hdr
 
+    # ── Autocomplete ──────────────────────────────────────────────────────────
+
+    def eventFilter(self, obj, event):
+        if obj is self.add_input:
+            t = event.type()
+            if t == event.Type.FocusOut:
+                # Delay so the popup click can fire first
+                QTimer.singleShot(160, self._popup.hide_popup)
+            elif t == event.Type.KeyPress:
+                key = event.key()
+                if key == Qt.Key.Key_Escape:
+                    self._popup.hide_popup()
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _on_input_changed(self, text):
+        if len(text.strip()) < 1:
+            self._search_timer.stop()
+            self._popup.hide_popup()
+            return
+        self._search_timer.start()   # restarts the debounce window
+
+    def _do_suggest(self):
+        query = self.add_input.text().strip()
+        if not query:
+            self._popup.hide_popup()
+            return
+        # Cancel previous in-flight worker
+        if self._suggest_worker and self._suggest_worker.isRunning():
+            self._suggest_worker.done.disconnect()
+        self._suggest_worker = _SuggestWorker(self.token, query, self)
+        self._suggest_worker.done.connect(self._popup.show_results)
+        self._suggest_worker.start()
+
+    def _on_suggest_chosen(self, symbol):
+        self.add_input.setText(symbol)
+        self._popup.hide_popup()
+        self._add_ticker()
+
     def _build_col_header(self):
         bar = QFrame()
         bar.setFixedHeight(32)
@@ -608,26 +1116,131 @@ class WatchlistPage(QWidget):
             f"background: {T.BG_ALT}; border-bottom: 1px solid {T.BORDER};"
         )
         hl = QHBoxLayout(bar)
-        hl.setContentsMargins(46, 0, 120, 0)
+        # left: body(28) + row-margin(12) + star-btn(28) + gap(6) = 74
+        hl.setContentsMargins(74, 0, 120, 0)
         hl.setSpacing(0)
 
-        cols = [
-            ("Ticker", 80), ("Price", 90), ("IVR", 70),
-            ("IVP", 70), ("HV30", 70), ("Beta", 60),
-        ]
-        for name, w in cols:
-            lbl = QLabel(name)
-            lbl.setFixedWidth(w)
-            lbl.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
-                f"letter-spacing: 0.5px; border: none;"
-            )
+        self._col_hdr_lbls: dict = {}   # sort_key -> QLabel
+
+        # Ticker column (sortable)
+        ticker_lbl = self._make_sort_hdr("Ticker", "ticker", 80)
+        hl.addWidget(ticker_lbl)
+
+        for _attr, _hdr, width, sk in _COLUMNS:
+            lbl = self._make_sort_hdr(_hdr, sk, width)
             hl.addWidget(lbl)
 
         hl.addStretch()
+        self._update_col_headers()
         return bar
 
-    # ── Data ─────────────────────────────────────────────────────────────────
+    def _make_sort_hdr(self, base_text, sort_key, width):
+        lbl = QLabel()
+        lbl.setFixedWidth(width)
+        lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        lbl.setToolTip(f"Sort by {base_text}  (click again to reverse · third click clears)")
+        self._col_hdr_lbls[sort_key] = lbl
+        lbl.mousePressEvent = lambda _e, k=sort_key: self._on_sort_click(k)
+        return lbl
+
+    def _update_col_headers(self):
+        for sk, lbl in self._col_hdr_lbls.items():
+            base, _default_asc = _SORT_META[sk]
+            active = (sk == self._sort_col)
+            if active:
+                arrow = " ▲" if self._sort_asc else " ▼"
+                lbl.setText(base + arrow)
+                lbl.setStyleSheet(
+                    f"color: {T.ACCENT}; font-size: 10px; font-weight: bold; "
+                    f"letter-spacing: 0.5px; border: none; "
+                    f"background: {T.CARD_ALT}; border-radius: 3px; "
+                    f"padding: 1px 3px;"
+                )
+            else:
+                lbl.setText(base)
+                lbl.setStyleSheet(
+                    f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
+                    f"letter-spacing: 0.5px; border: none;"
+                )
+
+    # ── Sort ──────────────────────────────────────────────────────────────────
+
+    def _on_sort_click(self, col_key):
+        if self._sort_col == col_key:
+            _base, default_asc = _SORT_META[col_key]
+            if self._sort_asc == default_asc:
+                # Already at first direction → flip to reverse
+                self._sort_asc = not self._sort_asc
+            else:
+                # At reverse → clear sort (back to insertion order)
+                self._sort_col = None
+                self._sort_asc = True
+        else:
+            self._sort_col = col_key
+            self._sort_asc = _SORT_META[col_key][1]   # default direction
+
+        self._update_col_headers()
+        self._rebuild_rows()
+        for t, row in self._rows.items():
+            row.update_data(
+                self._last_metrics.get(t, {}),
+                self._last_quotes.get(t, {}),
+            )
+
+    def _get_price(self, quote):
+        q = quote or {}
+        for k in ("mark", "last"):
+            try:
+                v = float(q.get(k) or 0)
+                if v > 0:
+                    return v
+            except (TypeError, ValueError):
+                pass
+        try:
+            b = float(q.get("bid") or 0)
+            a = float(q.get("ask") or 0)
+            if b > 0 and a > 0:
+                return (b + a) / 2.0
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    def _raw_sort_value(self, ticker):
+        """Return (is_none: int, value) for the active sort column."""
+        m = self._last_metrics.get(ticker, {})
+        q = self._last_quotes.get(ticker, {})
+        col = self._sort_col
+
+        if col == "ticker":
+            return (0, ticker.lower())
+        if col == "price":
+            v = self._get_price(q)
+        elif col == "ivr":
+            v = symbol_ivr(m)
+        elif col == "ivp":
+            v = symbol_ivp(m)
+        elif col == "beta":
+            v = symbol_beta(m)
+        elif col == "liq":
+            raw = m.get("liquidity-rating")
+            try:
+                v = float(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                v = None
+        else:
+            v = None
+
+        # None values always go to the end regardless of direction
+        return (0 if v is not None else 1, v if v is not None else 0.0)
+
+    def _apply_sort(self, tickers):
+        """Return tickers sorted by active column; None values always last."""
+        if not self._sort_col or not tickers:
+            return list(tickers)
+        reverse = not self._sort_asc
+        return sorted(tickers, key=self._raw_sort_value, reverse=reverse)
+
+    # ── Ticker management ─────────────────────────────────────────────────────
 
     def _add_ticker(self):
         ticker = _normalize_ticker(self.add_input.text())
@@ -635,21 +1248,39 @@ class WatchlistPage(QWidget):
             self.add_input.clear()
             return
         self._tickers.append(ticker)
-        self._save()
+        self._save_current()
+        self._tab_strip.rebuild(self._watchlists, self._active_id)
         self.add_input.clear()
         self._rebuild_rows()
         self._fetch()
 
     def _remove_ticker(self, ticker):
-        if ticker in self._tickers:
-            self._tickers.remove(ticker)
-        self._save()
+        tickers = self._tickers
+        if ticker in tickers:
+            tickers.remove(ticker)
+        pinned = self._pinned
+        pinned.discard(ticker)
+        self._pinned = pinned
+        self._last_metrics.pop(ticker, None)
+        self._last_quotes.pop(ticker, None)
+        self._save_current()
+        self._tab_strip.rebuild(self._watchlists, self._active_id)
         self._rebuild_rows()
 
-    def _save(self):
-        settings = api.load_settings()
-        settings["watchlist_tickers"] = self._tickers
-        api.save_settings(settings)
+    def _toggle_pin(self, ticker):
+        pinned = self._pinned
+        if ticker in pinned:
+            pinned.discard(ticker)
+        else:
+            pinned.add(ticker)
+        self._pinned = pinned
+        self._save_current()
+        self._rebuild_rows()
+        # Re-apply cached data after re-sort
+        for t, row in self._rows.items():
+            row.update_data(self._last_metrics.get(t, {}), self._last_quotes.get(t, {}))
+
+    # ── Fetch ─────────────────────────────────────────────────────────────────
 
     def _fetch(self):
         if not self._tickers:
@@ -658,46 +1289,89 @@ class WatchlistPage(QWidget):
             return
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("Loading…")
-        self._worker = _FetchWorker(self.token, self._tickers, self)
+        self._worker = _FetchWorker(self.token, list(self._tickers), self)
         self._worker.done.connect(self._on_fetch_done)
         self._worker.start()
 
     def _on_fetch_done(self, metrics, quotes):
         self.refresh_btn.setEnabled(True)
         self.refresh_btn.setText("↻  Refresh")
+        self._last_metrics.update(metrics)
+        self._last_quotes.update(quotes)
+        if self._sort_col:
+            # Re-sort rows now that real values are known
+            self._rebuild_rows()
         for ticker, row in self._rows.items():
-            row.update_data(metrics.get(ticker, {}), quotes.get(ticker, {}))
+            row.update_data(
+                self._last_metrics.get(ticker, {}),
+                self._last_quotes.get(ticker, {}),
+            )
 
     # ── UI rebuild ────────────────────────────────────────────────────────────
 
+    def _ordered_tickers(self):
+        """Return (pinned_list, unpinned_list) each sorted by active column."""
+        pinned   = [t for t in self._tickers if t in self._pinned]
+        unpinned = [t for t in self._tickers if t not in self._pinned]
+        return self._apply_sort(pinned), self._apply_sort(unpinned)
+
     def _rebuild_rows(self):
-        # Remove old rows
         for row in self._rows.values():
             self.body.removeWidget(row)
             row.deleteLater()
         self._rows = {}
 
-        if not self._tickers:
-            # Show empty state (insert before the stretch)
-            empty = QLabel("No tickers yet — add one above.")
+        # Remove divider if present
+        if hasattr(self, "_divider"):
+            self.body.removeWidget(self._divider)
+            self._divider.deleteLater()
+            del self._divider
+
+        # Remove empty label if present
+        if hasattr(self, "_empty_lbl"):
+            self.body.removeWidget(self._empty_lbl)
+            self._empty_lbl.deleteLater()
+            del self._empty_lbl
+
+        pinned_list, unpinned_list = self._ordered_tickers()
+        ordered = pinned_list + unpinned_list
+
+        if not ordered:
+            empty = QLabel("No tickers yet — type a symbol above and press Add.")
             empty.setStyleSheet(
                 f"color: {T.MUTED}; font-size: 13px; border: none;"
             )
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.body.insertWidget(0, empty)
             self._empty_lbl = empty
-        else:
-            if hasattr(self, "_empty_lbl"):
-                self.body.removeWidget(self._empty_lbl)
-                self._empty_lbl.deleteLater()
-                del self._empty_lbl
+            return
 
-            for i, ticker in enumerate(self._tickers):
-                row = _TickerRow(ticker, self.nlv, self)
-                row.remove_clicked.connect(self._remove_ticker)
-                row.size_clicked.connect(self._open_sizer)
-                self._rows[ticker] = row
-                self.body.insertWidget(i, row)
+        idx = 0
+        for ticker in pinned_list:
+            row = _TickerRow(ticker, self.nlv, pinned=True, parent=self)
+            row.remove_clicked.connect(self._remove_ticker)
+            row.pin_clicked.connect(self._toggle_pin)
+            row.size_clicked.connect(self._open_sizer)
+            self._rows[ticker] = row
+            self.body.insertWidget(idx, row)
+            idx += 1
+
+        if pinned_list and unpinned_list:
+            div = QFrame()
+            div.setFixedHeight(1)
+            div.setStyleSheet(f"background: {T.BORDER}; border: none;")
+            self.body.insertWidget(idx, div)
+            self._divider = div
+            idx += 1
+
+        for ticker in unpinned_list:
+            row = _TickerRow(ticker, self.nlv, pinned=False, parent=self)
+            row.remove_clicked.connect(self._remove_ticker)
+            row.pin_clicked.connect(self._toggle_pin)
+            row.size_clicked.connect(self._open_sizer)
+            self._rows[ticker] = row
+            self.body.insertWidget(idx, row)
+            idx += 1
 
     def _open_sizer(self, ticker, price, nlv):
         dlg = PositionSizerDialog(ticker, price, nlv, self)

@@ -111,6 +111,10 @@ class PayoffChart(FigureCanvasQTAgg):
         self._annot.set_visible(True)
         self.draw_idle()
 
+    def wheelEvent(self, event):
+        """Forward scroll events to the parent so the page scrolls normally."""
+        event.ignore()
+
     def _hide_cursor(self):
         if self._cursor_line is None:
             return
