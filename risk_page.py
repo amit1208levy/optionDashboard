@@ -4,7 +4,7 @@ from datetime import date, timedelta
 import numpy as np
 import matplotlib
 matplotlib.use("QtAgg")
-import matplotlib.pyplot as plt
+from matplotlib.figure import Figure as MplFigure
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.colors import TwoSlopeNorm, ListedColormap
 
@@ -72,10 +72,9 @@ class CalendarCard(QFrame):
         c_lay.setSpacing(6)
 
         if self._daily:
-            canvas, fig = self._build_canvas()
+            canvas = self._build_canvas()
             if canvas:
                 c_lay.addWidget(canvas)
-                plt.close(fig)
         else:
             empty = QLabel("No closed trades yet — P&L calendar will appear once trades close.")
             empty.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
@@ -138,6 +137,12 @@ class CalendarCard(QFrame):
     # ── Canvas ────────────────────────────────────────────────────────────────
 
     def _build_canvas(self):
+        try:
+            return self._build_canvas_impl()
+        except Exception:
+            return None
+
+    def _build_canvas_impl(self):
         start     = self._start
         today     = self._today
         start_dow = self._start_dow
@@ -153,11 +158,14 @@ class CalendarCard(QFrame):
                 grid[row, col] = self._daily.get(d, np.nan)
 
         # Store grid metadata for hover lookup
-        self._grid     = grid
+        self._grid      = grid
         self._start_dow = start_dow
 
-        fig, ax = plt.subplots(figsize=(14, 2.0))
+        # Use Figure() directly — avoids pyplot's figure manager so we don't
+        # need to call plt.close() (which can corrupt the canvas before first paint)
+        fig = MplFigure(figsize=(14, 2.0))
         fig.patch.set_facecolor("#161928")
+        ax = fig.add_subplot(111)
         ax.set_facecolor("#161928")
 
         vmax = max((abs(v) for v in self._daily.values()), default=1)
@@ -264,7 +272,9 @@ class CalendarCard(QFrame):
             self._hover_lbl.setText("  ·  ".join(parts))
 
         canvas.mpl_connect("motion_notify_event", on_motion)
-        return canvas, fig
+        # Keep a strong reference so the figure isn't GC'd before first paint
+        canvas._mpl_fig = fig
+        return canvas
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -422,7 +432,14 @@ class RiskPage(QWidget):
 
             metrics = acct.get("metrics") or {}
             self._build_allocation(instances, unassigned, overrides)
-            self._build_heatmap(metrics)
+            try:
+                self._build_heatmap(metrics)
+            except Exception as _he:
+                import traceback
+                lbl = QLabel(f"Calendar unavailable: {_he}\n{traceback.format_exc()}")
+                lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 10px; border: none;")
+                lbl.setWordWrap(True)
+                self.body.addWidget(lbl)
             self.body.addStretch()
         except Exception as exc:
             import traceback
