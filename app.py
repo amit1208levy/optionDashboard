@@ -1017,55 +1017,46 @@ class PortfolioScreen(QWidget):
         except (ValueError, TypeError):
             self.day_pnl_lbl.setText("—")
 
-        # ── YTD P&L (with fees) ─────────────────────────────────────────────
-        # Pulled directly from TastyTrade's transaction history for the current
-        # year.  We sum net-value (already minus all commissions / exchange /
-        # clearing / regulatory fees) for every Trade and Receive-Deliver
-        # transaction this year, then add the current unrealized P&L on open
-        # positions.
-        #
-        # Why not just use the balance "realized-year-gain" field?
-        #   - It is the gross P&L before commissions (TastyTrade charges fees
-        #     as a separate cash debit, so the gain field doesn't reflect them).
-        #   - It is also 0 when all positions are still open.
-        #
-        # The transaction net-value approach gives us both: the fees are already
-        # deducted in net-value, and open-position P&L rounds it out.
+        # ── P/L YTD  (realized closed-trade P&L only, gross before fees) ───────
+        # Source: TastyTrade balance "realized-year-gain" — this is the gain/loss
+        # from positions that have actually closed this year.  Open positions are
+        # NOT included here; they appear separately in the "Open P&L" tile so
+        # the two numbers never overlap.
         try:
-            # Sum net-value (post-fees) for every trade this year.
-            # Opening a short adds cash; closing it removes cash.
-            # Net of the two = round-trip P&L after commissions/fees.
-            ytd_realized = 0.0
-            for t in ytd_txns:
-                if (t.get("transaction-type") or "") not in ("Trade", "Receive Deliver"):
-                    continue
-                try:
-                    val    = float(t.get("net-value") or 0)
-                    effect = (t.get("net-value-effect") or "").lower()
-                    ytd_realized += -val if "debit" in effect else val
-                except (TypeError, ValueError):
-                    continue
-
-            # Add unrealized P&L on open positions (their mark vs avg open price)
-            open_pnl = sum(p.pnl for p in positions_now)
-            ytd = ytd_realized + open_pnl
-            self.ytd_pnl_lbl.setText(money(ytd, signed=True))
-            self.ytd_pnl_lbl.setStyleSheet(
-                f"color: {pnl_color(ytd)}; font-size: 22px; font-weight: bold; "
-                f"border: none; background: transparent;"
-            )
-
-            # P/L YTD (gross) — TastyTrade's balance "realized-year-gain" is the
-            # gross realized gain before commissions/fees, plus current open P&L.
-            ytd_gross = _signed_gain("realized-year-gain") + open_pnl
+            ytd_gross = _signed_gain("realized-year-gain")
             self.ytd_gross_lbl.setText(money(ytd_gross, signed=True))
             self.ytd_gross_lbl.setStyleSheet(
                 f"color: {pnl_color(ytd_gross)}; font-size: 22px; font-weight: bold; "
                 f"border: none; background: transparent;"
             )
         except (ValueError, TypeError):
-            self.ytd_pnl_lbl.setText("—")
             self.ytd_gross_lbl.setText("—")
+
+        # ── YTD W/Fees  (same realized P&L minus all commissions/fees paid) ───
+        # TastyTrade charges commissions separately from position P&L, so
+        # "realized-year-gain" is gross.  We subtract every fee field from the
+        # YTD transaction records to arrive at the true net-of-fees realized P&L.
+        try:
+            ytd_fees = 0.0
+            for t in ytd_txns:
+                if (t.get("transaction-type") or "") not in ("Trade", "Receive Deliver"):
+                    continue
+                for fee_key in ("commission", "clearing-fees",
+                                "proprietary-index-option-fees",
+                                "regulatory-fees", "exchange-fees"):
+                    try:
+                        ytd_fees += abs(float(t.get(fee_key) or 0))
+                    except (TypeError, ValueError):
+                        pass
+
+            ytd_wf = _signed_gain("realized-year-gain") - ytd_fees
+            self.ytd_pnl_lbl.setText(money(ytd_wf, signed=True))
+            self.ytd_pnl_lbl.setStyleSheet(
+                f"color: {pnl_color(ytd_wf)}; font-size: 22px; font-weight: bold; "
+                f"border: none; background: transparent;"
+            )
+        except (ValueError, TypeError):
+            self.ytd_pnl_lbl.setText("—")
 
         self._clear_layout(self.my_container)
         self._clear_layout(self.ua_container)
