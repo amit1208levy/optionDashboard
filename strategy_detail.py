@@ -48,7 +48,7 @@ from models import (
     StrategyInstance, strategy_extremes, probability_of_profit, capital_for_strategy,
     strategy_performance, symbol_ivr, symbol_ivp, symbol_beta, symbol_hv30,
     scenario_pnl, distribute_futures_margin, unassigned_positions, group_unassigned,
-    check_exit_conditions,
+    check_exit_conditions, _is_future_option,
 )
 from payoff_chart import PayoffChart
 from history_chart import HistoryChart
@@ -388,7 +388,7 @@ class StrategyDetailPage(QWidget):
 
         # For futures-option strategies, use the actual margin from TastyTrade
         has_future_opts = any(
-            l.instrument_type == "Future Option" for l in self.strategy.legs
+            _is_future_option(l.instrument_type) for l in self.strategy.legs
         )
         if has_future_opts:
             dist = self._get_distributed_futures_margin()
@@ -401,25 +401,54 @@ class StrategyDetailPage(QWidget):
 
     def _get_distributed_futures_margin(self):
         """
-        Look up this strategy's pro-rata share of the account's
-        futures-margin-requirement (from the balances API).
+        Return this strategy's pro-rata share of the account's futures margin.
+
+        Priority:
+          1. Distribute TastyTrade's reported futures-margin-requirement (from
+             the balances API) proportionally among all futures-option strategies
+             using SPAN weights.
+          2. If the API total is not available, fall back to distributing the
+             sum of individual SPAN estimates proportionally — equivalent to
+             each strategy owning its own SPAN estimate, but ensures the same
+             code path is used consistently and avoids the equity-option formula.
         Returns a float or None.
         """
         acct = self.portfolio.current_account() if self.portfolio else None
         if not acct:
             return None
+
+        positions  = acct["positions"]
+        strat_raw  = self.portfolio.strategies_raw
+        instances  = [StrategyInstance(d, positions) for d in strat_raw]
+        leftover   = unassigned_positions(positions, strat_raw)
+        unassigned = group_unassigned(leftover)
+
         try:
             total_fm = float(acct["balances"].get("futures-margin-requirement") or 0)
         except (TypeError, ValueError):
-            return None
-        if total_fm <= 0:
-            return None
+            total_fm = 0.0
 
-        positions = acct["positions"]
-        strat_raw = self.portfolio.strategies_raw
-        instances = [StrategyInstance(d, positions) for d in strat_raw]
-        leftover  = unassigned_positions(positions, strat_raw)
-        unassigned = group_unassigned(leftover)
+        if total_fm <= 0:
+            # No API total — distribute the sum of SPAN estimates proportionally.
+            # Each strategy still gets its own SPAN weight; this is equivalent to
+            # _notional_capital but uses the correct SPAN path instead of the
+            # equity formula that would otherwise fire for "unknown" instrument types.
+            from models import _span_per_contract
+            def _strategy_span(s):
+                best = 0.0
+                for leg in s.legs:
+                    if not _is_future_option(leg.instrument_type):
+                        continue
+                    if leg.is_long:
+                        continue
+                    w = _span_per_contract(leg) * leg.quantity
+                    best = max(best, w)
+                return best
+            all_strats = list(instances) + list(unassigned)
+            total_span = sum(_strategy_span(s) for s in all_strats)
+            if total_span <= 0:
+                return None
+            total_fm = total_span   # distribute total SPAN proportionally
 
         dist = distribute_futures_margin(instances, unassigned, total_fm)
         return dist.get(self.strategy.key)

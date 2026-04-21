@@ -1159,7 +1159,7 @@ def portfolio_greeks(positions, metrics_by_root=None):
         sign = p.sign  # +1 long / -1 short
         # Equity options: greeks are per-share; 100 shares per contract.
         # Futures options: greeks are already per-contract; no extra multiplier.
-        mult = 100 if p.instrument_type == "Equity Option" else 1
+        mult = 100 if not _is_future_option(p.instrument_type) else 1
         d = _to_float(p.delta) * p.quantity * mult * sign
         g = _to_float(p.gamma) * p.quantity * mult * sign
         t = _to_float(p.theta) * p.quantity * mult * sign
@@ -1221,6 +1221,16 @@ _FUTURES_SPAN = {
 }
 
 _SPAN_FALLBACK_PCT = 0.015   # 1.5 % of notional for unknown products
+
+
+def _is_future_option(instr_type):
+    """
+    Return True if instr_type represents a futures option.
+    Handles any capitalisation / formatting TastyTrade may return
+    ("Future Option", "future-option", "FutureOption", etc.).
+    """
+    il = (instr_type or "").lower().replace("-", " ").replace("_", " ")
+    return "future" in il and "option" in il
 
 
 # ── Contract dollar multipliers ──────────────────────────────────────────────
@@ -1316,7 +1326,7 @@ def _notional_capital(strategy):
             continue
 
         # --- short option ---
-        if leg.instrument_type == "Future Option":
+        if _is_future_option(leg.instrument_type):
             cap = _span_per_contract(leg) * qty
         else:
             # Naked equity option: ~20 % of strike × 100 shares
@@ -1366,7 +1376,7 @@ def distribute_futures_margin(strategies, unassigned_groups, total_futures_margi
         #  but we keep them out of the weight for simplicity)
         max_short = 0.0
         for leg in s.legs:
-            if leg.instrument_type != "Future Option":
+            if not _is_future_option(leg.instrument_type):
                 continue
             if leg.is_long:
                 continue
