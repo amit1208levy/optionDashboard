@@ -293,6 +293,11 @@ def get_market_metrics(token, symbols):
             sym = it.get("symbol")
             if sym:
                 out[sym] = it
+                # Also key by stripped-slash form (e.g. "/MES" → "MES") so
+                # callers can look up by bare root without caring which style
+                # the API echoed back.
+                if sym.startswith("/"):
+                    out[sym[1:]] = it
     return out
 
 

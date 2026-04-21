@@ -114,14 +114,22 @@ class PortfolioWorker(QThread):
                        if p.is_option and p.instrument_type == "Future Option"]
             equities = [p.symbol for p in positions
                         if not p.is_option and p.instrument_type == "Equity"]
-            roots = list({p.root for p in positions if p.root})
+
+            # Futures need "/" prefix on /market-metrics queries; equities
+            # don't.  Determine which roots are futures by checking whether
+            # the original underlying-symbol starts with "/".
+            fut_roots = {p.root for p in positions
+                         if p.root and (p.underlying or "").startswith("/")}
+            eq_roots  = {p.root for p in positions
+                         if p.root and not (p.underlying or "").startswith("/")}
+            metric_syms = list(eq_roots) + [f"/{r}" for r in fut_roots]
 
             with ThreadPoolExecutor(max_workers=2) as ex:
                 f_quotes  = ex.submit(api.get_market_data, self.token,
                                       equity_options=eq_opts,
                                       future_options=fu_opts,
                                       equities=equities)
-                f_metrics = ex.submit(api.get_market_metrics, self.token, roots)
+                f_metrics = ex.submit(api.get_market_metrics, self.token, metric_syms)
                 quotes  = f_quotes.result()
                 metrics = f_metrics.result()
 
