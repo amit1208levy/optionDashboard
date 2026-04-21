@@ -1393,6 +1393,92 @@ def distribute_futures_margin(strategies, unassigned_groups, total_futures_margi
     return {k: total_futures_margin * (w / total_w) for k, w in weights.items()}
 
 
+def distributed_delta_dte_capital(strategy, all_strategies, all_unassigned,
+                                   futures_margin_total=0.0):
+    """
+    Estimate this strategy's capital requirement by distributing the total
+    per-ticker capital pool proportionally, weighted by each strategy's
+    delta × DTE risk profile.
+
+    Algorithm
+    ---------
+    1. Find every strategy (instances + unassigned) that shares this
+       strategy's root ticker.
+    2. Compute the total capital pool for that root:
+         pool = Σ _notional_capital(s)  for every strategy on the same root
+       For futures-option roots: if futures_margin_total > 0 (the actual
+       number from the balances API), scale the pool so the whole account's
+       futures margin is distributed correctly.
+    3. Each strategy's weight = largest (|delta| × DTE × qty) across its
+       short option legs.  Defaults when live Greeks aren't available:
+         delta = 0.30  (representative 30-delta short option)
+         DTE   = 45    (typical entry DTE)
+    4. This strategy's share = pool × (my_weight / Σ all_weights).
+
+    Single-strategy root:  my_weight / total_w = 1 → gets the full pool,
+    which equals _notional_capital(strategy).  Identical to the old path.
+
+    Returns float or None.
+    """
+    root      = strategy.root or ""
+    all_strats = list(all_strategies) + list(all_unassigned)
+
+    # ── 1. Strategies on the same root ──────────────────────────────────────
+    same_root = [s for s in all_strats if (s.root or "") == root]
+    if not same_root:
+        return None
+
+    # ── 2. Total capital pool for this root ─────────────────────────────────
+    has_fut = any(
+        _is_future_option(leg.instrument_type)
+        for s in same_root for leg in s.legs
+    )
+
+    root_pool = sum(_notional_capital(s) for s in same_root)
+
+    if has_fut and futures_margin_total > 0 and root_pool > 0:
+        # Scale the pool so it reflects the broker's actual reported margin.
+        # We don't know per-product breakdowns, so attribute futures margin
+        # proportionally across roots by their SPAN weight.
+        all_fut_strats = [
+            s for s in all_strats
+            if any(_is_future_option(leg.instrument_type) for leg in s.legs)
+        ]
+        account_span = sum(_notional_capital(s) for s in all_fut_strats)
+        if account_span > 0:
+            root_pool = futures_margin_total * (root_pool / account_span)
+
+    if root_pool <= 0:
+        return None
+
+    # ── 3. Delta × DTE weight per strategy ──────────────────────────────────
+    def _weight(s):
+        best = 0.0
+        for leg in s.legs:
+            if not leg.is_option or leg.is_long:
+                continue
+            delta = abs(leg.delta) if leg.delta is not None else 0.30
+            dte   = max(leg.dte or 45, 1)
+            w = delta * dte * leg.quantity
+            if w > best:
+                best = w
+        return best
+
+    weights   = {s.key: _weight(s) for s in same_root}
+    total_w   = sum(weights.values())
+    my_weight = weights.get(strategy.key, 0.0)
+
+    # ── 4. Proportional allocation ───────────────────────────────────────────
+    if total_w <= 0:
+        # No Greeks at all → equal split
+        return root_pool / len(same_root)
+    if my_weight <= 0:
+        # This strategy has no short options (all-long, stock-only, etc.)
+        return None
+
+    return root_pool * (my_weight / total_w)
+
+
 def strategy_allocation(instances, unassigned_groups, overrides_by_id=None):
     """
     Like capital_allocation but returns one row per strategy (not per ticker).

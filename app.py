@@ -85,12 +85,15 @@ class PortfolioWorker(QThread):
                 roots = list({p.root for p in positions if p.root})
                 metrics = api.get_market_metrics(self.token, roots)
 
+                ytd_txns = api.get_transactions_ytd(self.token, num)
+
                 accounts.append({
                     "number":    num,
                     "nickname":  acct.get("nickname") or num,
                     "balances":  balances,
                     "positions": positions,
                     "metrics":   metrics,
+                    "ytd_txns":  ytd_txns,
                 })
             self.done.emit({"accounts": accounts, "error": ""})
         except Exception as e:
@@ -221,7 +224,6 @@ class AccountSettingsDialog(QDialog):
         ("theta", "Θ  Theta"),
         ("gamma", "Γ  Gamma"),
         ("vega",  "V  Vega"),
-        ("iv",    "IV  Implied Volatility"),
     ]
 
     def __init__(self, accounts, overrides, settings, parent=None):
@@ -231,7 +233,9 @@ class AccountSettingsDialog(QDialog):
         self.setMinimumWidth(500)
         self._fields = {}
         self._greek_checks = {}
-        enabled_greeks = settings.get("leg_greeks", ["delta", "theta", "iv"])
+        # Strip any legacy "iv" entries that may have been saved by older versions
+        enabled_greeks = [k for k in settings.get("leg_greeks", ["delta", "theta"])
+                          if k != "iv"]
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 22, 24, 22)
@@ -679,6 +683,11 @@ class PortfolioScreen(QWidget):
     # ── Data loading / close detection ──────────────────────────────────────
 
     def _load_data(self):
+        # Don't start a second worker while one is already running — that would
+        # drop the Python reference to the running worker, causing GC to call
+        # QThread::~QThread() while the C++ thread is still alive → SIGABRT.
+        if self._worker and self._worker.isRunning():
+            return
         self.status_lbl.setStyleSheet(
             f"color: {T.MUTED}; font-size: 13px; border: none; background: transparent;"
         )
@@ -885,9 +894,21 @@ class PortfolioScreen(QWidget):
             except (TypeError, ValueError):
                 return 0.0
 
-        # Day P&L (realized + unrealized change today)
+        positions_now = acct.get("positions", [])
+        ytd_txns      = acct.get("ytd_txns", [])
+
+        # ── Day P&L ─────────────────────────────────────────────────────────
+        # Computed from positions: mark vs prior-session close-price.
+        # TastyTrade's balance "unrealized-day-gain" field is unreliable
+        # (returns 0 when market is closed or for certain account types).
         try:
-            day_pnl = _signed_gain("realized-day-gain") + _signed_gain("unrealized-day-gain")
+            unrealized_day = sum(
+                p.sign * p.quantity * p.multiplier * (p.mark_price - p.close_price)
+                for p in positions_now
+                if p.close_price and p.close_price > 0 and p.mark_price
+            )
+            # TastyTrade's "realized-day-gain" covers trades already closed today
+            day_pnl = unrealized_day + _signed_gain("realized-day-gain")
             self.day_pnl_lbl.setText(money(day_pnl, signed=True))
             self.day_pnl_lbl.setStyleSheet(
                 f"color: {pnl_color(day_pnl)}; font-size: 22px; font-weight: bold; "
@@ -896,9 +917,38 @@ class PortfolioScreen(QWidget):
         except (ValueError, TypeError):
             self.day_pnl_lbl.setText("—")
 
-        # YTD P&L (realized year gain — includes fees on TastyTrade)
+        # ── YTD P&L (with fees) ─────────────────────────────────────────────
+        # Pulled directly from TastyTrade's transaction history for the current
+        # year.  We sum net-value (already minus all commissions / exchange /
+        # clearing / regulatory fees) for every Trade and Receive-Deliver
+        # transaction this year, then add the current unrealized P&L on open
+        # positions.
+        #
+        # Why not just use the balance "realized-year-gain" field?
+        #   - It is the gross P&L before commissions (TastyTrade charges fees
+        #     as a separate cash debit, so the gain field doesn't reflect them).
+        #   - It is also 0 when all positions are still open.
+        #
+        # The transaction net-value approach gives us both: the fees are already
+        # deducted in net-value, and open-position P&L rounds it out.
         try:
-            ytd = _signed_gain("realized-year-gain")
+            # Sum net-value (post-fees) for every trade this year.
+            # Opening a short adds cash; closing it removes cash.
+            # Net of the two = round-trip P&L after commissions/fees.
+            ytd_realized = 0.0
+            for t in ytd_txns:
+                if (t.get("transaction-type") or "") not in ("Trade", "Receive Deliver"):
+                    continue
+                try:
+                    val    = float(t.get("net-value") or 0)
+                    effect = (t.get("net-value-effect") or "").lower()
+                    ytd_realized += -val if "debit" in effect else val
+                except (TypeError, ValueError):
+                    continue
+
+            # Add unrealized P&L on open positions (their mark vs avg open price)
+            open_pnl = sum(p.pnl for p in positions_now)
+            ytd = ytd_realized + open_pnl
             self.ytd_pnl_lbl.setText(money(ytd, signed=True))
             self.ytd_pnl_lbl.setStyleSheet(
                 f"color: {pnl_color(ytd)}; font-size: 22px; font-weight: bold; "
@@ -1126,6 +1176,19 @@ class PortfolioScreen(QWidget):
             api.save_settings(self._settings)
             self._refresh_account_combo()
 
+    def stop_workers(self):
+        """Gracefully stop all background threads before this widget is deleted.
+
+        Must be called before deleteLater() / before Python drops the last
+        reference, otherwise QThread::~QThread() aborts when the thread is
+        still running (SIGABRT / EXC_CRASH).
+        """
+        for attr in ("_worker", "_update_worker"):
+            w = getattr(self, attr, None)
+            if w and w.isRunning():
+                w.quit()
+                w.wait(5000)   # 5 s safety timeout
+
     def _logout(self):
         api.clear_credentials()
         self.logout_requested.emit()
@@ -1217,6 +1280,7 @@ class MainWindow(QStackedWidget):
         if self.portfolio:
             self.setCurrentWidget(self.portfolio)
         if self.watchlist:
+            self.watchlist.stop_workers()   # join threads before deletion
             self.removeWidget(self.watchlist)
             self.watchlist.deleteLater()
             self.watchlist = None
@@ -1268,6 +1332,12 @@ class MainWindow(QStackedWidget):
             self.detail = None
 
     def _clear_all(self):
+        # Stop background threads on every screen that has them before we
+        # call deleteLater — prevents QThread::~QThread() crash (SIGABRT).
+        if self.portfolio:
+            self.portfolio.stop_workers()
+        if self.watchlist:
+            self.watchlist.stop_workers()
         while self.count():
             w = self.widget(0)
             self.removeWidget(w)

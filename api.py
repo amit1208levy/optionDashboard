@@ -233,6 +233,37 @@ def get_transactions(token, account_number, per_page=250, max_pages=40):
     return items
 
 
+def get_transactions_ytd(token, account_number):
+    """
+    Fetch all Trade / Receive-Deliver transactions for the current calendar year.
+    Uses start-date filtering so only 1-5 API pages are needed instead of 40.
+    Returns a list of raw transaction dicts.
+    """
+    from datetime import date
+    start = f"{date.today().year}-01-01"
+    items = []
+    page  = 0
+    while page < 20:          # 20 × 250 = 5 000 — more than enough for one year
+        try:
+            r = requests.get(
+                f"{BASE}/accounts/{account_number}/transactions",
+                headers=auth_headers(token),
+                params={"per-page": 250, "page-offset": page,
+                        "start-date": start},
+                timeout=15,
+            )
+        except requests.exceptions.RequestException:
+            break
+        if r.status_code != 200:
+            break
+        batch = r.json().get("data", {}).get("items", []) or []
+        items.extend(batch)
+        if len(batch) < 250:
+            break
+        page += 1
+    return items
+
+
 def get_market_metrics(token, symbols):
     """
     Returns {symbol: metrics_dict} with fields like

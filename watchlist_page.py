@@ -1238,6 +1238,16 @@ class WatchlistPage(QWidget):
         reverse = not self._sort_asc
         return sorted(tickers, key=self._raw_sort_value, reverse=reverse)
 
+    def stop_workers(self):
+        """Gracefully stop background threads before this widget is deleted.
+
+        Must be called before deleteLater() so that QThread::~QThread() is
+        never reached while the C++ thread is still alive (SIGABRT / EXC_CRASH).
+        """
+        if self._worker and self._worker.isRunning():
+            self._worker.quit()
+            self._worker.wait(5000)   # 5 s safety timeout
+
     # ── Ticker management ─────────────────────────────────────────────────────
 
     def _add_ticker(self):

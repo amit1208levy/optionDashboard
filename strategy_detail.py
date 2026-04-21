@@ -10,45 +10,97 @@ import api
 import theme as T
 
 # ── Leg column definitions ───────────────────────────────────────────────────
+# New layout: ⠿ | Ticker | Strike | Exp | P&L | Day | Qty | Open | Extrinsic | Greeks
 
-# Columns always shown
 _BASE_LEG_COLUMNS = [
-    ("Side",    60),
-    ("Type",    58),
-    ("Strike",  72),
-    ("Exp",     92),
-    ("Qty",     48),
-    ("Open",    68),
-    ("Mark",    68),
-    ("Premium", 90),
-    ("P&L",     96),
+    ("",          24),   # drag-handle placeholder (no header text)
+    ("Ticker",    68),   # underlying root + C/P type
+    ("Strike",    72),
+    ("Exp",       82),
+    ("P&L",       90),
+    ("Day",       80),   # day P&L (mark − prior close)
+    ("Qty",       52),
+    ("Open",      84),   # net premium at open (credit/debit)
+    ("Extrinsic", 76),   # current time-value of the option
 ]
 
-# Optional Greek columns: key → (header_label, width)
+# IV removed; only Δ Θ Γ V remain
 _GREEK_COL_DEFS = {
-    "delta": ("Δ",  56),
-    "theta": ("Θ",  56),
-    "gamma": ("Γ",  56),
-    "vega":  ("V",  56),
-    "iv":    ("IV", 62),
+    "delta": ("Δ", 52),
+    "theta": ("Θ", 52),
+    "gamma": ("Γ", 52),
+    "vega":  ("V", 52),
 }
-_GREEK_ORDER = ["delta", "theta", "gamma", "vega", "iv"]
+_GREEK_ORDER = ["delta", "theta", "gamma", "vega"]
 
 
 def _active_leg_columns():
-    """Return the column list to render, respecting the user's settings."""
+    """Return (columns, enabled_greeks) respecting the user's settings."""
     settings = api.load_settings()
-    enabled  = settings.get("leg_greeks", ["delta", "theta", "iv"])
+    enabled  = [k for k in settings.get("leg_greeks", ["delta", "theta"])
+                if k in _GREEK_COL_DEFS]   # silently drop 'iv' from old saves
     cols = list(_BASE_LEG_COLUMNS)
     for key in _GREEK_ORDER:
         if key in enabled:
             cols.append(_GREEK_COL_DEFS[key])
     return cols, enabled
+
+
+# ── Per-leg helpers ──────────────────────────────────────────────────────────
+
+def _fmt_greek(v, signed=True):
+    """
+    Format a Greek value with auto-scaling precision.
+    Avoids the "−0.00" display artifact for small values.
+    """
+    if v is None:
+        return "—"
+    abs_v = abs(v)
+    if abs_v == 0:
+        return "0"
+    if abs_v < 0.0005:
+        return "~0"
+    if abs_v < 0.01:
+        dp = 4
+    elif abs_v < 0.1:
+        dp = 3
+    elif abs_v < 10:
+        dp = 2
+    else:
+        dp = 1
+    fmt = f"{v:+.{dp}f}" if signed else f"{v:.{dp}f}"
+    return fmt
+
+
+def _extrinsic_value(leg):
+    """
+    Time value (extrinsic) of the option at current mark.
+    = mark − max(0, intrinsic).  Returns 0 for stock legs.
+    """
+    if not leg.is_option or leg.mark_price <= 0:
+        return 0.0
+    und = leg.underlying_price
+    if und is None:
+        return leg.mark_price   # no underlying → all extrinsic
+    if leg.call_put == "C":
+        intrinsic = max(0.0, und - (leg.strike or 0))
+    else:
+        intrinsic = max(0.0, (leg.strike or 0) - und)
+    return max(0.0, leg.mark_price - intrinsic)
+
+
+def _day_pnl_leg(leg):
+    """Day P&L for one leg: sign × qty × mult × (mark − prior_close)."""
+    if not leg.close_price:
+        return None
+    return leg.sign * leg.quantity * leg.multiplier * (leg.mark_price - leg.close_price)
+
+
 from models import (
     StrategyInstance, strategy_extremes, probability_of_profit, capital_for_strategy,
     strategy_performance, symbol_ivr, symbol_ivp, symbol_beta, symbol_hv30,
-    scenario_pnl, distribute_futures_margin, unassigned_positions, group_unassigned,
-    check_exit_conditions, _is_future_option,
+    scenario_pnl, distributed_delta_dte_capital,
+    unassigned_positions, group_unassigned, check_exit_conditions,
 )
 from payoff_chart import PayoffChart
 from history_chart import HistoryChart
@@ -56,17 +108,47 @@ from strategy_card import money, pct, fmt_num, pnl_color, dte_color
 from strategies_page import PastLegPickerDialog
 
 
-# ── Leg row (read-only) ─────────────────────────────────────────────────────
+# ── Drag handle ──────────────────────────────────────────────────────────────
+
+class _DragHandle(QLabel):
+    """⠿ icon; pressing it initiates a row-drag in _LegsBody."""
+    pressed = pyqtSignal(int)   # global-Y at press time
+
+    def __init__(self, parent=None):
+        super().__init__("⠿", parent)
+        self.setFixedWidth(24)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setStyleSheet(
+            f"color: {T.MUTED}; border: none; background: transparent; "
+            f"font-size: 13px; letter-spacing: 0;"
+        )
+        self.setToolTip("Drag to reorder this leg")
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.pressed.emit(int(e.globalPosition().y()))
+            e.accept()
+        else:
+            super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mouseReleaseEvent(e)
+
+
+# ── Leg header row ───────────────────────────────────────────────────────────
 
 class LegHeader(QFrame):
     def __init__(self, columns, parent=None):
         super().__init__(parent)
         self.setStyleSheet("background: transparent; border: none;")
         h = QHBoxLayout(self)
-        h.setContentsMargins(10, 4, 6, 6)
-        h.setSpacing(8)
+        h.setContentsMargins(0, 4, 6, 6)
+        h.setSpacing(0)
         for label, width in columns:
-            l = QLabel(label.upper())
+            l = QLabel(label.upper() if label else "")
             l.setFixedWidth(width)
             l.setStyleSheet(
                 f"color: {T.MUTED}; background: transparent; border: none; "
@@ -76,47 +158,68 @@ class LegHeader(QFrame):
         h.addStretch()
 
 
+# ── Single leg row ───────────────────────────────────────────────────────────
+
 class LegRow(QFrame):
-    def __init__(self, leg, enabled_greeks, columns, parent=None):
+    drag_started = pyqtSignal(object, int)   # (self, global_y)
+
+    _NORMAL = (
+        "QFrame {{ background: {card}; border: 1px solid {border}; border-radius: 8px; }}"
+        "QFrame:hover {{ border-color: {bh}; background: #1d2034; }}"
+    )
+    _DRAGGING = (
+        "QFrame {{ background: #2a2e4a; border: 1px solid {purple}; "
+        "border-radius: 8px; }}"
+    )
+
+    def __init__(self, leg, enabled_greeks, parent=None):
         super().__init__(parent)
-        self.setStyleSheet(
-            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
-            f"border-radius: 8px; }}"
-            f"QFrame:hover {{ border-color: {T.BORDER_H}; background: #1d2034; }}"
-        )
+        self.leg = leg
+        self.setFixedHeight(44)
+        self._set_style(False)
+
         h = QHBoxLayout(self)
-        h.setContentsMargins(10, 6, 6, 6)
-        h.setSpacing(8)
+        h.setContentsMargins(0, 0, 6, 0)
+        h.setSpacing(0)
 
-        side_color = T.TEAL if leg.is_long else T.YELLOW
-        type_color = T.GREEN if leg.call_put == "C" else (T.RED if leg.call_put == "P" else T.MUTED)
-        prem_color = T.GREEN if leg.credit_debit > 0 else (T.RED if leg.credit_debit < 0 else T.MUTED)
+        # ── Drag handle ───────────────────────────────────────────────────
+        handle = _DragHandle()
+        handle.pressed.connect(lambda y: self.drag_started.emit(self, y))
+        h.addWidget(handle)
 
-        # Fixed base cells
-        cells = [
-            (leg.direction_label.upper(),          side_color,         700),
-            (leg.type_label,                       type_color,         700),
-            (f"${leg.strike:g}" if leg.strike else "—", T.TEXT,        600),
-            (leg.expires_at.strftime("%b %d %y") if leg.expires_at else "—", T.TEXT_DIM, 400),
-            (f"{leg.quantity:g}",                  T.TEXT,             500),
-            (money(leg.avg_open_price),            T.TEXT_DIM,         400),
-            (money(leg.mark_price),                T.TEXT,             500),
-            (money(leg.credit_debit, signed=True), prem_color,         600),
-            (money(leg.pnl, signed=True),          pnl_color(leg.pnl), 700),
+        # ── Data cells ────────────────────────────────────────────────────
+        type_color = (T.GREEN if leg.call_put == "C"
+                      else T.RED if leg.call_put == "P"
+                      else T.MUTED)
+        prem_color = (T.GREEN if leg.credit_debit > 0
+                      else T.RED if leg.credit_debit < 0
+                      else T.MUTED)
+        side_tag   = " S" if not leg.is_long else " L"
+
+        day  = _day_pnl_leg(leg)
+        ext  = _extrinsic_value(leg)
+        ticker_text = f"{leg.root or '—'}{side_tag}"
+
+        # (text, color, weight, width)
+        base_cells = [
+            (ticker_text,
+             type_color,                        700, 68),
+            (f"${leg.strike:g}" if leg.strike else "—",
+             T.TEXT,                            600, 72),
+            (leg.expires_at.strftime("%b %d %y") if leg.expires_at else "—",
+             T.TEXT_DIM,                        400, 82),
+            (money(leg.pnl, signed=True),
+             pnl_color(leg.pnl),                700, 90),
+            (money(day, signed=True) if day is not None else "—",
+             pnl_color(day) if day is not None else T.MUTED, 600, 80),
+            (f"{leg.quantity:g}",
+             T.TEXT,                            500, 52),
+            (money(leg.credit_debit, signed=True),
+             prem_color,                        600, 84),
+            (f"${ext:.3f}" if ext > 0 else "—",
+             T.TEXT_DIM,                        500, 76),
         ]
-        # Optional Greek cells appended in canonical order
-        greek_vals = {
-            "delta": fmt_num(leg.delta, 2, signed=True),
-            "theta": fmt_num(leg.theta, 2, signed=True),
-            "gamma": fmt_num(leg.gamma, 2, signed=True),
-            "vega":  fmt_num(leg.vega,  2, signed=True),
-            "iv":    pct(leg.iv * 100 if leg.iv is not None else None, signed=False),
-        }
-        for key in _GREEK_ORDER:
-            if key in enabled_greeks:
-                cells.append((greek_vals[key], T.TEXT_DIM, 400))
-
-        for (text, color, weight), (_, width) in zip(cells, columns):
+        for text, color, weight, width in base_cells:
             l = QLabel(text)
             l.setFixedWidth(width)
             l.setStyleSheet(
@@ -124,7 +227,115 @@ class LegRow(QFrame):
                 f"font-size: 12px; font-weight: {weight};"
             )
             h.addWidget(l)
+
+        # ── Greek cells ───────────────────────────────────────────────────
+        greek_vals = {
+            "delta": _fmt_greek(leg.delta),
+            "theta": _fmt_greek(leg.theta),
+            "gamma": _fmt_greek(leg.gamma),
+            "vega":  _fmt_greek(leg.vega),
+        }
+        for key in _GREEK_ORDER:
+            if key in enabled_greeks:
+                _, width = _GREEK_COL_DEFS[key]
+                l = QLabel(greek_vals[key])
+                l.setFixedWidth(width)
+                l.setStyleSheet(
+                    f"color: {T.TEXT_DIM}; background: transparent; border: none; "
+                    f"font-size: 12px; font-weight: 400;"
+                )
+                h.addWidget(l)
+
         h.addStretch()
+
+    def _set_style(self, dragging):
+        if dragging:
+            self.setStyleSheet(
+                self._DRAGGING.format(purple=T.PURPLE)
+            )
+        else:
+            self.setStyleSheet(
+                self._NORMAL.format(
+                    card=T.CARD, border=T.BORDER, bh=T.BORDER_H
+                )
+            )
+
+    def set_dragging(self, on: bool):
+        self._set_style(on)
+
+
+# ── Reorderable legs body ────────────────────────────────────────────────────
+
+class _LegsBody(QWidget):
+    """
+    VBox of LegRows with grab-mouse drag-to-reorder.
+
+    The user grabs the ⠿ handle; _LegsBody captures all mouse events via
+    grabMouse(), reorders rows live on mouse-move, and emits `reordered`
+    (new symbol list) on mouse-release so the caller can persist the order.
+    """
+    reordered = pyqtSignal(list)   # [symbol, ...] in new order
+
+    def __init__(self, legs, enabled_greeks, parent=None):
+        super().__init__(parent)
+        self._rows: list[LegRow] = []
+        self._dragging: LegRow | None = None
+
+        self._lay = QVBoxLayout(self)
+        self._lay.setSpacing(4)
+        self._lay.setContentsMargins(0, 0, 0, 0)
+
+        for leg in legs:
+            row = LegRow(leg, enabled_greeks)
+            row.drag_started.connect(self._on_drag_started)
+            self._rows.append(row)
+            self._lay.addWidget(row)
+
+    # ── Drag lifecycle ───────────────────────────────────────────────────────
+
+    def _on_drag_started(self, row: LegRow, _global_y: int):
+        if len(self._rows) < 2:
+            return                     # nothing to reorder
+        self._dragging = row
+        row.set_dragging(True)
+        self.grabMouse()               # all subsequent events come here
+
+    def mouseMoveEvent(self, e):
+        if self._dragging is None:
+            return
+        local_y = e.pos().y()
+        # Find target index: insert before the row whose midpoint is below cursor
+        target = len(self._rows) - 1
+        for i, row in enumerate(self._rows):
+            if local_y < row.pos().y() + row.height() // 2:
+                target = i
+                break
+
+        curr = next((i for i, r in enumerate(self._rows) if r is self._dragging), -1)
+        if curr < 0 or target == curr:
+            return
+
+        # Rebuild rows list with dragged row at target position
+        others = [r for r in self._rows if r is not self._dragging]
+        others.insert(min(target, len(others)), self._dragging)
+        self._rows = others
+
+        # Reflect new order in the layout (remove-all then re-add is simplest)
+        for row in self._rows:
+            self._lay.removeWidget(row)
+        for row in self._rows:
+            self._lay.addWidget(row)
+
+        e.accept()
+
+    def mouseReleaseEvent(self, e):
+        if self._dragging is None:
+            return
+        self._dragging.set_dragging(False)
+        self._dragging = None
+        self.releaseMouse()
+        self.reordered.emit([r.leg.symbol for r in self._rows])
+        e.accept()
 
 
 # ── Detail page ─────────────────────────────────────────────────────────────
@@ -372,11 +583,10 @@ class StrategyDetailPage(QWidget):
     def _capital_required_with_source(self):
         """
         Returns (value, source) where source is one of:
-          'override'    – user-set manual override
-          'max_loss'    – defined-risk strategy (max loss from payoff diagram)
-          'distributed' – actual TastyTrade futures margin, distributed proportionally
-          'estimate'    – SPAN / notional approximation (least accurate)
-          None          – no value available
+          'override'   – user-set manual override
+          'max_loss'   – defined-risk strategy (exact max loss from payoff diagram)
+          'rough_est'  – delta/DTE-weighted share of total per-ticker capital pool
+          None         – no value available
         """
         override = self._capital_override()
         if override is not None:
@@ -386,32 +596,24 @@ class StrategyDetailPage(QWidget):
         if max_loss is not None and max_loss != float("-inf"):
             return abs(max_loss), "max_loss"
 
-        # For futures-option strategies, use the actual margin from TastyTrade
-        has_future_opts = any(
-            _is_future_option(l.instrument_type) for l in self.strategy.legs
-        )
-        if has_future_opts:
-            dist = self._get_distributed_futures_margin()
-            if dist is not None and dist > 0:
-                return dist, "distributed"
+        # Undefined-risk: distribute per-ticker capital pool weighted by delta×DTE
+        dist = self._get_delta_dte_capital()
+        if dist is not None and dist > 0:
+            return dist, "rough_est"
 
-        # Undefined-risk equity options: notional/SPAN approximation
+        # Last-resort fallback (all-long or no Greeks at all)
         est = capital_for_strategy(self.strategy)
-        return (est if est else None), "estimate"
+        return (est if est else None), "rough_est"
 
-    def _get_distributed_futures_margin(self):
+    def _get_delta_dte_capital(self):
         """
-        Return this strategy's pro-rata share of the account's futures margin.
+        Distribute the total capital for this strategy's root ticker
+        proportionally across all strategies on that root, weighted by
+        each strategy's largest short-leg |delta| × DTE × qty.
 
-        Priority:
-          1. Distribute TastyTrade's reported futures-margin-requirement (from
-             the balances API) proportionally among all futures-option strategies
-             using SPAN weights.
-          2. If the API total is not available, fall back to distributing the
-             sum of individual SPAN estimates proportionally — equivalent to
-             each strategy owning its own SPAN estimate, but ensures the same
-             code path is used consistently and avoids the equity-option formula.
-        Returns a float or None.
+        Works for both equity and futures options — no special-casing needed.
+        Passes the broker's reported futures-margin-requirement so the pool
+        for futures roots is anchored to the actual account margin.
         """
         acct = self.portfolio.current_account() if self.portfolio else None
         if not acct:
@@ -428,30 +630,10 @@ class StrategyDetailPage(QWidget):
         except (TypeError, ValueError):
             total_fm = 0.0
 
-        if total_fm <= 0:
-            # No API total — distribute the sum of SPAN estimates proportionally.
-            # Each strategy still gets its own SPAN weight; this is equivalent to
-            # _notional_capital but uses the correct SPAN path instead of the
-            # equity formula that would otherwise fire for "unknown" instrument types.
-            from models import _span_per_contract
-            def _strategy_span(s):
-                best = 0.0
-                for leg in s.legs:
-                    if not _is_future_option(leg.instrument_type):
-                        continue
-                    if leg.is_long:
-                        continue
-                    w = _span_per_contract(leg) * leg.quantity
-                    best = max(best, w)
-                return best
-            all_strats = list(instances) + list(unassigned)
-            total_span = sum(_strategy_span(s) for s in all_strats)
-            if total_span <= 0:
-                return None
-            total_fm = total_span   # distribute total SPAN proportionally
-
-        dist = distribute_futures_margin(instances, unassigned, total_fm)
-        return dist.get(self.strategy.key)
+        return distributed_delta_dte_capital(
+            self.strategy, instances, unassigned,
+            futures_margin_total=total_fm,
+        )
 
     def _capital_override(self):
         if not isinstance(self.strategy, StrategyInstance):
@@ -506,6 +688,9 @@ class StrategyDetailPage(QWidget):
         if cap_required is None:
             text  = "Undefined"
             color = T.MUTED
+        elif source == "rough_est":
+            text  = "~" + money(cap_required)    # tilde = rough estimate
+            color = T.TEXT_DIM
         else:
             text  = money(cap_required)
             color = T.PURPLE if is_override else T.TEXT_DIM
@@ -519,11 +704,10 @@ class StrategyDetailPage(QWidget):
         # Source badge
         if source == "override":
             badge_text, badge_color = "manual", T.PURPLE
-        elif source == "distributed":
-            badge_text, badge_color = "actual margin", T.TEAL
-        elif source == "estimate":
-            badge_text, badge_color = "estimate", T.MUTED
+        elif source == "rough_est":
+            badge_text, badge_color = "~roughly calculated", T.MUTED
         else:
+            # max_loss → no badge (it's exact, self-explanatory)
             badge_text, badge_color = None, None
 
         if badge_text:
@@ -571,12 +755,20 @@ class StrategyDetailPage(QWidget):
         grid.setHorizontalSpacing(14)
         grid.setVerticalSpacing(6)
 
+        # Beta-weighted delta
+        m    = self._metrics_for_root()
+        beta = symbol_beta(m) if m else None
+        bwd  = (s.net_delta * beta
+                if (s.net_delta is not None and beta is not None)
+                else None)
+
         items = [
-            ("Δ Delta",  fmt_num(s.net_delta, 2, signed=True),
+            ("Δ Delta",  _fmt_greek(s.net_delta),
                 pnl_color(s.net_delta) if s.net_delta else T.TEXT_DIM),
-            ("Θ Theta",  fmt_num(s.net_theta, 2, signed=True),
+            ("Θ Theta",  _fmt_greek(s.net_theta),
                 pnl_color(s.net_theta) if s.net_theta else T.TEXT_DIM),
-            ("V Vega",   fmt_num(s.net_vega,  2, signed=True), T.TEXT_DIM),
+            ("V Vega",   _fmt_greek(s.net_vega),  T.TEXT_DIM),
+            ("β×Δ BWD",  _fmt_greek(bwd) if bwd is not None else "—", T.TEXT_DIM),
         ]
         for i, (label, value, color) in enumerate(items):
             grid.addWidget(self._metric_box(label, value, color), 0, i)
@@ -653,9 +845,36 @@ class StrategyDetailPage(QWidget):
         columns, enabled_greeks = _active_leg_columns()
         frame, lay = self._section_frame(f"Legs ({len(self.strategy.legs)})")
         lay.addWidget(LegHeader(columns))
-        for leg in self.strategy.legs:
-            lay.addWidget(LegRow(leg, enabled_greeks, columns))
+
+        # Apply user-defined display order if one has been saved
+        legs = list(self.strategy.legs)
+        if isinstance(self.strategy, StrategyInstance) and self.portfolio:
+            raw = next(
+                (r for r in self.portfolio.strategies_raw
+                 if r["id"] == self.strategy.id), None
+            )
+            if raw and raw.get("leg_order"):
+                order = {sym: i for i, sym in enumerate(raw["leg_order"])}
+                legs.sort(key=lambda l: order.get(l.symbol, 999))
+
+        body = _LegsBody(legs, enabled_greeks)
+        if isinstance(self.strategy, StrategyInstance):
+            body.reordered.connect(self._on_legs_reordered)
+        lay.addWidget(body)
         return frame
+
+    def _on_legs_reordered(self, new_symbols: list):
+        """Persist the user-defined leg display order to the strategies JSON."""
+        if not isinstance(self.strategy, StrategyInstance) or not self.portfolio:
+            return
+        raw = next(
+            (r for r in self.portfolio.strategies_raw
+             if r["id"] == self.strategy.id), None
+        )
+        if raw is None:
+            return
+        raw["leg_order"] = new_symbols
+        self.portfolio.save_strategies()
 
     # ── Exit Plan ────────────────────────────────────────────────────────────
 
