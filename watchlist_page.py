@@ -1,4 +1,6 @@
 """Watchlist page — multiple named lists, pin/star, IVR stars, liquidity stars."""
+import json
+import os
 import re
 import time
 
@@ -66,7 +68,7 @@ def _ivr_stars(ivr):
     return _stars_html(n, color=color)
 
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QStringListModel
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QStringListModel
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QScrollArea, QDialog, QSlider,
@@ -169,61 +171,33 @@ _INDEX_SYMBOLS = {
 }
 
 
-# ── Suggest worker ────────────────────────────────────────────────────────────
+# ── Local ticker data (loaded once at import time) ────────────────────────────
 
-class _SuggestWorker(QThread):
-    done = pyqtSignal(list)   # list of {symbol, description, type}
+def _load_ticker_items():
+    """Return a list of display strings from tickers.json for the QCompleter."""
+    path = os.path.join(os.path.dirname(__file__), "tickers.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = []
+    items = []
+    for t in data:
+        sym  = (t.get("symbol") or "").strip()
+        desc = (t.get("description") or "").strip()
+        kind = (t.get("type") or "").strip()
+        if not sym:
+            continue
+        if desc and kind:
+            items.append(f"{sym}  ·  {desc}  [{kind}]")
+        elif desc:
+            items.append(f"{sym}  ·  {desc}")
+        else:
+            items.append(sym)
+    return items
 
-    def __init__(self, token, query, parent=None):
-        super().__init__(parent)
-        self.token = token
-        self.query = query.upper().lstrip("/")
 
-    def run(self):
-        q = self.query
-        results = []
-        seen    = set()
-
-        def _add(sym, desc, kind, priority=1):
-            if sym not in seen:
-                seen.add(sym)
-                results.append({"symbol": sym, "description": desc,
-                                 "type": kind, "_p": priority})
-
-        # Build combined offline table
-        offline = {}
-        for sym, desc in _INDEX_SYMBOLS.items():
-            offline[sym] = (desc, "Index/ETF")
-        for sym, desc in _FUTURES_ROOTS.items():
-            offline[sym] = (desc, "Futures")
-
-        # Priority 0 – prefix match (strongest)
-        for sym, (desc, kind) in sorted(offline.items()):
-            if sym.startswith(q):
-                _add(sym, desc, kind, 0)
-
-        # Priority 1 – substring match (e.g. "MFTS" finds nothing, but "FTS" → MFTS)
-        for sym, (desc, kind) in sorted(offline.items()):
-            if q in sym and not sym.startswith(q):
-                _add(sym, desc, kind, 1)
-
-        # Priority 2 – description word match (e.g. "gold" → GC/GLD)
-        for sym, (desc, kind) in sorted(offline.items()):
-            if q.lower() in desc.lower() and sym not in seen:
-                _add(sym, desc, kind, 2)
-
-        # ── Online: TastyTrade equity / ETF search ────────────────────────────
-        try:
-            for e in api.search_instruments(self.token, q, per_page=12):
-                _add(e["symbol"], e.get("description") or "",
-                     e.get("type") or "Equity", 2)
-        except Exception:
-            pass
-
-        results.sort(key=lambda r: r["_p"])
-        for r in results:
-            r.pop("_p", None)
-        self.done.emit(results[:12])
+_COMPLETER_ITEMS = _load_ticker_items()
 
 
 # ── Autocomplete completer ────────────────────────────────────────────────────
@@ -232,15 +206,12 @@ class _SuggestWorker(QThread):
 
 class _SymCompleter(QCompleter):
     """
-    Completer that shows all items supplied by _SuggestWorker (no extra
-    Qt-side filtering) and inserts only the ticker symbol into the input.
-
-    Each model item is "SYMBOL  ·  Description  [Type]"; splitPath() returns
-    [""] so every item matches, and pathFromIndex() strips back to the symbol.
+    Completer backed by the local tickers.json file.
+    MatchContains mode means "SP" matches "SPX", "SPY", "SPDR", and even
+    description words like "S&P 500".
+    Each model item is "SYMBOL  ·  Description  [Type]";
+    pathFromIndex() strips back to just the ticker symbol on selection.
     """
-    def splitPath(self, _path):        # show ALL items, ignore current text
-        return [""]
-
     def pathFromIndex(self, index):   # insert only the symbol part
         text = index.data() or ""
         return text.split("  ·  ")[0].strip()
@@ -839,7 +810,6 @@ class WatchlistPage(QWidget):
         self._last_quotes:  dict = {}
         self._sort_col: str | None = None   # active sort key
         self._sort_asc: bool       = True   # True = ascending
-        self._suggest_worker = None         # in-flight _SuggestWorker
 
         self._watchlists, self._active_id = self._load_all()
         self._wl = self._find_wl(self._active_id)
@@ -860,13 +830,19 @@ class WatchlistPage(QWidget):
 
         root.addWidget(self._build_col_header())
 
-        # ── Autocomplete via QCompleter (handles macOS z-order natively) ──────
+        # ── Autocomplete via QCompleter backed by local tickers.json ─────────
+        # Qt handles macOS popup z-order natively; no API calls during typing.
+        # Real market data is fetched only when a ticker is actually added.
         self._completer = _SymCompleter(self.add_input)
         self._completer.setCompletionMode(
             QCompleter.CompletionMode.PopupCompletion
         )
+        self._completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self._completer.setMaxVisibleItems(12)
+        self._completer.setModel(
+            QStringListModel(_COMPLETER_ITEMS, self._completer)
+        )
 
         _popup_view = QListView()
         _popup_view.setStyleSheet(
@@ -880,11 +856,6 @@ class WatchlistPage(QWidget):
         self._completer.setPopup(_popup_view)
         self.add_input.setCompleter(self._completer)
         self._completer.activated.connect(self._on_suggest_chosen)
-
-        self._search_timer = QTimer(self)
-        self._search_timer.setSingleShot(True)
-        self._search_timer.setInterval(180)   # ms debounce
-        self._search_timer.timeout.connect(self._do_suggest)
 
         self.add_input.textChanged.connect(self._on_input_changed)
         self.add_input.installEventFilter(self)
@@ -1078,50 +1049,19 @@ class WatchlistPage(QWidget):
 
     def eventFilter(self, obj, event):
         # QCompleter handles FocusOut and Escape automatically.
-        # We only intercept to stop the debounce timer on Escape.
+        # We only intercept to hide the popup explicitly on Escape.
         if obj is self.add_input and event.type() == event.Type.KeyPress:
             if event.key() == Qt.Key.Key_Escape:
-                self._search_timer.stop()
                 self._completer.popup().hide()
                 return True
         return super().eventFilter(obj, event)
 
     def _on_input_changed(self, text):
-        if len(text.strip()) < 1:
-            self._search_timer.stop()
+        # Hide popup when the field is cleared; QCompleter auto-shows otherwise.
+        if not text.strip():
             self._completer.popup().hide()
-            return
-        self._search_timer.start()   # restarts the debounce window
 
-    def _do_suggest(self):
-        query = self.add_input.text().strip()
-        if not query:
-            return
-        # Safely disconnect previous worker
-        if self._suggest_worker:
-            try:
-                self._suggest_worker.done.disconnect()
-            except (TypeError, RuntimeError):
-                pass
-        self._suggest_worker = _SuggestWorker(self.token, query, self)
-        self._suggest_worker.done.connect(self._on_suggestions)
-        self._suggest_worker.start()
-
-    def _on_suggestions(self, results: list):
-        """Receive worker results → update completer model → show popup."""
-        if not self.add_input.text().strip():
-            return
-        items = []
-        for r in results:
-            sym  = r["symbol"]
-            desc = r.get("description") or ""
-            kind = r.get("type") or "Equity"
-            label = f"{sym}  ·  {desc}  [{kind}]" if desc else f"{sym}  [{kind}]"
-            items.append(label)
-        self._completer.setModel(QStringListModel(items, self._completer))
-        self._completer.complete()   # show / refresh the popup
-
-    def _on_suggest_chosen(self, text: str):
+    def _on_suggest_chosen(self, _text: str):
         # QCompleter already inserted pathFromIndex() (just the symbol) into
         # add_input via its activated signal; just trigger the add.
         self._add_ticker()
