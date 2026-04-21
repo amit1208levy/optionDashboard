@@ -207,12 +207,21 @@ _COMPLETER_ITEMS = _load_ticker_items()
 class _SymCompleter(QCompleter):
     """
     Completer backed by the local tickers.json file.
-    MatchContains mode means "SP" matches "SPX", "SPY", "SPDR", and even
-    description words like "S&P 500".
-    Each model item is "SYMBOL  ·  Description  [Type]";
-    pathFromIndex() strips back to just the ticker symbol on selection.
+
+    splitPath returns [""] so Qt shows everything already in the model;
+    we populate the model ourselves in _on_input_changed with results
+    sorted by match quality:
+      1. exact symbol match
+      2. symbol starts with query
+      3. symbol contains query (substring)
+      4. description contains query  (e.g. "gold" → GC, GLD)
+
+    pathFromIndex strips the display label back to just the ticker symbol.
     """
-    def pathFromIndex(self, index):   # insert only the symbol part
+    def splitPath(self, _path):        # let our manual filter handle it
+        return [""]
+
+    def pathFromIndex(self, index):    # insert only the symbol on selection
         text = index.data() or ""
         return text.split("  ·  ")[0].strip()
 
@@ -235,13 +244,26 @@ class _FetchWorker(QThread):
         quotes  = api.get_market_data(self.token, equities=self.tickers)
         missing = [t for t in self.tickers if not _has_price(quotes.get(t))]
         if missing:
-            fut_quotes = api.get_market_data(
-                self.token, futures=["/" + t for t in missing]
-            )
-            for sym, q in fut_quotes.items():
-                root = sym.lstrip("/")
-                if root in missing:
-                    quotes[root] = q
+            # Resolve futures roots (e.g. "ES") to active contracts ("/ESM26")
+            root_map = api.get_futures_active_contracts(self.token, missing)
+            fut_syms   = []   # full contract symbols to fetch
+            sym_to_root = {}  # "/ESM26" -> "ES"  (to map results back)
+            for root in missing:
+                contract = root_map.get(root)
+                if contract:
+                    fut_syms.append(contract)
+                    sym_to_root[contract] = root
+                else:
+                    # Fallback: try "/ROOT" in case API supports it
+                    fallback = "/" + root
+                    fut_syms.append(fallback)
+                    sym_to_root[fallback] = root
+            if fut_syms:
+                fut_quotes = api.get_market_data(self.token, futures=fut_syms)
+                for sym, q in fut_quotes.items():
+                    root = sym_to_root.get(sym) or sym_to_root.get("/" + sym.lstrip("/"))
+                    if root and root in missing:
+                        quotes[root] = q
         self.done.emit(metrics, quotes)
 
 
@@ -837,12 +859,9 @@ class WatchlistPage(QWidget):
         self._completer.setCompletionMode(
             QCompleter.CompletionMode.PopupCompletion
         )
-        self._completer.setFilterMode(Qt.MatchFlag.MatchContains)
         self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
         self._completer.setMaxVisibleItems(12)
-        self._completer.setModel(
-            QStringListModel(_COMPLETER_ITEMS, self._completer)
-        )
+        self._completer.setModel(QStringListModel([], self._completer))
 
         _popup_view = QListView()
         _popup_view.setStyleSheet(
@@ -1057,9 +1076,31 @@ class WatchlistPage(QWidget):
         return super().eventFilter(obj, event)
 
     def _on_input_changed(self, text):
-        # Hide popup when the field is cleared; QCompleter auto-shows otherwise.
-        if not text.strip():
+        q = text.strip()
+        if not q:
             self._completer.popup().hide()
+            return
+        qu = q.upper()
+        ql = q.lower()
+        exact = []
+        starts = []
+        sym_has = []
+        desc_has = []
+        for item in _COMPLETER_ITEMS:
+            sym = item.split("  ·  ")[0].strip().upper()
+            if sym == qu:
+                exact.append(item)
+            elif sym.startswith(qu):
+                starts.append(item)
+            elif qu in sym:
+                sym_has.append(item)
+            elif ql in item.lower():
+                desc_has.append(item)
+        ordered = exact + starts + sym_has + desc_has
+        self._completer.setModel(
+            QStringListModel(ordered[:50], self._completer)
+        )
+        self._completer.complete()
 
     def _on_suggest_chosen(self, _text: str):
         # QCompleter already inserted pathFromIndex() (just the symbol) into

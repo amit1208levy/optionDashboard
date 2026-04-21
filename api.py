@@ -297,6 +297,52 @@ def search_instruments(token, query, per_page=10):
         return []
 
 
+def get_futures_active_contracts(token, roots):
+    """
+    Resolve futures root codes to their active front-month contract symbols.
+    E.g. ["ES", "MES"] → {"ES": "/ESM26", "MES": "/MESM26"}.
+    Returns {} silently on any error.
+    """
+    if not roots:
+        return {}
+    try:
+        from datetime import date
+        today = date.today().isoformat()
+        params = [("product-code[]", r) for r in roots]
+        r = requests.get(
+            f"{BASE}/instruments/futures",
+            headers=auth_headers(token),
+            params=params,
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return {}
+        items = r.json().get("data", {}).get("items", []) or []
+        # Group contracts by product-code, picking the nearest active expiry
+        by_root = {}
+        for item in items:
+            root = item.get("product-code") or ""
+            sym  = item.get("symbol") or ""
+            exp  = item.get("expiration-date") or ""
+            is_active = bool(item.get("active-month") or item.get("is-front-month"))
+            if not root or not sym:
+                continue
+            by_root.setdefault(root, []).append((is_active, exp, sym))
+        out = {}
+        for root, contracts in by_root.items():
+            # Prefer active-month flag; among ties, pick soonest expiry
+            contracts.sort(key=lambda x: (not x[0], x[1]))
+            for _active, exp, sym in contracts:
+                if exp >= today:
+                    out[root] = sym
+                    break
+            if root not in out and contracts:
+                out[root] = contracts[0][2]
+        return out
+    except Exception:
+        return {}
+
+
 def get_market_data(token, equity_options=None, future_options=None, equities=None, futures=None):
     """
     Snapshot quotes + Greeks for options and stocks/futures. Returns {symbol: quote dict}.
