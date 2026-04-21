@@ -53,51 +53,73 @@ class ConnectWorker(QThread):
 class PortfolioWorker(QThread):
     done = pyqtSignal(dict)
 
-    def __init__(self, token):
+    def __init__(self, token, creds=None):
         super().__init__()
         self.token = token
+        self.creds = creds   # needed to refresh an expired access token
 
     def run(self):
-        try:
-            accounts_raw = api.list_accounts(self.token)
-            accounts = []
-            for acct in accounts_raw:
-                num = acct.get("account-number", "")
-                if not num:
-                    continue
-                balances  = api.get_balances(self.token, num)
-                positions = [Position(p) for p in api.get_positions(self.token, num)]
+        new_token = None
+        for attempt in range(2):   # attempt 0 = normal; attempt 1 = after token refresh
+            try:
+                accounts_raw = api.list_accounts(self.token)
+                accounts = []
+                for acct in accounts_raw:
+                    num = acct.get("account-number", "")
+                    if not num:
+                        continue
+                    balances  = api.get_balances(self.token, num)
+                    positions = [Position(p) for p in api.get_positions(self.token, num)]
 
-                equity_opts = [p.symbol for p in positions
-                                if p.is_option and p.instrument_type == "Equity Option"]
-                future_opts = [p.symbol for p in positions
-                                if p.is_option and p.instrument_type == "Future Option"]
-                equities    = [p.symbol for p in positions
-                                if not p.is_option and p.instrument_type == "Equity"]
-                quotes = api.get_market_data(
-                    self.token, equity_options=equity_opts,
-                    future_options=future_opts, equities=equities,
-                )
-                for p in positions:
-                    p.attach_quote(quotes.get(p.symbol))
+                    equity_opts = [p.symbol for p in positions
+                                    if p.is_option and p.instrument_type == "Equity Option"]
+                    future_opts = [p.symbol for p in positions
+                                    if p.is_option and p.instrument_type == "Future Option"]
+                    equities    = [p.symbol for p in positions
+                                    if not p.is_option and p.instrument_type == "Equity"]
+                    quotes = api.get_market_data(
+                        self.token, equity_options=equity_opts,
+                        future_options=future_opts, equities=equities,
+                    )
+                    for p in positions:
+                        p.attach_quote(quotes.get(p.symbol))
 
-                # Per-underlying metrics: IVR/IVP/beta/HV30
-                roots = list({p.root for p in positions if p.root})
-                metrics = api.get_market_metrics(self.token, roots)
+                    # Per-underlying metrics: IVR/IVP/beta/HV30
+                    roots = list({p.root for p in positions if p.root})
+                    metrics = api.get_market_metrics(self.token, roots)
 
-                ytd_txns = api.get_transactions_ytd(self.token, num)
+                    ytd_txns = api.get_transactions_ytd(self.token, num)
 
-                accounts.append({
-                    "number":    num,
-                    "nickname":  acct.get("nickname") or num,
-                    "balances":  balances,
-                    "positions": positions,
-                    "metrics":   metrics,
-                    "ytd_txns":  ytd_txns,
-                })
-            self.done.emit({"accounts": accounts, "error": ""})
-        except Exception as e:
-            self.done.emit({"accounts": [], "error": str(e)})
+                    accounts.append({
+                        "number":    num,
+                        "nickname":  acct.get("nickname") or num,
+                        "balances":  balances,
+                        "positions": positions,
+                        "metrics":   metrics,
+                        "ytd_txns":  ytd_txns,
+                    })
+                self.done.emit({"accounts": accounts, "error": "", "new_token": new_token})
+                return
+
+            except Exception as e:
+                err = str(e)
+                # 401 Unauthorized = access token expired.
+                # Refresh once using the stored credentials, then retry.
+                if ("401" in err or "Unauthorized" in err) and self.creds and attempt == 0:
+                    tok, refresh_err = api.get_access_token(
+                        self.creds["refresh_token"], self.creds["secret_token"]
+                    )
+                    if tok:
+                        self.token = tok
+                        new_token  = tok
+                        continue   # retry with the fresh token
+                    self.done.emit({
+                        "accounts":  [],
+                        "error":     f"Session expired — re-auth failed: {refresh_err}",
+                        "new_token": None,
+                    })
+                    return
+                self.done.emit({"accounts": [], "error": err, "new_token": None})
 
 
 # ── Setup screen ─────────────────────────────────────────────────────────────
@@ -709,11 +731,18 @@ class PortfolioScreen(QWidget):
             f"color: {T.MUTED}; font-size: 13px; border: none; background: transparent;"
         )
         self.status_lbl.setText("Loading portfolio…")
-        self._worker = PortfolioWorker(self.token)
+        self._worker = PortfolioWorker(self.token, self.creds)
         self._worker.done.connect(self._on_data)
         self._worker.start()
 
     def _on_data(self, result):
+        # If the worker refreshed an expired access token, adopt it so all
+        # subsequent refreshes (live-mode timer, manual refresh) use the new one.
+        if result.get("new_token"):
+            self.token = result["new_token"]
+            self.creds["access_token"] = self.token
+            api.save_credentials(self.creds)
+
         if result.get("error"):
             self.status_lbl.setStyleSheet(
                 f"color: {T.RED}; font-size: 13px; border: none; background: transparent;"
