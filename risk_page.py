@@ -1,332 +1,326 @@
-"""Risk Management page — portfolio allocation by strategy + earnings calendar."""
-import calendar as _cal
-from datetime import date
+"""Risk Management page — portfolio allocation + SPY & VIX scenario charts."""
+import numpy as np
 
-import api
-import theme as T
-from models import (
-    StrategyInstance, unassigned_positions, group_unassigned, strategy_allocation,
-)
-from strategy_card import money, pnl_color
+import matplotlib
+matplotlib.use("QtAgg")                     # must be set before other mpl imports
+import matplotlib.pyplot as plt
+import matplotlib.ticker
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QScrollArea,
+    QPushButton, QScrollArea, QSizePolicy,
 )
 
+import api
+import theme as T
+from models import (
+    StrategyInstance, unassigned_positions, group_unassigned,
+    strategy_allocation, portfolio_greeks, symbol_beta, _is_future_option,
+)
+from strategy_card import money, pnl_color
 
-# ── Background worker: fetch market metrics ───────────────────────────────────
 
-class _MetricsWorker(QThread):
-    done = pyqtSignal(dict)
+# ── helpers ──────────────────────────────────────────────────────────────────
 
-    def __init__(self, token, symbols):
+def _f(v):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+# Color palette for strategy segments (cycles if more strategies than entries)
+_PALETTE = [
+    T.PURPLE, T.TEAL, T.BLUE, T.GREEN, T.YELLOW,
+    "#f97316", "#ec4899", "#06b6d4", "#84cc16", "#a78bfa",
+]
+
+# Matplotlib dark style matching the app
+_MPL_STYLE = {
+    "figure.facecolor":  T.BG,
+    "axes.facecolor":    T.CARD,
+    "axes.edgecolor":    T.BORDER,
+    "text.color":        T.TEXT_DIM,
+    "axes.labelcolor":   T.LABEL,
+    "xtick.color":       T.MUTED,
+    "ytick.color":       T.MUTED,
+    "grid.color":        T.BORDER,
+    "grid.alpha":        0.7,
+    "axes.grid":         True,
+    "axes.spines.top":   False,
+    "axes.spines.right": False,
+    "lines.linewidth":   2.2,
+    "font.size":         10,
+    "axes.titlesize":    11,
+    "axes.labelsize":    10,
+    "xtick.labelsize":   9,
+    "ytick.labelsize":   9,
+}
+
+
+# ── background workers ────────────────────────────────────────────────────────
+
+class _PriceWorker(QThread):
+    """Fetch SPY and VIX current prices in the background."""
+    done = pyqtSignal(float, float)   # spy_price, vix_price
+
+    def __init__(self, token, positions):
         super().__init__()
-        self.token   = token
-        self.symbols = symbols
+        self._token     = token
+        self._positions = list(positions)
 
     def run(self):
+        spy = vix = None
+
+        # Fast path: SPY underlying_price is already in portfolio positions
+        for p in self._positions:
+            if p.root == "SPY" and p.underlying_price and p.underlying_price > 0:
+                spy = p.underlying_price
+                break
+
         try:
-            self.done.emit(api.get_market_metrics(self.token, self.symbols))
+            quotes = api.get_market_data(self._token, equities=["SPY", "VIX"])
+
+            if spy is None:
+                q = quotes.get("SPY", {})
+                b, a = _f(q.get("bid")), _f(q.get("ask"))
+                if b and a and b > 0 and a > 0:
+                    spy = (b + a) / 2.0
+                elif _f(q.get("last")):
+                    spy = _f(q.get("last"))
+                elif _f(q.get("mark")):
+                    spy = _f(q.get("mark"))
+
+            q = quotes.get("VIX", {})
+            b, a = _f(q.get("bid")), _f(q.get("ask"))
+            if b and a and b > 0 and a > 0:
+                vix = (b + a) / 2.0
+            elif _f(q.get("last")):
+                vix = _f(q.get("last"))
+            elif _f(q.get("mark")):
+                vix = _f(q.get("mark"))
         except Exception:
-            self.done.emit({})
+            pass
+
+        # Fallbacks when market is closed or API doesn't support these symbols
+        self.done.emit(spy or 500.0, vix or 18.0)
 
 
-# ── Earnings calendar ─────────────────────────────────────────────────────────
+# ── allocation row widget ─────────────────────────────────────────────────────
 
-class EarningsCalendar(QFrame):
+class _AllocationRow(QFrame):
     """
-    3-month earnings calendar (current + next 2 months).
-
-    Shows upcoming earnings for:
-      • every ticker in ALL watchlists
-      • every position currently in the portfolio
-
-    Today is clearly highlighted.  Past earnings are dimmed.
+    One strategy row in the allocation table.
+    The full row height is 68 px; left edge has a colored accent bar.
+    The % allocation is the most prominent number.
     """
 
-    NUM_MONTHS = 3
-
-    def __init__(self, existing_metrics, token, parent=None):
+    def __init__(self, row_data: dict, color: str, parent=None):
         super().__init__(parent)
-        self._metrics = dict(existing_metrics or {})
-        self._token   = token
-        self._worker  = None
-        self._today   = date.today()
-
-        # Collect every ticker across all watchlists
-        settings   = api.load_settings()
-        wl_lists   = settings.get("watchlists_v2", [])
-        self._wl_tickers = sorted({
-            t.upper().lstrip("/")
-            for wl in wl_lists
-            for t in wl.get("tickers", [])
-        })
-
+        self.setFixedHeight(68)
         self.setStyleSheet(
-            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
-            f"border-radius: 12px; }}"
-        )
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(22, 16, 22, 20)
-        outer.setSpacing(10)
-
-        # ── Header row ────────────────────────────────────────────────────────
-        hdr_row = QHBoxLayout()
-        hdr_row.setSpacing(12)
-
-        title = QLabel("EARNINGS CALENDAR")
-        title.setStyleSheet(
-            f"color: {T.LABEL}; font-size: 11px; font-weight: bold; "
-            f"letter-spacing: 0.8px; border: none;"
-        )
-        hdr_row.addWidget(title)
-        hdr_row.addStretch()
-
-        # Legend
-        for dot_color, label in [
-            (T.YELLOW,  "upcoming"),
-            (T.MUTED,   "reported"),
-            (T.PURPLE,  "today"),
-        ]:
-            dot = QFrame()
-            dot.setFixedSize(8, 8)
-            dot.setStyleSheet(
-                f"background: {dot_color}; border-radius: 4px; border: none;"
-            )
-            hdr_row.addWidget(dot)
-            lb = QLabel(label)
-            lb.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 10px; border: none; margin-right: 8px;"
-            )
-            hdr_row.addWidget(lb)
-
-        self._status_lbl = QLabel("")
-        self._status_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 10px; border: none;")
-        hdr_row.addWidget(self._status_lbl)
-        outer.addLayout(hdr_row)
-
-        # ── Month panels container ────────────────────────────────────────────
-        self._panels_row = QHBoxLayout()
-        self._panels_row.setSpacing(20)
-        outer.addLayout(self._panels_row)
-
-        # Build immediately with what we have (portfolio metrics)
-        self._rebuild()
-
-        # Kick off async fetch for watchlist tickers not yet in metrics
-        missing = [t for t in self._wl_tickers if t not in self._metrics]
-        if missing:
-            self._status_lbl.setText(f"loading {len(missing)} watchlist symbols…")
-            self._worker = _MetricsWorker(self._token, missing)
-            self._worker.done.connect(self._on_metrics)
-            self._worker.start()
-
-    # ── Data helpers ──────────────────────────────────────────────────────────
-
-    def _on_metrics(self, new_metrics):
-        self._metrics.update(new_metrics)
-        self._status_lbl.setText("")
-        self._rebuild()
-
-    def _collect_earnings(self):
-        """Return {date: [ticker, ...]} from all known metrics."""
-        result = {}
-        for ticker, m in self._metrics.items():
-            earn = (m or {}).get("earnings") or {}
-            raw  = earn.get("expected-report-date") or ""
-            if not raw:
-                continue
-            try:
-                d = date.fromisoformat(str(raw)[:10])
-                result.setdefault(d, []).append(ticker)
-            except ValueError:
-                pass
-        for d in result:
-            result[d].sort()
-        return result
-
-    # ── Rendering ─────────────────────────────────────────────────────────────
-
-    def _clear_panels(self):
-        while self._panels_row.count():
-            item = self._panels_row.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-
-    def _rebuild(self):
-        self._clear_panels()
-        earnings = self._collect_earnings()
-        today    = self._today
-
-        for i in range(self.NUM_MONTHS):
-            raw_m  = today.month + i - 1
-            year   = today.year + raw_m // 12
-            month  = raw_m % 12 + 1
-            first  = date(year, month, 1)
-            panel  = self._build_month_panel(first, today, earnings)
-            self._panels_row.addWidget(panel, 1)
-
-    def _build_month_panel(self, first, today, earnings):
-        panel = QFrame()
-        panel.setStyleSheet(
             f"QFrame {{ background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
-            f"border-radius: 8px; }}"
-        )
-        vl = QVBoxLayout(panel)
-        vl.setContentsMargins(10, 10, 10, 10)
-        vl.setSpacing(6)
-
-        # Month + year title
-        title = QLabel(first.strftime("%B %Y"))
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setStyleSheet(
-            f"color: {T.TEXT}; font-size: 13px; font-weight: bold; border: none;"
-        )
-        vl.addWidget(title)
-
-        # Weekday column headers
-        dow_row = QHBoxLayout()
-        dow_row.setSpacing(2)
-        for day_name in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]:
-            lbl = QLabel(day_name)
-            lbl.setFixedWidth(42)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            weekend = day_name in ("Sa", "Su")
-            lbl.setStyleSheet(
-                f"color: {'#2d3a50' if weekend else T.MUTED}; "
-                f"font-size: 9px; font-weight: bold; border: none;"
-            )
-            dow_row.addWidget(lbl)
-        vl.addLayout(dow_row)
-
-        # Day grid
-        _, num_days = _cal.monthrange(first.year, first.month)
-        start_col   = first.weekday()   # 0 = Monday
-
-        # Build as rows of 7
-        rows = []
-        current_row = []
-        # Pad start
-        for _ in range(start_col):
-            current_row.append(None)
-        for day_num in range(1, num_days + 1):
-            current_row.append(date(first.year, first.month, day_num))
-            if len(current_row) == 7:
-                rows.append(current_row)
-                current_row = []
-        if current_row:
-            while len(current_row) < 7:
-                current_row.append(None)
-            rows.append(current_row)
-
-        for week_row in rows:
-            row_lay = QHBoxLayout()
-            row_lay.setSpacing(2)
-            for d in week_row:
-                if d is None:
-                    spacer = QWidget()
-                    spacer.setFixedWidth(42)
-                    row_lay.addWidget(spacer)
-                else:
-                    cell = self._build_cell(d, today, earnings.get(d, []))
-                    row_lay.addWidget(cell)
-            vl.addLayout(row_lay)
-
-        vl.addStretch()
-        return panel
-
-    def _build_cell(self, d, today, tickers):
-        is_today   = (d == today)
-        is_past    = (d < today)
-        is_weekend = (d.weekday() >= 5)
-        has_earn   = bool(tickers)
-
-        cell = QFrame()
-        cell.setFixedWidth(42)
-
-        if is_today:
-            bg     = T.PURPLE
-            radius = "border-radius: 6px;"
-            border = f"border: 2px solid {T.PURPLE2};"
-        elif has_earn and not is_past:
-            bg     = "#1a2540"
-            radius = "border-radius: 5px;"
-            border = f"border: 1px solid {T.BLUE};"
-        elif has_earn and is_past:
-            bg     = "#14171f"
-            radius = "border-radius: 5px;"
-            border = f"border: 1px solid {T.BORDER};"
-        elif is_weekend:
-            bg     = "transparent"
-            radius = "border-radius: 0;"
-            border = "border: none;"
-        else:
-            bg     = "transparent"
-            radius = "border-radius: 0;"
-            border = "border: none;"
-
-        cell.setStyleSheet(
-            f"QFrame {{ background: {bg}; {radius} {border} }}"
+            f"border-radius: 10px; }}"
         )
 
-        vl = QVBoxLayout(cell)
-        vl.setContentsMargins(2, 3, 2, 3)
-        vl.setSpacing(1)
+        hl = QHBoxLayout(self)
+        hl.setContentsMargins(0, 0, 20, 0)
+        hl.setSpacing(0)
 
-        # Day number
-        if is_today:
-            num_color = "white"
-            num_weight = "bold"
-        elif is_past:
-            num_color  = T.MUTED if not has_earn else "#475569"
-            num_weight = "normal"
-        elif is_weekend:
-            num_color  = "#2d3a50"
-            num_weight = "normal"
-        else:
-            num_color  = T.TEXT if has_earn else T.TEXT_DIM
-            num_weight = "bold" if has_earn else "normal"
-
-        num_lbl = QLabel(str(d.day))
-        num_lbl.setFixedWidth(38)
-        num_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        num_lbl.setStyleSheet(
-            f"color: {num_color}; font-size: 11px; "
-            f"font-weight: {num_weight}; border: none;"
+        # ── left color accent ────────────────────────────────────────────────
+        accent = QFrame()
+        accent.setFixedWidth(6)
+        accent.setStyleSheet(
+            f"QFrame {{ background: {color}; border: none; border-radius: 0; "
+            f"border-top-left-radius: 9px; border-bottom-left-radius: 9px; }}"
         )
-        vl.addWidget(num_lbl)
+        hl.addWidget(accent)
+        hl.addSpacing(16)
 
-        # Ticker badges (max 3, then "+N")
-        badge_bg    = "rgba(96,165,250,0.18)"  if (has_earn and not is_past) else "#1a1d2e"
-        badge_color = T.BLUE                   if (has_earn and not is_past) else T.MUTED
+        # ── strategy name + ticker ───────────────────────────────────────────
+        name_col = QVBoxLayout()
+        name_col.setSpacing(4)
+        name_col.setAlignment(Qt.AlignmentFlag.AlignVCenter)
 
-        for tk in tickers[:3]:
-            b = QLabel(tk[:5])
-            b.setFixedWidth(38)
-            b.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            b.setStyleSheet(
-                f"color: {badge_color}; font-size: 7px; font-weight: bold; "
-                f"background: {badge_bg}; border-radius: 3px; "
-                f"padding: 0 2px; border: none;"
-            )
-            vl.addWidget(b)
+        name = row_data.get("name") or row_data["root"]
+        name_lbl = QLabel(name)
+        name_lbl.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 14px; font-weight: bold; border: none;"
+        )
+        name_col.addWidget(name_lbl)
 
-        if len(tickers) > 3:
-            more = QLabel(f"+{len(tickers) - 3} more")
-            more.setFixedWidth(38)
-            more.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            more.setStyleSheet(f"color: {T.MUTED}; font-size: 7px; border: none;")
-            vl.addWidget(more)
+        root_lbl = QLabel(row_data["root"])
+        root_lbl.setStyleSheet(
+            f"color: white; background: {color}; border: none; border-radius: 5px; "
+            f"padding: 1px 8px; font-size: 10px; font-weight: bold;"
+        )
+        root_lbl.setMaximumWidth(80)
+        name_col.addWidget(root_lbl)
 
-        vl.addStretch()
-        return cell
+        hl.addLayout(name_col, 1)
+
+        # ── % allocation (biggest number on the row) ─────────────────────────
+        pct_val = row_data["pct"]
+        pct_color = (T.RED if pct_val >= 40
+                     else (T.YELLOW if pct_val >= 20 else T.TEAL))
+        pct_lbl = QLabel(f"{pct_val:.1f}%")
+        pct_lbl.setFixedWidth(80)
+        pct_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        pct_lbl.setStyleSheet(
+            f"color: {pct_color}; font-size: 22px; font-weight: bold; border: none;"
+        )
+        hl.addWidget(pct_lbl)
+        hl.addSpacing(20)
+
+        # ── capital ──────────────────────────────────────────────────────────
+        cap_lbl = QLabel(money(row_data["capital"]))
+        cap_lbl.setFixedWidth(110)
+        cap_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        cap_lbl.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 12px; border: none;"
+        )
+        hl.addWidget(cap_lbl)
+        hl.addSpacing(16)
+
+        # ── open P&L ─────────────────────────────────────────────────────────
+        pnl_val  = row_data.get("pnl") or 0.0
+        pnl_c    = pnl_color(pnl_val)
+        pnl_lbl  = QLabel(money(pnl_val, signed=True))
+        pnl_lbl.setFixedWidth(110)
+        pnl_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        pnl_lbl.setStyleSheet(
+            f"color: {pnl_c}; font-size: 13px; font-weight: bold; border: none;"
+        )
+        hl.addWidget(pnl_lbl)
 
 
-# ── Risk page ─────────────────────────────────────────────────────────────────
+# ── chart helpers ─────────────────────────────────────────────────────────────
+
+def _make_canvas(width_px=500, height_px=300) -> FigureCanvasQTAgg:
+    """Return an MPL canvas sized to the given pixel dimensions."""
+    dpi = 96
+    fig = Figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi)
+    canvas = FigureCanvasQTAgg(fig)
+    canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    canvas.setFixedHeight(height_px)
+    return canvas
+
+
+def _bw_gamma(positions, metrics_by_root) -> float:
+    """Beta-weighted gamma: Σ gamma × beta² × qty × mult × sign."""
+    total = 0.0
+    for p in positions:
+        if not p.is_option or p.gamma is None:
+            continue
+        mult = 100 if not _is_future_option(p.instrument_type) else 1
+        beta = symbol_beta(metrics_by_root.get(p.root)) or 1.0
+        total += p.gamma * p.quantity * mult * p.sign * (beta ** 2)
+    return total
+
+
+def _draw_spy_chart(canvas: FigureCanvasQTAgg,
+                    spy: float, net_liq: float,
+                    bwd: float, bwg: float):
+    """
+    SPY scenario chart.
+    X: SPY price  (±25 % of current)
+    Y: estimated account value / SPY price
+
+    Shows how many "SPY shares" the account is worth as the market moves.
+    The curve bends upward for net-long portfolios and downward for net-short.
+    """
+    with plt.rc_context(_MPL_STYLE):
+        fig = canvas.figure
+        fig.clear()
+        ax  = fig.add_subplot(111)
+
+        x   = np.linspace(spy * 0.75, spy * 1.25, 400)
+        ds  = x - spy                           # ΔSPY
+        pnl = bwd * ds + 0.5 * bwg * ds ** 2   # Greek-estimated P&L
+        y   = (net_liq + pnl) / x              # account value normalised by SPY
+
+        # Current value (horizontal baseline)
+        y0  = net_liq / spy
+
+        ax.axhline(y0, color=T.BORDER_H, linewidth=1, linestyle="--", alpha=0.7,
+                   label="Current")
+        ax.axvline(spy, color=T.MUTED, linewidth=1, linestyle=":", alpha=0.6)
+
+        ax.plot(x, y, color=T.PURPLE, linewidth=2.5)
+        ax.fill_between(x, y0, y, where=(y > y0),
+                        alpha=0.15, color=T.GREEN, interpolate=True)
+        ax.fill_between(x, y0, y, where=(y <= y0),
+                        alpha=0.15, color=T.RED, interpolate=True)
+
+        # Mark current point
+        ax.scatter([spy], [y0], color=T.ACCENT, zorder=5, s=50)
+
+        ax.set_xlabel("SPY Price  ($)")
+        ax.set_ylabel("Account Value / SPY  (shares equivalent)")
+        ax.set_title("SPY Scenario — Account Value Normalised to SPY")
+
+        # Format Y tick labels with commas
+        ax.yaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}")
+        )
+        ax.xaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _: f"${v:,.0f}")
+        )
+        fig.tight_layout(pad=1.2)
+        canvas.draw()
+
+
+def _draw_vix_chart(canvas: FigureCanvasQTAgg,
+                    vix: float, net_liq: float, net_vega: float):
+    """
+    VIX scenario chart.
+    X: VIX level  (0.4× – 2.5× current, clamped to [5, 80])
+    Y: estimated account value / VIX level
+
+    Vega is approximated as linear: P&L ≈ net_vega × ΔVIX.
+    (VIX ≈ SPY 30-day IV in %; vega = $ per 1 vol-point.)
+    """
+    with plt.rc_context(_MPL_STYLE):
+        fig = canvas.figure
+        fig.clear()
+        ax  = fig.add_subplot(111)
+
+        x_min = max(5.0,  vix * 0.4)
+        x_max = min(80.0, vix * 2.5)
+        x   = np.linspace(x_min, x_max, 400)
+        dv  = x - vix                   # ΔVIX
+        pnl = net_vega * dv             # vega × ΔVIX
+        y   = (net_liq + pnl) / x      # account value normalised by VIX
+
+        y0  = net_liq / vix             # current baseline
+
+        ax.axhline(y0, color=T.BORDER_H, linewidth=1, linestyle="--", alpha=0.7,
+                   label="Current")
+        ax.axvline(vix, color=T.MUTED, linewidth=1, linestyle=":", alpha=0.6)
+
+        ax.plot(x, y, color=T.TEAL, linewidth=2.5)
+        ax.fill_between(x, y0, y, where=(y > y0),
+                        alpha=0.15, color=T.GREEN, interpolate=True)
+        ax.fill_between(x, y0, y, where=(y <= y0),
+                        alpha=0.15, color=T.RED, interpolate=True)
+
+        ax.scatter([vix], [y0], color=T.ACCENT, zorder=5, s=50)
+
+        ax.set_xlabel("VIX Level")
+        ax.set_ylabel("Account Value / VIX  ($ per VIX unit)")
+        ax.set_title("VIX Scenario — Account Value Normalised to VIX")
+
+        ax.yaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}")
+        )
+        fig.tight_layout(pad=1.2)
+        canvas.draw()
+
+
+# ── main page ─────────────────────────────────────────────────────────────────
 
 class RiskPage(QWidget):
     back_requested = pyqtSignal()
@@ -334,12 +328,15 @@ class RiskPage(QWidget):
     def __init__(self, portfolio, parent=None):
         super().__init__(parent)
         self.portfolio = portfolio
+        self._worker   = None
+        self._spy_canvas = None
+        self._vix_canvas = None
         self.setStyleSheet(T.BASE_STYLE)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-        root.addWidget(self._build_header())
+        root_lay = QVBoxLayout(self)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+        root_lay.setSpacing(0)
+        root_lay.addWidget(self._build_header())
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -349,17 +346,18 @@ class RiskPage(QWidget):
         self.body.setContentsMargins(28, 20, 28, 40)
         self.body.setSpacing(8)
         scroll.setWidget(body_w)
-        root.addWidget(scroll)
+        root_lay.addWidget(scroll)
 
         self._populate()
 
-    # ── Header ────────────────────────────────────────────────────────────────
+    # ── header ────────────────────────────────────────────────────────────────
 
     def _build_header(self):
         hdr = QFrame()
         hdr.setFixedHeight(60)
         hdr.setStyleSheet(
-            f"QFrame {{ background: {T.CARD}; border-bottom: 1px solid {T.BORDER}; border-radius: 0; }}"
+            f"QFrame {{ background: {T.CARD}; border-bottom: 1px solid {T.BORDER}; "
+            f"border-radius: 0; }}"
         )
         hl = QHBoxLayout(hdr)
         hl.setContentsMargins(28, 0, 28, 0)
@@ -380,7 +378,7 @@ class RiskPage(QWidget):
         hl.addStretch()
         return hdr
 
-    # ── Section helpers ───────────────────────────────────────────────────────
+    # ── layout helpers ────────────────────────────────────────────────────────
 
     def _section_header(self, text):
         lbl = QLabel(text)
@@ -391,7 +389,7 @@ class RiskPage(QWidget):
         )
         return lbl
 
-    def _card(self):
+    def _card_frame(self):
         f = QFrame()
         f.setStyleSheet(
             f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
@@ -402,7 +400,7 @@ class RiskPage(QWidget):
         lay.setSpacing(8)
         return f, lay
 
-    # ── Build content ─────────────────────────────────────────────────────────
+    # ── populate ──────────────────────────────────────────────────────────────
 
     def _populate(self):
         try:
@@ -421,30 +419,50 @@ class RiskPage(QWidget):
                           for r in self.portfolio.strategies_raw
                           if r.get("capital_override") is not None}
 
-            metrics = acct.get("metrics") or {}
+            metrics  = acct.get("metrics") or {}
+            bal      = acct.get("balances", {})
+            net_liq  = _f(bal.get("net-liquidating-value")) or 0.0
+            greeks   = portfolio_greeks(positions, metrics)
+            bwd      = greeks.get("beta_weighted_delta") or 0.0
+            bwg      = _bw_gamma(positions, metrics)
+            net_vega = greeks.get("net_vega") or 0.0
+
+            # Allocation table
             self._build_allocation(instances, unassigned, overrides)
-            try:
-                self._build_earnings_calendar(metrics)
-            except Exception as _he:
-                import traceback
-                lbl = QLabel(f"Calendar unavailable: {_he}\n{traceback.format_exc()}")
-                lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 10px; border: none;")
-                lbl.setWordWrap(True)
-                self.body.addWidget(lbl)
+
+            # Chart sections (placeholder while prices load)
+            self._build_chart_section("SPY CHART", T.PURPLE, "spy")
+            self._build_chart_section("VIX CHART", T.TEAL,   "vix")
+
             self.body.addStretch()
+
+            # Kick off background price fetch; render charts when done
+            self._worker = _PriceWorker(self.portfolio.token, positions)
+            self._worker.done.connect(
+                lambda s, v: self._on_prices(s, v, net_liq, bwd, bwg, net_vega)
+            )
+            self._worker.start()
+
         except Exception as exc:
             import traceback
-            err = QLabel(f"Error loading Risk page:\n{exc}\n\n{traceback.format_exc()}")
+            err = QLabel(f"Error:\n{exc}\n\n{traceback.format_exc()}")
             err.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
             err.setWordWrap(True)
             self.body.addWidget(err)
             self.body.addStretch()
 
-    # ── Allocation by strategy ────────────────────────────────────────────────
+    def _on_prices(self, spy: float, vix: float,
+                   net_liq: float, bwd: float, bwg: float, net_vega: float):
+        if self._spy_canvas:
+            _draw_spy_chart(self._spy_canvas, spy, net_liq, bwd, bwg)
+        if self._vix_canvas:
+            _draw_vix_chart(self._vix_canvas, vix, net_liq, net_vega)
+
+    # ── allocation section ────────────────────────────────────────────────────
 
     def _build_allocation(self, instances, unassigned, overrides):
         self.body.addWidget(self._section_header("PORTFOLIO ALLOCATION BY STRATEGY"))
-        card, lay = self._card()
+        card, lay = self._card_frame()
 
         rows, total = strategy_allocation(instances, unassigned, overrides)
 
@@ -453,132 +471,123 @@ class RiskPage(QWidget):
             self.body.addWidget(card)
             return
 
-        # Header row
+        # ── stacked overview bar ─────────────────────────────────────────────
+        bar_outer = QFrame()
+        bar_outer.setFixedHeight(28)
+        bar_outer.setStyleSheet(
+            f"background: {T.BG_ALT}; border-radius: 8px; border: none;"
+        )
+        bar_lay = QHBoxLayout(bar_outer)
+        bar_lay.setContentsMargins(0, 0, 0, 0)
+        bar_lay.setSpacing(1)
+
+        for i, r in enumerate(rows):
+            seg = QFrame()
+            color = _PALETTE[i % len(_PALETTE)]
+            # Round left corners on first segment, right on last
+            radius = ""
+            if i == 0:
+                radius = "border-top-left-radius: 7px; border-bottom-left-radius: 7px;"
+            if i == len(rows) - 1:
+                radius += "border-top-right-radius: 7px; border-bottom-right-radius: 7px;"
+            seg.setStyleSheet(
+                f"QFrame {{ background: {color}; border: none; {radius} }}"
+            )
+            weight = max(1, int(r["pct"] * 10))
+            bar_lay.addWidget(seg, weight)
+
+        lay.addWidget(bar_outer)
+
+        # ── column headers ───────────────────────────────────────────────────
+        lay.addSpacing(6)
         hdr_row = QHBoxLayout()
+        hdr_row.setContentsMargins(22, 0, 0, 0)
         hdr_row.setSpacing(0)
         for text, width, align in [
-            ("Strategy",  240, Qt.AlignmentFlag.AlignLeft),
-            ("Ticker",     70, Qt.AlignmentFlag.AlignLeft),
-            ("",            0, Qt.AlignmentFlag.AlignLeft),
-            ("Allocation", 70, Qt.AlignmentFlag.AlignRight),
-            ("Capital",   115, Qt.AlignmentFlag.AlignRight),
-            ("Open P&L",  100, Qt.AlignmentFlag.AlignRight),
+            ("Strategy",  0,   Qt.AlignmentFlag.AlignLeft),
+            ("Alloc",     90,  Qt.AlignmentFlag.AlignRight),
+            ("Capital",   120, Qt.AlignmentFlag.AlignRight),
+            ("Open P&L",  120, Qt.AlignmentFlag.AlignRight),
         ]:
-            if width == 0:
-                hdr_row.addStretch(1)
-                continue
             lbl = QLabel(text)
-            lbl.setFixedWidth(width)
-            lbl.setAlignment(align)
             lbl.setStyleSheet(
                 f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
                 f"letter-spacing: 0.4px; border: none;"
             )
-            hdr_row.addWidget(lbl)
+            if width:
+                lbl.setFixedWidth(width)
+            lbl.setAlignment(align)
+            hdr_row.addWidget(lbl, 0 if width else 1)
         lay.addLayout(hdr_row)
+        lay.addSpacing(4)
 
+        # ── per-strategy rows ────────────────────────────────────────────────
+        for i, r in enumerate(rows):
+            row = _AllocationRow(r, _PALETTE[i % len(_PALETTE)])
+            lay.addWidget(row)
+            lay.setSpacing(6)
+
+        # ── footer ───────────────────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(f"background: {T.BORDER}; max-height: 1px; border: none;")
         lay.addWidget(sep)
 
-        for r in rows:
-            row_w = QHBoxLayout()
-            row_w.setSpacing(0)
-
-            strat_name = r.get("name") or r["root"]
-            name_lbl = QLabel(strat_name)
-            name_lbl.setFixedWidth(240)
-            name_lbl.setStyleSheet(
-                f"color: {T.TEXT}; font-size: 12px; font-weight: bold; border: none;"
-            )
-            row_w.addWidget(name_lbl)
-
-            root_lbl = QLabel(r["root"])
-            root_lbl.setFixedWidth(70)
-            root_lbl.setStyleSheet(
-                f"color: {T.ACCENT}; font-size: 11px; border: none;"
-            )
-            row_w.addWidget(root_lbl)
-
-            # Allocation bar
-            bar_outer = QFrame()
-            bar_outer.setFixedHeight(10)
-            bar_outer.setStyleSheet(
-                f"QFrame {{ background: #12151d; border: 1px solid {T.BORDER}; "
-                f"border-radius: 5px; }}"
-            )
-            bar_lay = QHBoxLayout(bar_outer)
-            bar_lay.setContentsMargins(0, 0, 0, 0)
-            bar_lay.setSpacing(0)
-            fill = QFrame()
-            fill_color = (T.RED if r["pct"] >= 40
-                          else (T.YELLOW if r["pct"] >= 20 else T.PURPLE))
-            fill.setStyleSheet(
-                f"QFrame {{ background: {fill_color}; border: none; border-radius: 4px; }}"
-            )
-            sf = int(max(1, round(r["pct"] * 10)))
-            sr = int(max(1, round((100 - r["pct"]) * 10)))
-            bar_lay.addWidget(fill, sf)
-            spacer = QWidget()
-            spacer.setStyleSheet("background: transparent;")
-            bar_lay.addWidget(spacer, sr)
-            row_w.addWidget(bar_outer, 1)
-
-            pct_lbl = QLabel(f"{r['pct']:.1f}%")
-            pct_lbl.setFixedWidth(70)
-            pct_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            pct_lbl.setStyleSheet(
-                f"color: {T.TEXT_DIM}; font-size: 12px; border: none;"
-            )
-            row_w.addWidget(pct_lbl)
-
-            cap_lbl = QLabel(money(r["capital"]))
-            cap_lbl.setFixedWidth(115)
-            cap_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            cap_lbl.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 11px; border: none;"
-            )
-            row_w.addWidget(cap_lbl)
-
-            pnl_val  = r.get("pnl") or 0.0
-            pnl_text = money(pnl_val, signed=True)
-            pnl_c    = pnl_color(pnl_val)
-            pnl_lbl  = QLabel(pnl_text)
-            pnl_lbl.setFixedWidth(100)
-            pnl_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            pnl_lbl.setStyleSheet(
-                f"color: {pnl_c}; font-size: 12px; font-weight: bold; border: none;"
-            )
-            row_w.addWidget(pnl_lbl)
-
-            lay.addLayout(row_w)
-
-        # Total footer
-        sep2 = QFrame()
-        sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"background: {T.BORDER}; max-height: 1px; border: none;")
-        lay.addWidget(sep2)
-
-        total_row = QHBoxLayout()
-        total_lbl = QLabel("Total deployed")
-        total_lbl.setStyleSheet(
+        footer = QHBoxLayout()
+        tl = QLabel("Total deployed capital")
+        tl.setStyleSheet(
             f"color: {T.LABEL}; font-size: 11px; font-weight: bold; border: none;"
         )
-        total_row.addWidget(total_lbl)
-        total_row.addStretch()
-        total_val = QLabel(money(total))
-        total_val.setStyleSheet(
-            f"color: {T.TEXT}; font-size: 12px; font-weight: bold; border: none;"
+        footer.addWidget(tl)
+        footer.addStretch()
+        tv = QLabel(money(total))
+        tv.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 13px; font-weight: bold; border: none;"
         )
-        total_row.addWidget(total_val)
-        lay.addLayout(total_row)
+        footer.addWidget(tv)
+        lay.addLayout(footer)
 
         self.body.addWidget(card)
 
-    # ── Earnings calendar ─────────────────────────────────────────────────────
+    # ── chart sections ────────────────────────────────────────────────────────
 
-    def _build_earnings_calendar(self, metrics):
-        self.body.addWidget(self._section_header("EARNINGS CALENDAR"))
-        card = EarningsCalendar(metrics, self.portfolio.token)
+    def _build_chart_section(self, title: str, accent_color: str, key: str):
+        """Create a card with a section header and an embedded matplotlib canvas."""
+        self.body.addWidget(self._section_header(title))
+        card, lay = self._card_frame()
+
+        # Loading placeholder shown while worker fetches prices
+        loading = QLabel("Fetching market data…")
+        loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        loading.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 12px; border: none; padding: 40px 0;"
+        )
+        lay.addWidget(loading)
+
+        # Canvas (hidden until prices arrive)
+        canvas = _make_canvas(width_px=800, height_px=300)
+        canvas.setVisible(False)
+        lay.addWidget(canvas)
+
         self.body.addWidget(card)
+
+        # Store canvas + loading label so we can swap them in _on_prices
+        if key == "spy":
+            self._spy_canvas   = canvas
+            self._spy_loading  = loading
+        else:
+            self._vix_canvas   = canvas
+            self._vix_loading  = loading
+
+    def _on_prices(self, spy: float, vix: float,
+                   net_liq: float, bwd: float, bwg: float, net_vega: float):
+        """Called on GUI thread when the price worker completes."""
+        if self._spy_canvas:
+            _draw_spy_chart(self._spy_canvas, spy, net_liq, bwd, bwg)
+            self._spy_loading.setVisible(False)
+            self._spy_canvas.setVisible(True)
+
+        if self._vix_canvas:
+            _draw_vix_chart(self._vix_canvas, vix, net_liq, net_vega)
+            self._vix_loading.setVisible(False)
+            self._vix_canvas.setVisible(True)
