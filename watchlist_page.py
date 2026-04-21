@@ -66,11 +66,12 @@ def _ivr_stars(ivr):
     return _stars_html(n, color=color)
 
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QPoint
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QStringListModel
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QScrollArea, QDialog, QSlider,
     QComboBox, QDoubleSpinBox, QSizePolicy, QInputDialog, QMessageBox,
+    QCompleter, QListView,
 )
 
 
@@ -225,150 +226,24 @@ class _SuggestWorker(QThread):
         self.done.emit(results[:12])
 
 
-# ── Suggest popup ─────────────────────────────────────────────────────────────
+# ── Autocomplete completer ────────────────────────────────────────────────────
+# Using QCompleter lets Qt handle popup positioning, z-order, and macOS window
+# management — all the things that a hand-rolled popup struggles with.
 
-class _SuggestPopup(QFrame):
-    chosen = pyqtSignal(str)   # symbol selected
+class _SymCompleter(QCompleter):
+    """
+    Completer that shows all items supplied by _SuggestWorker (no extra
+    Qt-side filtering) and inserts only the ticker symbol into the input.
 
-    # How many px below the anchor widget's bottom edge to appear
-    _GAP = 4
+    Each model item is "SYMBOL  ·  Description  [Type]"; splitPath() returns
+    [""] so every item matches, and pathFromIndex() strips back to the symbol.
+    """
+    def splitPath(self, _path):        # show ALL items, ignore current text
+        return [""]
 
-    def __init__(self, anchor: QLineEdit, page: QWidget):
-        # Child widget of WatchlistPage, absolutely positioned and raised above
-        # the scroll area.  Avoids macOS top-level-window quirks (Tool windows
-        # can disappear behind the main window or never appear at all).
-        super().__init__(page)
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self._anchor = anchor
-        self._page   = page
-        self._rows: list[QFrame] = []
-
-        self.setObjectName("suggestBox")
-        self.setStyleSheet(
-            f"QFrame#suggestBox {{ background: {T.CARD}; "
-            f"border: 1px solid {T.PURPLE}; border-radius: 10px; }}"
-        )
-
-        self._lay = QVBoxLayout(self)
-        self._lay.setContentsMargins(5, 5, 5, 5)
-        self._lay.setSpacing(1)
-        self.hide()
-
-    # ── Public API ────────────────────────────────────────────────────────────
-
-    def show_results(self, results: list):
-        # Clear previous rows
-        for r in self._rows:
-            self._lay.removeWidget(r)
-            r.deleteLater()
-        self._rows = []
-        self._hovered = -1
-
-        if not results:
-            # Show feedback instead of silently hiding
-            row = self._make_no_results_row()
-            self._lay.addWidget(row)
-            self._rows.append(row)
-            self._reposition()
-            self.show()
-            self.raise_()
-            return
-
-        for r in results:
-            row = self._make_row(r)
-            self._lay.addWidget(row)
-            self._rows.append(row)
-
-        self._reposition()
-        self.show()
-        self.raise_()
-
-    def hide_popup(self):
-        self.hide()
-
-    # ── Layout ────────────────────────────────────────────────────────────────
-
-    def _make_row(self, r: dict) -> QFrame:
-        sym  = r["symbol"]
-        desc = r.get("description") or ""
-        kind = r.get("type") or "Equity"
-
-        row = QFrame()
-        row.setCursor(Qt.CursorShape.PointingHandCursor)
-        row.setStyleSheet(
-            f"QFrame {{ background: transparent; border: none; border-radius: 6px; }}"
-            f"QFrame:hover {{ background: {T.BG_ALT}; }}"
-        )
-
-        rl = QHBoxLayout(row)
-        rl.setContentsMargins(10, 7, 10, 7)
-        rl.setSpacing(10)
-
-        sym_lbl = QLabel(sym)
-        sym_lbl.setFixedWidth(68)
-        sym_lbl.setStyleSheet(
-            f"color: {T.ACCENT}; font-size: 13px; font-weight: bold; "
-            f"border: none; background: transparent;"
-        )
-        rl.addWidget(sym_lbl)
-
-        desc_lbl = QLabel(desc)
-        desc_lbl.setStyleSheet(
-            f"color: {T.LABEL}; font-size: 11px; "
-            f"border: none; background: transparent;"
-        )
-        # Truncate long descriptions visually
-        desc_lbl.setMaximumWidth(260)
-        rl.addWidget(desc_lbl, 1)
-
-        type_c = T.TEAL if kind == "Futures" else (T.PURPLE if "ETF" in kind else T.BLUE)
-        kind_lbl = QLabel(kind)
-        kind_lbl.setStyleSheet(
-            f"color: {type_c}; font-size: 10px; font-weight: 600; "
-            f"border: none; background: transparent;"
-        )
-        rl.addWidget(kind_lbl)
-
-        # Wire click on all sub-labels too
-        for w in (row, sym_lbl, desc_lbl, kind_lbl):
-            w.mousePressEvent = lambda _e, s=sym: self._pick(s)
-
-        return row
-
-    def _make_no_results_row(self) -> QFrame:
-        row = QFrame()
-        row.setStyleSheet(
-            f"QFrame {{ background: transparent; border: none; border-radius: 6px; }}"
-        )
-        rl = QHBoxLayout(row)
-        rl.setContentsMargins(14, 10, 14, 10)
-        lbl = QLabel("No matches found")
-        lbl.setStyleSheet(
-            f"color: {T.MUTED}; font-size: 12px; font-style: italic; "
-            f"border: none; background: transparent;"
-        )
-        rl.addWidget(lbl)
-        return row
-
-    def _reposition(self):
-        # Use mapTo() to walk the widget hierarchy directly — avoids the
-        # global-coord round-trip and any DPI/window-offset surprises.
-        pos = self._anchor.mapTo(
-            self._page,
-            QPoint(0, self._anchor.height() + self._GAP),
-        )
-        self.move(pos)
-        self.setFixedWidth(max(460, self._anchor.width()))
-        # Force the layout to compute its geometry BEFORE we query sizeHint,
-        # otherwise adjustSize() may see height=0 on a not-yet-shown widget.
-        self.layout().activate()
-        self.adjustSize()
-
-    # ── Interaction ───────────────────────────────────────────────────────────
-
-    def _pick(self, symbol: str):
-        self.chosen.emit(symbol)
-        self.hide()
+    def pathFromIndex(self, index):   # insert only the symbol part
+        text = index.data() or ""
+        return text.split("  ·  ")[0].strip()
 
 
 # ── Fetch worker ──────────────────────────────────────────────────────────────
@@ -985,9 +860,26 @@ class WatchlistPage(QWidget):
 
         root.addWidget(self._build_col_header())
 
-        # Autocomplete popup — created after add_input exists (see _build_header)
-        self._popup = _SuggestPopup(self.add_input, self)
-        self._popup.chosen.connect(self._on_suggest_chosen)
+        # ── Autocomplete via QCompleter (handles macOS z-order natively) ──────
+        self._completer = _SymCompleter(self.add_input)
+        self._completer.setCompletionMode(
+            QCompleter.CompletionMode.PopupCompletion
+        )
+        self._completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._completer.setMaxVisibleItems(12)
+
+        _popup_view = QListView()
+        _popup_view.setStyleSheet(
+            f"QListView {{ background: {T.CARD}; color: {T.TEXT}; "
+            f"border: 1px solid {T.PURPLE}; border-radius: 8px; "
+            f"font-size: 13px; outline: none; }}"
+            f"QListView::item {{ padding: 7px 12px; border-radius: 4px; }}"
+            f"QListView::item:selected, QListView::item:hover "
+            f"{{ background: {T.BG_ALT}; color: {T.ACCENT}; }}"
+        )
+        self._completer.setPopup(_popup_view)
+        self.add_input.setCompleter(self._completer)
+        self._completer.activated.connect(self._on_suggest_chosen)
 
         self._search_timer = QTimer(self)
         self._search_timer.setSingleShot(True)
@@ -1063,7 +955,7 @@ class WatchlistPage(QWidget):
         self._sort_col     = None   # reset sort for new list
         self._sort_asc     = True
         self._update_col_headers()
-        self._popup.hide_popup()
+        self._completer.popup().hide()
         self._save_all()
         self._tab_strip.rebuild(self._watchlists, self._active_id)
         self._rebuild_rows()
@@ -1185,43 +1077,53 @@ class WatchlistPage(QWidget):
     # ── Autocomplete ──────────────────────────────────────────────────────────
 
     def eventFilter(self, obj, event):
-        if obj is self.add_input:
-            t = event.type()
-            if t == event.Type.FocusOut:
-                # Delay so the popup click can fire first
-                QTimer.singleShot(160, self._popup.hide_popup)
-            elif t == event.Type.KeyPress:
-                key = event.key()
-                if key == Qt.Key.Key_Escape:
-                    self._popup.hide_popup()
-                    return True
+        # QCompleter handles FocusOut and Escape automatically.
+        # We only intercept to stop the debounce timer on Escape.
+        if obj is self.add_input and event.type() == event.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Escape:
+                self._search_timer.stop()
+                self._completer.popup().hide()
+                return True
         return super().eventFilter(obj, event)
 
     def _on_input_changed(self, text):
         if len(text.strip()) < 1:
             self._search_timer.stop()
-            self._popup.hide_popup()
+            self._completer.popup().hide()
             return
         self._search_timer.start()   # restarts the debounce window
 
     def _do_suggest(self):
         query = self.add_input.text().strip()
         if not query:
-            self._popup.hide_popup()
             return
-        # Always safely disconnect the old worker (whether still running or finished)
+        # Safely disconnect previous worker
         if self._suggest_worker:
             try:
                 self._suggest_worker.done.disconnect()
             except (TypeError, RuntimeError):
                 pass
         self._suggest_worker = _SuggestWorker(self.token, query, self)
-        self._suggest_worker.done.connect(self._popup.show_results)
+        self._suggest_worker.done.connect(self._on_suggestions)
         self._suggest_worker.start()
 
-    def _on_suggest_chosen(self, symbol):
-        self.add_input.setText(symbol)
-        self._popup.hide_popup()
+    def _on_suggestions(self, results: list):
+        """Receive worker results → update completer model → show popup."""
+        if not self.add_input.text().strip():
+            return
+        items = []
+        for r in results:
+            sym  = r["symbol"]
+            desc = r.get("description") or ""
+            kind = r.get("type") or "Equity"
+            label = f"{sym}  ·  {desc}  [{kind}]" if desc else f"{sym}  [{kind}]"
+            items.append(label)
+        self._completer.setModel(QStringListModel(items, self._completer))
+        self._completer.complete()   # show / refresh the popup
+
+    def _on_suggest_chosen(self, text: str):
+        # QCompleter already inserted pathFromIndex() (just the symbol) into
+        # add_input via its activated signal; just trigger the add.
         self._add_ticker()
 
     def _build_col_header(self):
