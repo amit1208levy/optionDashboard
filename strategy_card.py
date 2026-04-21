@@ -49,6 +49,8 @@ class StrategyCard(QFrame):
         super().__init__(parent)
         self.strategy = strategy
         self.metrics = metrics or {}
+        self._pnl_val_lbl = None   # QLabel — set by _stat() when is_pnl=True
+        self._pnl_pct_lbl = None   # QLabel for pct sub-label
         self.setObjectName("card")
         self.setStyleSheet(
             f"QFrame#card {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
@@ -131,7 +133,8 @@ class StrategyCard(QFrame):
             "Open P&L",
             money(strategy.pnl, signed=True),
             pnl_color(strategy.pnl),
-            sub=pct(strategy.pnl_pct)
+            sub=pct(strategy.pnl_pct),
+            is_pnl=True,
         ))
 
         chevron = QLabel("›")
@@ -162,7 +165,7 @@ class StrategyCard(QFrame):
             )
         return l
 
-    def _stat(self, label, value, color, sub=None):
+    def _stat(self, label, value, color, sub=None, is_pnl=False):
         w = QFrame()
         w.setStyleSheet("background: transparent; border: none;")
         w.setFixedWidth(110)
@@ -184,14 +187,39 @@ class StrategyCard(QFrame):
         )
         val.setAlignment(Qt.AlignmentFlag.AlignRight)
         lay.addWidget(val)
+        sub_lbl = None
         if sub:
-            s = QLabel(sub)
-            s.setStyleSheet(
+            sub_lbl = QLabel(sub)
+            sub_lbl.setStyleSheet(
                 f"color: {color}; font-size: 11px; background: transparent; border: none;"
             )
-            s.setAlignment(Qt.AlignmentFlag.AlignRight)
-            lay.addWidget(s)
+            sub_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            lay.addWidget(sub_lbl)
+        if is_pnl:
+            self._pnl_val_lbl = val
+            self._pnl_pct_lbl = sub_lbl
         return w
+
+    def refresh_pnl(self):
+        """Update the Open P&L stat in-place after a live quote update.
+        Called from the GUI thread; safe since all Qt label updates must be
+        on the main thread (the Qt signal from QuoteStreamer delivers here)."""
+        if self._pnl_val_lbl is None:
+            return
+        p   = self.strategy.pnl
+        pp  = self.strategy.pnl_pct
+        c   = pnl_color(p)
+        self._pnl_val_lbl.setText(money(p, signed=True))
+        self._pnl_val_lbl.setStyleSheet(
+            f"color: {c}; font-size: 15px; font-weight: bold; "
+            f"background: transparent; border: none;"
+        )
+        if self._pnl_pct_lbl is not None:
+            self._pnl_pct_lbl.setText(pct(pp))
+            self._pnl_pct_lbl.setStyleSheet(
+                f"color: {c}; font-size: 11px; "
+                f"background: transparent; border: none;"
+            )
 
     # ── Events ──────────────────────────────────────────────────────────────
 

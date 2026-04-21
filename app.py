@@ -15,6 +15,7 @@ from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 import theme as T
 import api
 import updater
+import streamer as _streamer_mod
 from version import VERSION
 from models import (
     Position, StrategyInstance, unassigned_positions, group_unassigned,
@@ -428,6 +429,9 @@ class PortfolioScreen(QWidget):
         self._accounts  = []
         self._alerted   = {}   # {(strategy_id, condition_type): severity} — prevents repeat alerts
         self._ytd_cache = {}   # {account_number: {fetched_at, transactions}} — shared across workers
+        self._streamer       = None   # QuoteStreamer (live mode only)
+        self._strategy_cards = []     # [StrategyCard] — current My Strategies cards
+        self._ua_cards       = []     # [StrategyCard] — current Unassigned cards
 
         self.strategies_all = api.load_strategies()   # {acct_num: [entries]}
         self.history_all    = api.load_history()      # {acct_num: [entries]}
@@ -611,13 +615,21 @@ class PortfolioScreen(QWidget):
         hl.addWidget(logout_btn)
         return header
 
-    def _style_live_btn(self, on):
-        if on:
-            self.live_btn.setText("●  Live")
+    def _style_live_btn(self, on, streaming=False):
+        if on and streaming:
+            self.live_btn.setText("● Streaming")
             self.live_btn.setStyleSheet(
                 f"QPushButton {{ background: {T.GREEN_D}; color: white; border: none; "
                 f"border-radius: 6px; padding: 0 10px; font-size: 11px; font-weight: bold; }}"
                 f"QPushButton:hover {{ background: {T.GREEN}; }}"
+            )
+        elif on:
+            self.live_btn.setText("⟳  Connecting")
+            self.live_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.YELLOW}; "
+                f"border: 1px solid {T.YELLOW}; border-radius: 6px; padding: 0 10px; "
+                f"font-size: 11px; }}"
+                f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
             )
         else:
             self.live_btn.setText("○  Live")
@@ -629,11 +641,132 @@ class PortfolioScreen(QWidget):
             )
 
     def _toggle_live(self, on):
-        self._style_live_btn(on)
+        self._style_live_btn(on, streaming=False)
         if on:
             self._live_timer.start()
+            self._start_streamer()
         else:
             self._live_timer.stop()
+            self._stop_streamer()
+
+    def _start_streamer(self):
+        """Create and start the DXLink quote streamer."""
+        self._stop_streamer()   # stop any previous instance
+        s = _streamer_mod.QuoteStreamer(self.token, parent=self)
+        s.price_update.connect(self._on_price_update)
+        s.status_changed.connect(self._on_streamer_status)
+        self._streamer = s
+        s.start()
+        # Subscribe immediately if we already have positions
+        self._update_streamer_symbols()
+
+    def _stop_streamer(self):
+        """Gracefully stop the streamer (if running)."""
+        if self._streamer:
+            self._streamer.status_changed.disconnect()
+            self._streamer.price_update.disconnect()
+            self._streamer.stop_streaming()
+            if self._streamer.isRunning():
+                self._streamer.wait(3000)
+            self._streamer = None
+
+    def _update_streamer_symbols(self):
+        """Push all position symbols from all accounts to the streamer."""
+        if not self._streamer:
+            return
+        symbols = []
+        for acct in self._accounts:
+            for p in acct.get("positions", []):
+                symbols.append(p.symbol)
+        self._streamer.set_symbols(symbols)
+
+    def _on_streamer_status(self, status: str):
+        """Handle QuoteStreamer status changes on the GUI thread."""
+        if status == "connected":
+            self._style_live_btn(True, streaming=True)
+            self.status_lbl.setText("")
+        elif status == "connecting":
+            self._style_live_btn(True, streaming=False)
+        elif status == "disconnected":
+            if self.live_btn.isChecked():
+                self._style_live_btn(True, streaming=False)
+        elif status.startswith("error"):
+            # Show briefly in status label; keep button in "connecting" state
+            self.status_lbl.setStyleSheet(
+                f"color: {T.YELLOW}; font-size: 12px; border: none; background: transparent;"
+            )
+            self.status_lbl.setText(f"Stream: {status}")
+
+    # ── Live quote update ────────────────────────────────────────────────────
+
+    def _on_price_update(self, quotes: dict):
+        """
+        Called on the GUI thread every time DXLink delivers new quotes.
+        Updates mark prices on the current account's positions in-place
+        and refreshes only the P&L labels — no full re-render.
+        """
+        acct = self.current_account()
+        if not acct:
+            return
+
+        changed = False
+        for p in acct.get("positions", []):
+            q = quotes.get(p.symbol)
+            if not q:
+                continue
+            mark = q.get("mark")
+            if mark is not None and mark > 0 and abs(mark - p.mark_price) > 0.001:
+                p.mark_price = mark
+                changed = True
+            # Update Greeks if present
+            for attr in ("delta", "gamma", "theta", "vega"):
+                v = q.get(attr)
+                if v is not None:
+                    setattr(p, attr, v)
+            if mark is not None and mark > 0:
+                p._recompute()
+
+        if not changed:
+            return
+
+        # ── Refresh Open P&L tile ────────────────────────────────────────────
+        total_pnl = (sum(c.strategy.pnl for c in self._strategy_cards)
+                     + sum(c.strategy.pnl for c in self._ua_cards))
+        self.pnl_total_lbl.setText(money(total_pnl, signed=True))
+        self.pnl_total_lbl.setStyleSheet(
+            f"color: {pnl_color(total_pnl)}; font-size: 22px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+
+        # ── Refresh strategy card P&L labels ────────────────────────────────
+        for card in self._strategy_cards + self._ua_cards:
+            card.refresh_pnl()
+
+        # ── Refresh Day P&L ──────────────────────────────────────────────────
+        bal = acct.get("balances", {})
+
+        def _sg(key):
+            try:
+                raw = float(bal.get(key) or 0)
+                eff = (bal.get(f"{key}-effect") or "").lower()
+                return -raw if "debit" in eff else raw
+            except (TypeError, ValueError):
+                return 0.0
+
+        try:
+            unrealized_day = sum(
+                p.sign * p.quantity * p.multiplier * (p.mark_price - p.close_price)
+                for p in acct.get("positions", [])
+                if p.close_price and p.close_price > 0 and p.mark_price
+            )
+            day_pnl = unrealized_day + _sg("realized-day-gain")
+            self.day_pnl_lbl.setText(money(day_pnl, signed=True))
+            self.day_pnl_lbl.setStyleSheet(
+                f"color: {pnl_color(day_pnl)}; font-size: 22px; font-weight: bold; "
+                f"border: none; background: transparent;"
+            )
+        except (TypeError, ValueError):
+            pass
 
     def _make_tile(self, label):
         f = QFrame()
@@ -809,6 +942,9 @@ class PortfolioScreen(QWidget):
         # Detect closures + update snapshots for every account
         self._process_snapshots()
         self._check_exit_alerts()
+
+        # Push fresh symbol list to the streamer (positions may have changed)
+        self._update_streamer_symbols()
 
         self._refresh_account_combo()
         if self._accounts:
@@ -1076,8 +1212,9 @@ class PortfolioScreen(QWidget):
             f"border: none; background: transparent;"
         )
 
+        self._strategy_cards = []
         if not instances:
-            empty = QLabel("No strategies configured — click “Configure Account” in the header.")
+            empty = QLabel('No strategies configured \u2014 click \u201cConfigure Account\u201d in the header.')
             empty.setStyleSheet(
                 f"color: {T.MUTED}; font-size: 13px; padding: 22px; border: 1px dashed "
                 f"{T.BORDER}; border-radius: 10px; background: {T.CARD};"
@@ -1089,7 +1226,9 @@ class PortfolioScreen(QWidget):
                 card = StrategyCard(inst, metrics=metrics)
                 card.clicked.connect(self.strategy_clicked.emit)
                 self.my_container.addWidget(card)
+                self._strategy_cards.append(card)
 
+        self._ua_cards = []
         if not unassigned:
             empty = QLabel("All legs are assigned to strategies.")
             empty.setStyleSheet(
@@ -1103,6 +1242,7 @@ class PortfolioScreen(QWidget):
                 card = StrategyCard(strat, metrics=metrics)
                 card.clicked.connect(self.strategy_clicked.emit)
                 self.ua_container.addWidget(card)
+                self._ua_cards.append(card)
 
     def _render_greeks(self, positions, metrics_by_root):
         g = portfolio_greeks(positions, metrics_by_root)
@@ -1284,6 +1424,9 @@ class PortfolioScreen(QWidget):
         reference, otherwise QThread::~QThread() aborts when the thread is
         still running (SIGABRT / EXC_CRASH).
         """
+        # Stop the quote streamer first (it has its own asyncio loop)
+        self._stop_streamer()
+        # Stop the portfolio fetch worker and update-check worker
         for attr in ("_worker", "_update_worker"):
             w = getattr(self, attr, None)
             if w and w.isRunning():
@@ -1291,6 +1434,7 @@ class PortfolioScreen(QWidget):
                 w.wait(5000)   # 5 s safety timeout
 
     def _logout(self):
+        self._stop_streamer()
         api.clear_credentials()
         self.logout_requested.emit()
 

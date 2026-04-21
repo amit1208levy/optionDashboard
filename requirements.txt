@@ -1,3 +1,4 @@
 PyQt6>=6.6
 requests>=2.28
 matplotlib>=3.7
+websockets>=13.0
