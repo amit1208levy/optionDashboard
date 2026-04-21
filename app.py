@@ -1,6 +1,7 @@
 """Options Dashboard — setup + portfolio + configure screens."""
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from PyQt6.QtWidgets import (
@@ -53,58 +54,110 @@ class ConnectWorker(QThread):
 class PortfolioWorker(QThread):
     done = pyqtSignal(dict)
 
-    def __init__(self, token, creds=None):
+    # YTD transaction TTL: don't re-fetch within the same hour.
+    _YTD_TTL_SECONDS = 3600
+
+    def __init__(self, token, creds=None, ytd_cache=None):
         super().__init__()
-        self.token = token
-        self.creds = creds   # needed to refresh an expired access token
+        self.token      = token
+        self.creds      = creds
+        # ytd_cache is a mutable dict shared with PortfolioScreen so it
+        # survives across worker instances (i.e. across live-mode refreshes).
+        self._ytd_cache = ytd_cache if ytd_cache is not None else {}
+
+    # ── Per-account helpers ──────────────────────────────────────────────────
+
+    def _ytd_txns(self, num):
+        """Return YTD transactions from cache if fresh, else fetch and cache."""
+        entry = self._ytd_cache.get(num, {})
+        try:
+            age = (datetime.now(timezone.utc) -
+                   datetime.fromisoformat(entry["fetched_at"])).total_seconds()
+            if age < self._YTD_TTL_SECONDS:
+                return entry["transactions"]
+        except (KeyError, ValueError):
+            pass
+        txns = api.get_transactions_ytd(self.token, num)
+        self._ytd_cache[num] = {
+            "fetched_at":   datetime.now(timezone.utc).isoformat(),
+            "transactions": txns,
+        }
+        return txns
+
+    def _fetch_one(self, acct):
+        """
+        Fetch all data for one account using two parallel phases:
+          Phase 1 (independent): balances + positions + YTD transactions
+          Phase 2 (needs positions): market quotes + market metrics
+        Returns a data dict, or None if the account has no number.
+        """
+        num = acct.get("account-number", "")
+        if not num:
+            return None
+        try:
+            # ── Phase 1: three independent calls in parallel ─────────────
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                f_bal = ex.submit(api.get_balances,   self.token, num)
+                f_pos = ex.submit(api.get_positions,  self.token, num)
+                f_ytd = ex.submit(self._ytd_txns,     num)
+                balances      = f_bal.result()
+                positions_raw = f_pos.result()
+                ytd_txns      = f_ytd.result()
+
+            positions = [Position(p) for p in positions_raw]
+
+            # ── Phase 2: quotes + metrics in parallel (both need positions) ──
+            eq_opts = [p.symbol for p in positions
+                       if p.is_option and p.instrument_type == "Equity Option"]
+            fu_opts = [p.symbol for p in positions
+                       if p.is_option and p.instrument_type == "Future Option"]
+            equities = [p.symbol for p in positions
+                        if not p.is_option and p.instrument_type == "Equity"]
+            roots = list({p.root for p in positions if p.root})
+
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                f_quotes  = ex.submit(api.get_market_data, self.token,
+                                      equity_options=eq_opts,
+                                      future_options=fu_opts,
+                                      equities=equities)
+                f_metrics = ex.submit(api.get_market_metrics, self.token, roots)
+                quotes  = f_quotes.result()
+                metrics = f_metrics.result()
+
+            for p in positions:
+                p.attach_quote(quotes.get(p.symbol))
+
+            return {
+                "number":    num,
+                "nickname":  acct.get("nickname") or num,
+                "balances":  balances,
+                "positions": positions,
+                "metrics":   metrics,
+                "ytd_txns":  ytd_txns,
+            }
+        except Exception:
+            return None   # account-level error: skip this account gracefully
+
+    # ── Main run ─────────────────────────────────────────────────────────────
 
     def run(self):
         new_token = None
         for attempt in range(2):   # attempt 0 = normal; attempt 1 = after token refresh
             try:
-                accounts_raw = api.list_accounts(self.token)
-                accounts = []
-                for acct in accounts_raw:
-                    num = acct.get("account-number", "")
-                    if not num:
-                        continue
-                    balances  = api.get_balances(self.token, num)
-                    positions = [Position(p) for p in api.get_positions(self.token, num)]
+                accounts_raw = [a for a in api.list_accounts(self.token)
+                                if a.get("account-number")]
 
-                    equity_opts = [p.symbol for p in positions
-                                    if p.is_option and p.instrument_type == "Equity Option"]
-                    future_opts = [p.symbol for p in positions
-                                    if p.is_option and p.instrument_type == "Future Option"]
-                    equities    = [p.symbol for p in positions
-                                    if not p.is_option and p.instrument_type == "Equity"]
-                    quotes = api.get_market_data(
-                        self.token, equity_options=equity_opts,
-                        future_options=future_opts, equities=equities,
-                    )
-                    for p in positions:
-                        p.attach_quote(quotes.get(p.symbol))
+                # Fetch all accounts concurrently
+                with ThreadPoolExecutor(max_workers=max(len(accounts_raw), 1)) as ex:
+                    results = list(ex.map(self._fetch_one, accounts_raw))
 
-                    # Per-underlying metrics: IVR/IVP/beta/HV30
-                    roots = list({p.root for p in positions if p.root})
-                    metrics = api.get_market_metrics(self.token, roots)
-
-                    ytd_txns = api.get_transactions_ytd(self.token, num)
-
-                    accounts.append({
-                        "number":    num,
-                        "nickname":  acct.get("nickname") or num,
-                        "balances":  balances,
-                        "positions": positions,
-                        "metrics":   metrics,
-                        "ytd_txns":  ytd_txns,
-                    })
+                accounts = [r for r in results if r is not None]
                 self.done.emit({"accounts": accounts, "error": "", "new_token": new_token})
                 return
 
             except Exception as e:
                 err = str(e)
-                # 401 Unauthorized = access token expired.
-                # Refresh once using the stored credentials, then retry.
+                # 401 = access token expired → refresh once and retry
                 if ("401" in err or "Unauthorized" in err) and self.creds and attempt == 0:
                     tok, refresh_err = api.get_access_token(
                         self.creds["refresh_token"], self.creds["secret_token"]
@@ -112,7 +165,7 @@ class PortfolioWorker(QThread):
                     if tok:
                         self.token = tok
                         new_token  = tok
-                        continue   # retry with the fresh token
+                        continue
                     self.done.emit({
                         "accounts":  [],
                         "error":     f"Session expired — re-auth failed: {refresh_err}",
@@ -369,11 +422,12 @@ class PortfolioScreen(QWidget):
 
     def __init__(self, creds, token):
         super().__init__()
-        self.creds = creds
-        self.token = token
-        self._worker = None
-        self._accounts = []
-        self._alerted  = {}   # {(strategy_id, condition_type): severity} — prevents repeat alerts
+        self.creds      = creds
+        self.token      = token
+        self._worker    = None
+        self._accounts  = []
+        self._alerted   = {}   # {(strategy_id, condition_type): severity} — prevents repeat alerts
+        self._ytd_cache = {}   # {account_number: {fetched_at, transactions}} — shared across workers
 
         self.strategies_all = api.load_strategies()   # {acct_num: [entries]}
         self.history_all    = api.load_history()      # {acct_num: [entries]}
@@ -731,7 +785,7 @@ class PortfolioScreen(QWidget):
             f"color: {T.MUTED}; font-size: 13px; border: none; background: transparent;"
         )
         self.status_lbl.setText("Loading portfolio…")
-        self._worker = PortfolioWorker(self.token, self.creds)
+        self._worker = PortfolioWorker(self.token, self.creds, self._ytd_cache)
         self._worker.done.connect(self._on_data)
         self._worker.start()
 
