@@ -768,6 +768,28 @@ class PortfolioScreen(QWidget):
         except (TypeError, ValueError):
             pass
 
+        # ── Refresh P/L YTD and YTD W/Fees (they include open P&L) ───────────
+        # Both depend on the same open_pnl_now which just changed.
+        # ytd_realized + ytd_fees were cached by _render() so we don't need to
+        # re-iterate every YTD transaction on every quote tick.
+        try:
+            ytd_realized = getattr(self, "_ytd_realized", 0.0)
+            ytd_fees     = getattr(self, "_ytd_fees",     0.0)
+            ytd_total    = ytd_realized + total_pnl
+            self.ytd_gross_lbl.setText(money(ytd_total, signed=True))
+            self.ytd_gross_lbl.setStyleSheet(
+                f"color: {pnl_color(ytd_total)}; font-size: 22px; font-weight: bold; "
+                f"border: none; background: transparent;"
+            )
+            ytd_wf = ytd_total - ytd_fees
+            self.ytd_pnl_lbl.setText(money(ytd_wf, signed=True))
+            self.ytd_pnl_lbl.setStyleSheet(
+                f"color: {pnl_color(ytd_wf)}; font-size: 22px; font-weight: bold; "
+                f"border: none; background: transparent;"
+            )
+        except (TypeError, ValueError):
+            pass
+
     def _make_tile(self, label):
         f = QFrame()
         f.setStyleSheet(
@@ -1153,25 +1175,31 @@ class PortfolioScreen(QWidget):
         except (ValueError, TypeError):
             self.day_pnl_lbl.setText("—")
 
-        # ── P/L YTD  (realized closed-trade P&L only, gross before fees) ───────
-        # Source: TastyTrade balance "realized-year-gain" — this is the gain/loss
-        # from positions that have actually closed this year.  Open positions are
-        # NOT included here; they appear separately in the "Open P&L" tile so
-        # the two numbers never overlap.
+        # ── P/L YTD  (TastyTrade formula: realized-closed + open/unrealized) ───
+        # TastyTrade's "P/L YTD" in their UI is NOT closed-only — it includes the
+        # current mark-to-market value of every still-open position.  Reference
+        # verified against TastyTrade account table:
+        #   P/L YTD = realized-year-gain + Σ position.pnl   (open unrealized)
+        # This makes P/L YTD and Open P&L overlap intentionally, which matches
+        # the broker's displayed numbers.
         try:
-            ytd_gross = _signed_gain("realized-year-gain")
-            self.ytd_gross_lbl.setText(money(ytd_gross, signed=True))
+            ytd_realized = _signed_gain("realized-year-gain")
+            open_pnl_now = sum(p.pnl for p in positions_now)
+            ytd_total    = ytd_realized + open_pnl_now
+            self.ytd_gross_lbl.setText(money(ytd_total, signed=True))
             self.ytd_gross_lbl.setStyleSheet(
-                f"color: {pnl_color(ytd_gross)}; font-size: 22px; font-weight: bold; "
+                f"color: {pnl_color(ytd_total)}; font-size: 22px; font-weight: bold; "
                 f"border: none; background: transparent;"
             )
         except (ValueError, TypeError):
+            ytd_realized = 0.0
+            open_pnl_now = 0.0
+            ytd_total    = 0.0
             self.ytd_gross_lbl.setText("—")
 
-        # ── YTD W/Fees  (same realized P&L minus all commissions/fees paid) ───
-        # TastyTrade charges commissions separately from position P&L, so
-        # "realized-year-gain" is gross.  We subtract every fee field from the
-        # YTD transaction records to arrive at the true net-of-fees realized P&L.
+        # ── YTD W/Fees  (TastyTrade formula: P/L YTD − YTD fees) ────────────
+        # Subtract every fee field on every YTD Trade / Receive-Deliver record
+        # to match what TastyTrade displays as "P/L YTD w/f".
         try:
             ytd_fees = 0.0
             for t in ytd_txns:
@@ -1185,7 +1213,12 @@ class PortfolioScreen(QWidget):
                     except (TypeError, ValueError):
                         pass
 
-            ytd_wf = _signed_gain("realized-year-gain") - ytd_fees
+            # Cache for live-mode price updates so _on_price_update can
+            # recompute these tiles without re-reading all transactions.
+            self._ytd_realized = ytd_realized
+            self._ytd_fees     = ytd_fees
+
+            ytd_wf = ytd_total - ytd_fees
             self.ytd_pnl_lbl.setText(money(ytd_wf, signed=True))
             self.ytd_pnl_lbl.setStyleSheet(
                 f"color: {pnl_color(ytd_wf)}; font-size: 22px; font-weight: bold; "
