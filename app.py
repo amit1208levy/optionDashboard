@@ -338,13 +338,11 @@ class PortfolioScreen(QWidget):
     watchlist_requested = pyqtSignal()
     risk_requested      = pyqtSignal()
 
-    PRIMARY_CARDS = [
-        ("net-liquidating-value", "Net Liq"),
-    ]
+    # Primary balance tile definitions (key → balance API field, label → tile header)
+    # Tiles shown in primary row, in column order matching the reference screenshot.
+    # Manually-computed tiles (Day P&L, YTD, etc.) are interleaved in _build_balance_row.
     MORE_CARDS = [
-        ("cash-balance",            "Cash"),
-        ("derivative-buying-power", "Option BP"),
-        ("equity-buying-power",     "Equity BP"),
+        ("cash-balance", "Cash"),
     ]
 
     def __init__(self, creds, token):
@@ -614,34 +612,53 @@ class PortfolioScreen(QWidget):
     def _build_balance_row(self):
         outer = QVBoxLayout()
         outer.setSpacing(8)
-
-        # ── Primary row ────────────────────────────────────────────────────
-        primary = QHBoxLayout()
-        primary.setSpacing(12)
         self.bal_cards = {}
 
-        for key, label in self.PRIMARY_CARDS:
+        # ── Primary row ────────────────────────────────────────────────────
+        # Column order mirrors the reference screenshot:
+        #   Net Liq | Day P&L | P/L YTD | Option BP | Stock BP |
+        #   YTD W/Fees | BP Used | BP Used % | Open P&L
+        primary = QHBoxLayout()
+        primary.setSpacing(10)
+
+        def _add_bal(key, label):
             w, val = self._bal_tile(label)
             self.bal_cards[key] = val
             primary.addWidget(w)
 
-        # Capital Used
-        w, self.cap_used_lbl = self._bal_tile("Portfolio Used")
-        primary.addWidget(w)
+        # 1. Net Liq
+        _add_bal("net-liquidating-value", "Net Liq")
 
-        # Open P&L
-        w, self.pnl_total_lbl = self._bal_tile("Open P&L")
-        primary.addWidget(w)
-
-        # Day P&L
+        # 2. Day P&L  (computed from positions)
         w, self.day_pnl_lbl = self._bal_tile("Day P&L")
         primary.addWidget(w)
 
-        # YTD P&L (with fees)
-        w, self.ytd_pnl_lbl = self._bal_tile("YTD P&L")
+        # 3. P/L YTD  (gross realized gain from TastyTrade balance, + open P&L)
+        w, self.ytd_gross_lbl = self._bal_tile("P/L YTD")
         primary.addWidget(w)
 
-        # More button
+        # 4. Option BP
+        _add_bal("derivative-buying-power", "Option BP")
+
+        # 5. Stock BP
+        _add_bal("equity-buying-power", "Stock BP")
+
+        # 6. YTD W/Fees  (transaction-based, net of commissions/exchange/regulatory fees)
+        w, self.ytd_pnl_lbl = self._bal_tile("YTD W/Fees")
+        primary.addWidget(w)
+
+        # 7. BP Used $  (maintenance requirement in dollars)
+        _add_bal("maintenance-requirement", "BP Used")
+
+        # 8. BP Used %  (maintenance / net-liq)
+        w, self.cap_used_lbl = self._bal_tile("BP Used %")
+        primary.addWidget(w)
+
+        # 9. Open P&L  (sum of all position unrealized P&Ls)
+        w, self.pnl_total_lbl = self._bal_tile("Open P&L")
+        primary.addWidget(w)
+
+        # More button (just Cash behind it now)
         self._more_expanded = False
         self._more_btn = QPushButton("More  ▼")
         self._more_btn.setFixedSize(80, 62)
@@ -657,12 +674,12 @@ class PortfolioScreen(QWidget):
 
         outer.addLayout(primary)
 
-        # ── Secondary row (hidden by default) ─────────────────────────────
+        # ── Secondary row (Cash, hidden by default) ────────────────────────
         self._more_row_w = QWidget()
         self._more_row_w.setStyleSheet("background: transparent;")
         more_row = QHBoxLayout(self._more_row_w)
         more_row.setContentsMargins(0, 0, 0, 0)
-        more_row.setSpacing(12)
+        more_row.setSpacing(10)
 
         for key, label in self.MORE_CARDS:
             w, val = self._bal_tile(label)
@@ -954,8 +971,18 @@ class PortfolioScreen(QWidget):
                 f"color: {pnl_color(ytd)}; font-size: 22px; font-weight: bold; "
                 f"border: none; background: transparent;"
             )
+
+            # P/L YTD (gross) — TastyTrade's balance "realized-year-gain" is the
+            # gross realized gain before commissions/fees, plus current open P&L.
+            ytd_gross = _signed_gain("realized-year-gain") + open_pnl
+            self.ytd_gross_lbl.setText(money(ytd_gross, signed=True))
+            self.ytd_gross_lbl.setStyleSheet(
+                f"color: {pnl_color(ytd_gross)}; font-size: 22px; font-weight: bold; "
+                f"border: none; background: transparent;"
+            )
         except (ValueError, TypeError):
             self.ytd_pnl_lbl.setText("—")
+            self.ytd_gross_lbl.setText("—")
 
         self._clear_layout(self.my_container)
         self._clear_layout(self.ua_container)
