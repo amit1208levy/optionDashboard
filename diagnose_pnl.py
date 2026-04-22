@@ -76,6 +76,19 @@ def main() -> int:
                 print(f"    first: type={t.transaction_type!r} sub={t.transaction_sub_type!r} "
                       f"value={t.value} commission={t.commission}")
 
+            # Breakdown of every Money Movement transaction so we can see
+            # which sub-types should count as deposits vs P&L
+            print("  Money Movement breakdown:")
+            from collections import defaultdict
+            mm_by_sub = defaultdict(lambda: {"count": 0, "sum": 0.0})
+            for t in txns:
+                if (t.transaction_type or "").lower() == "money movement":
+                    sub = t.transaction_sub_type or "(none)"
+                    mm_by_sub[sub]["count"] += 1
+                    mm_by_sub[sub]["sum"]   += float(t.value or 0)
+            for sub, info in sorted(mm_by_sub.items()):
+                print(f"    {sub:35s} count={info['count']:>3d}  sum={info['sum']:+.2f}")
+
             print("  get_net_liquidating_value_history(start_time=Jan 1) ...")
             from datetime import datetime, timezone
             start = datetime(date.today().year, 1, 1, tzinfo=timezone.utc)

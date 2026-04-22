@@ -73,19 +73,37 @@ def _to_float(v) -> float:
 
 
 def _tx_fees(t: Transaction) -> float:
-    """Sum every explicit fee field on a transaction.  Always returns ≥ 0."""
-    return (_to_float(t.commission)
-            + _to_float(t.clearing_fees)
-            + _to_float(t.regulatory_fees)
-            + _to_float(t.proprietary_index_option_fees))
+    """
+    Sum every explicit fee field as positive dollars.
+    The SDK returns commission etc. signed (e.g. -0.75 for a $0.75 debit) so
+    we take abs() of each field to get a positive "fees paid" total.
+    """
+    return (abs(_to_float(t.commission))
+            + abs(_to_float(t.clearing_fees))
+            + abs(_to_float(t.regulatory_fees))
+            + abs(_to_float(t.proprietary_index_option_fees)))
+
+
+# Sub-types of "Money Movement" that represent EXTERNAL cash flow.
+# Anything else (Balance Adjustment, Credit Interest, Subscription Fee, …) is
+# part of P&L, NOT a deposit/withdrawal — including it would corrupt the
+# NetLiq-delta math.  Match case-insensitively against substrings.
+_DEPOSIT_KEYWORDS = (
+    "deposit", "withdrawal", "withdraw", "wire", "ach",
+    "transfer", "rollover",
+)
+
+
+def _is_external_money_movement(t: Transaction) -> bool:
+    """True if this transaction represents external cash entering/leaving the account."""
+    if (t.transaction_type or "").lower() != "money movement":
+        return False
+    sub = (t.transaction_sub_type or "").lower()
+    return any(kw in sub for kw in _DEPOSIT_KEYWORDS)
 
 
 def _tx_signed_value(t: Transaction) -> float:
-    """
-    Return the signed dollar value of a Money-Movement transaction
-    (positive = credit / deposit, negative = debit / withdrawal).
-    The SDK doesn't expose value-effect cleanly so we infer sign from value.
-    """
+    """Signed dollar value (positive = money in, negative = money out)."""
     return _to_float(t.value)
 
 
@@ -153,7 +171,7 @@ def compute_ytd_pnl(access_token: str, account_number: str,
             ttype = (t.transaction_type or "").lower()
             if ttype in ("trade", "receive deliver"):
                 ytd_fees += _tx_fees(t)
-            elif ttype == "money movement":
+            if _is_external_money_movement(t):
                 net_deposits += _tx_signed_value(t)
 
         # ── 4. Apply the formula ─────────────────────────────────────────────
