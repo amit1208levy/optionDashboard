@@ -1,19 +1,52 @@
 """TastyTrade API — auth, credentials, data fetch."""
 import json
 import os
+import sys
+import shutil
 import requests
 
 BASE = "https://api.tastyworks.com"
 UA   = "options-dashboard/1.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-CREDENTIALS_FILE    = os.path.join(HERE, ".credentials.json")
-GROUPS_FILE         = os.path.join(HERE, ".groups.json")
-ACCOUNT_NAMES_FILE  = os.path.join(HERE, ".account_names.json")
-STRATEGIES_FILE     = os.path.join(HERE, ".strategies.json")
-HISTORY_FILE        = os.path.join(HERE, ".history.json")
-SNAPSHOTS_FILE      = os.path.join(HERE, ".snapshots.json")
-SETTINGS_FILE       = os.path.join(HERE, ".settings.json")
+
+def _user_data_dir() -> str:
+    """
+    Return the directory where user data (credentials, strategies, history…)
+    is stored.  When running inside a PyInstaller .app bundle we store under
+    ~/Library/Application Support/OptionsDashboard/ so that replacing the
+    .app does not wipe the user's data.  When running from source we keep
+    using the project dir for easier dev workflow.
+    """
+    frozen = getattr(sys, "frozen", False) or "Contents/Resources" in HERE
+    if frozen:
+        d = os.path.expanduser("~/Library/Application Support/OptionsDashboard")
+        os.makedirs(d, exist_ok=True)
+        # One-time migration: if the old .app bundle still contained data
+        # files, copy them over so existing users don't lose their settings.
+        for name in (".credentials.json", ".groups.json", ".account_names.json",
+                     ".strategies.json", ".history.json", ".snapshots.json",
+                     ".settings.json"):
+            src = os.path.join(HERE, name)
+            dst = os.path.join(d, name)
+            if os.path.exists(src) and not os.path.exists(dst):
+                try:
+                    shutil.copy2(src, dst)
+                except Exception:
+                    pass
+        return d
+    return HERE
+
+
+_DATA_DIR = _user_data_dir()
+
+CREDENTIALS_FILE    = os.path.join(_DATA_DIR, ".credentials.json")
+GROUPS_FILE         = os.path.join(_DATA_DIR, ".groups.json")
+ACCOUNT_NAMES_FILE  = os.path.join(_DATA_DIR, ".account_names.json")
+STRATEGIES_FILE     = os.path.join(_DATA_DIR, ".strategies.json")
+HISTORY_FILE        = os.path.join(_DATA_DIR, ".history.json")
+SNAPSHOTS_FILE      = os.path.join(_DATA_DIR, ".snapshots.json")
+SETTINGS_FILE       = os.path.join(_DATA_DIR, ".settings.json")
 
 
 # ── Credentials ─────────────────────────────────────────────────────────────
