@@ -932,7 +932,7 @@ class PortfolioScreen(QWidget):
         w, self.day_pnl_lbl   = self._bal_tile("Day P&L")
         primary.addWidget(w)
 
-        w, self.ytd_gross_lbl = self._bal_tile("P/L YTD")
+        w, self.ytd_pnl_lbl   = self._bal_tile("YTD W/Fees")
         primary.addWidget(w)
 
         w, self.pnl_total_lbl = self._bal_tile("Open P&L")
@@ -965,7 +965,7 @@ class PortfolioScreen(QWidget):
         more_row.setContentsMargins(0, 0, 0, 0)
         more_row.setSpacing(10)
 
-        w, self.ytd_pnl_lbl = self._bal_tile("YTD W/Fees")
+        w, self.ytd_gross_lbl = self._bal_tile("P/L YTD")
         more_row.addWidget(w)
 
         _add_bal("derivative-buying-power", "Option BP", more_row)
