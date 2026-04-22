@@ -677,13 +677,21 @@ class PortfolioScreen(QWidget):
         hl.addWidget(logout_btn)
         return header
 
-    def _style_live_btn(self, on, streaming=False):
+    def _style_live_btn(self, on, streaming=False, mode="connecting"):
+        """mode: "connecting" | "rest" (REST fallback) | "streaming" (unused) """
         if on and streaming:
             self.live_btn.setText("● Streaming")
             self.live_btn.setStyleSheet(
                 f"QPushButton {{ background: {T.GREEN_D}; color: white; border: none; "
                 f"border-radius: 6px; padding: 0 10px; font-size: 11px; font-weight: bold; }}"
                 f"QPushButton:hover {{ background: {T.GREEN}; }}"
+            )
+        elif on and mode == "rest":
+            self.live_btn.setText("●  Live (15s)")
+            self.live_btn.setStyleSheet(
+                f"QPushButton {{ background: {T.PURPLE}; color: white; border: none; "
+                f"border-radius: 6px; padding: 0 10px; font-size: 11px; font-weight: bold; }}"
+                f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
             )
         elif on:
             self.live_btn.setText("⟳  Connecting")
@@ -748,6 +756,25 @@ class PortfolioScreen(QWidget):
         if status == "connected":
             self._style_live_btn(True, streaming=True)
             self.status_lbl.setText("")
+            self._stream_fail_count = 0
+            return
+        if status.startswith("error"):
+            # Persistent errors (e.g. HTTP 403 = no streaming scope on OAuth
+            # app) → give up trying the WebSocket and show "Live (15s)" to
+            # indicate REST polling is still active.
+            self._stream_fail_count = getattr(self, "_stream_fail_count", 0) + 1
+            if self._stream_fail_count >= 2:
+                self._stop_streamer()
+                self._style_live_btn(True, mode="rest")
+                if "403" in status:
+                    self.status_lbl.setStyleSheet(
+                        f"color: {T.YELLOW}; font-size: 11px; border: none; background: transparent;"
+                    )
+                    self.status_lbl.setText(
+                        "Live updates via 15s polling — your OAuth app doesn't "
+                        "have quote-streaming permission for real-time WebSocket."
+                    )
+                return
         elif status == "connecting":
             self._style_live_btn(True, streaming=False)
         elif status == "disconnected":
