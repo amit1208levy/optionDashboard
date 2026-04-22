@@ -636,7 +636,7 @@ _COLUMNS = [
     ("price_lbl", "Price",  90,  "price"),
     ("ivr_lbl",   "IVR ★", 100, "ivr"),
     ("ivp_lbl",   "IVP",    60,  "ivp"),
-    ("beta_lbl",  "Beta",   55,  "beta"),
+    ("beta_lbl",  "β-Wtd Δ", 70, "beta"),
     ("liq_lbl",   "Liq ★",  90,  "liq"),
 ]
 
@@ -647,7 +647,7 @@ _SORT_META = {
     "price":  ("Price",  False),
     "ivr":    ("IVR ★",  False),
     "ivp":    ("IVP",    False),
-    "beta":   ("Beta",   True),
+    "beta":   ("β-Wtd Δ", True),
     "liq":    ("Liq ★",  False),
 }
 
