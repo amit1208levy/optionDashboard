@@ -31,13 +31,24 @@ UA   = "options-dashboard/1.0"
 # TastyTrade datetime format expected by /net-liq/history
 _TT_DATE_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
-# Sub-types of "Money Movement" we treat as cash flow (excluded from P&L).
-# Anything else (Balance Adjustment, Credit Interest, Subscription Fee, …)
-# stays inside P&L.  Substring match, case-insensitive.
-_DEPOSIT_KEYWORDS = (
+# Sub-types of "Money Movement" whose name alone tells us it's external
+# cash flow (should be subtracted from NetLiq delta so it doesn't inflate P&L).
+# Mark to Market is TastyTrade's daily futures cash settlement — also belongs
+# outside of P&L per their UI convention.
+_EXPLICIT_EXTERNAL_SUBTYPES = (
     "deposit", "withdrawal", "withdraw", "wire", "ach",
-    "transfer", "rollover", "mark to market",
+    "rollover", "mark to market",
 )
+
+# Ambiguous "Transfer" sub-types need the description to classify:
+#   • Internal (between two TastyTrade accounts)  → leave in P&L
+#   • External (to an outside bank)                → subtract from P&L
+import re as _re
+_TT_ACCT_RE = _re.compile(r"\b[0-9][A-Z]{2}\d{5}\b", _re.IGNORECASE)
+_INTERNAL_HINTS = ("internal", "account transfer", "between accounts",
+                   "journal", "sweep", "inter-account")
+_EXTERNAL_HINTS = ("bank", "ach", "wire", "external", "check",
+                   "to bank", "from bank")
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -60,11 +71,44 @@ def _headers(token: str) -> dict:
 
 
 def _is_external_money_movement(t: dict) -> bool:
-    """True if this Money-Movement transaction is cash flow (not P&L)."""
+    """
+    Return True if this Money-Movement transaction is external cash flow
+    (should be subtracted from the NetLiq-delta when computing P/L YTD).
+
+    Explicit sub-types (Deposit, Withdrawal, Wire, ACH, MTM) are always
+    external.  "Transfer" is ambiguous — a Transfer between two TastyTrade
+    accounts is internal and should NOT be treated as cash flow, while a
+    Transfer to an outside bank should be.  We look at the description
+    field to decide:
+       • mentions a TastyTrade account number or "internal" → internal
+       • mentions bank / ACH / wire / external             → external
+       • otherwise default to INTERNAL (safer — matches TT's own UI where
+         ambiguous transfers stay inside P&L).
+    """
     if (t.get("transaction-type") or "").lower() != "money movement":
         return False
-    sub = (t.get("transaction-sub-type") or "").lower()
-    return any(kw in sub for kw in _DEPOSIT_KEYWORDS)
+    sub  = (t.get("transaction-sub-type") or "").lower()
+    desc = (t.get("description") or "").lower()
+
+    # Explicit external sub-types — always count
+    if any(kw in sub for kw in _EXPLICIT_EXTERNAL_SUBTYPES):
+        return True
+
+    # Ambiguous "transfer" → inspect description
+    if "transfer" in sub:
+        # Any TT account number (e.g. 5WZ12345) in the description means
+        # it's a transfer BETWEEN two TT accounts — treat as internal.
+        if _TT_ACCT_RE.search(desc):
+            return False
+        if any(kw in desc for kw in _INTERNAL_HINTS):
+            return False
+        if any(kw in desc for kw in _EXTERNAL_HINTS):
+            return True
+        # Default for unlabeled Transfers: treat as internal so we never
+        # erroneously inflate P&L by counting a cash move between accounts.
+        return False
+
+    return False
 
 
 def _signed_value(t: dict) -> float:
