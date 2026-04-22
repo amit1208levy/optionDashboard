@@ -1486,23 +1486,36 @@ class PortfolioScreen(QWidget):
                 f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
             )
             self._show_update_dialog(result)
+            return
+
+        self.update_btn.setText(f"v{VERSION}")
+        err = result.get("error") or ""
+
+        # SILENT (auto-check on startup): never show any popup, ever.
+        # If the check fails, mark the button with a small hint and move on
+        # — the user can retry by clicking it manually.
+        if silent:
+            if err:
+                self.update_btn.setToolTip(f"Last update check failed: {err}")
+                self.update_btn.setText(f"v{VERSION} ⚠")
+            return
+
+        # Manual "Check for updates" click:
+        # transient network errors → silent (not actionable)
+        el = err.lower()
+        if any(t in el for t in ("timed out", "timeout", "network",
+                                  "could not resolve", "no route", "name or service")):
+            self.update_btn.setToolTip(f"Last update check failed: {err}")
+            return
+
+        # Real errors → warn; success → info
+        if err:
+            QMessageBox.warning(self, "Update check failed", err)
         else:
-            self.update_btn.setText(f"v{VERSION}")
-            err = (result.get("error") or "").lower()
-            # Suppress transient network errors — they happen on slow Wi-Fi /
-            # offline and aren't actionable.  Only surface real problems.
-            if any(t in err for t in ("timed out", "timeout", "network",
-                                       "could not resolve", "no route")):
-                return
-            if silent:
-                return
-            if result.get("error"):
-                QMessageBox.warning(self, "Update check failed", result["error"])
-            else:
-                QMessageBox.information(
-                    self, "Up to date",
-                    f"You're on the latest version (v{VERSION})."
-                )
+            QMessageBox.information(
+                self, "Up to date",
+                f"You're on the latest version (v{VERSION})."
+            )
 
     def _show_update_dialog(self, result):
         dlg = QDialog(self)
