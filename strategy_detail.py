@@ -496,7 +496,7 @@ class StrategyDetailPage(QWidget):
         row.addWidget(self._big_tile(
             "DTE",
             str(s.dte) if s.dte is not None else "—",
-            dte_color(s.dte),
+            T.TEXT,
         ))
 
         dit_text = f"{s.dit}d" if s.dit is not None else "—"

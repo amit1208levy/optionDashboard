@@ -118,7 +118,7 @@ class StrategyCard(QFrame):
         h.addWidget(self._stat(
             "DTE",
             str(strategy.dte) if strategy.dte is not None else "—",
-            dte_color(strategy.dte)
+            T.TEXT,
         ))
 
         pop = probability_of_profit(strategy)
