@@ -911,51 +911,31 @@ class PortfolioScreen(QWidget):
         outer.setSpacing(8)
         self.bal_cards = {}
 
-        # ── Primary row ────────────────────────────────────────────────────
-        # Column order mirrors the reference screenshot:
-        #   Net Liq | Day P&L | P/L YTD | Option BP | Stock BP |
-        #   YTD W/Fees | BP Used | BP Used % | Open P&L
+        # ── Primary row (essentials only) ──────────────────────────────────
+        # Net Liq | Day P&L | P/L YTD | Open P&L | BP Used %
         primary = QHBoxLayout()
         primary.setSpacing(10)
 
-        def _add_bal(key, label):
+        def _add_bal(key, label, parent_layout):
             w, val = self._bal_tile(label)
             self.bal_cards[key] = val
-            primary.addWidget(w)
+            parent_layout.addWidget(w)
 
-        # 1. Net Liq
-        _add_bal("net-liquidating-value", "Net Liq")
+        _add_bal("net-liquidating-value", "Net Liq", primary)
 
-        # 2. Day P&L  (computed from positions)
-        w, self.day_pnl_lbl = self._bal_tile("Day P&L")
+        w, self.day_pnl_lbl   = self._bal_tile("Day P&L")
         primary.addWidget(w)
 
-        # 3. P/L YTD  (gross realized gain from TastyTrade balance, + open P&L)
         w, self.ytd_gross_lbl = self._bal_tile("P/L YTD")
         primary.addWidget(w)
 
-        # 4. Option BP
-        _add_bal("derivative-buying-power", "Option BP")
-
-        # 5. Stock BP
-        _add_bal("equity-buying-power", "Stock BP")
-
-        # 6. YTD W/Fees  (transaction-based, net of commissions/exchange/regulatory fees)
-        w, self.ytd_pnl_lbl = self._bal_tile("YTD W/Fees")
-        primary.addWidget(w)
-
-        # 7. BP Used $  (maintenance requirement in dollars)
-        _add_bal("maintenance-requirement", "BP Used")
-
-        # 8. BP Used %  (maintenance / net-liq)
-        w, self.cap_used_lbl = self._bal_tile("BP Used %")
-        primary.addWidget(w)
-
-        # 9. Open P&L  (sum of all position unrealized P&Ls)
         w, self.pnl_total_lbl = self._bal_tile("Open P&L")
         primary.addWidget(w)
 
-        # More button (just Cash behind it now)
+        w, self.cap_used_lbl  = self._bal_tile("BP Used %")
+        primary.addWidget(w)
+
+        # More button
         self._more_expanded = False
         self._more_btn = QPushButton("More  ▼")
         self._more_btn.setFixedSize(80, 62)
@@ -971,12 +951,20 @@ class PortfolioScreen(QWidget):
 
         outer.addLayout(primary)
 
-        # ── Secondary row (Cash, hidden by default) ────────────────────────
+        # ── Secondary row (hidden by default) ──────────────────────────────
+        # YTD W/Fees | Option BP | Stock BP | BP Used $ | Cash
         self._more_row_w = QWidget()
         self._more_row_w.setStyleSheet("background: transparent;")
         more_row = QHBoxLayout(self._more_row_w)
         more_row.setContentsMargins(0, 0, 0, 0)
         more_row.setSpacing(10)
+
+        w, self.ytd_pnl_lbl = self._bal_tile("YTD W/Fees")
+        more_row.addWidget(w)
+
+        _add_bal("derivative-buying-power", "Option BP", more_row)
+        _add_bal("equity-buying-power",     "Stock BP",  more_row)
+        _add_bal("maintenance-requirement", "BP Used",   more_row)
 
         for key, label in self.MORE_CARDS:
             w, val = self._bal_tile(label)
