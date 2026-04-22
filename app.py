@@ -1488,6 +1488,12 @@ class PortfolioScreen(QWidget):
             self._show_update_dialog(result)
         else:
             self.update_btn.setText(f"v{VERSION}")
+            err = (result.get("error") or "").lower()
+            # Suppress transient network errors — they happen on slow Wi-Fi /
+            # offline and aren't actionable.  Only surface real problems.
+            if any(t in err for t in ("timed out", "timeout", "network",
+                                       "could not resolve", "no route")):
+                return
             if silent:
                 return
             if result.get("error"):

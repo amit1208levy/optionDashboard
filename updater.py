@@ -37,7 +37,10 @@ def check_latest():
         return {"available": False, "latest": "", "local": "", "notes": "",
                 "error": "Not a git checkout — reinstall from GitHub."}
 
-    ok, _, err = _git("fetch", "--quiet", "origin")
+    # Allow up to 45 s on slow connections; retry once before giving up.
+    ok, _, err = _git("fetch", "--quiet", "origin", timeout=45)
+    if not ok:
+        ok, _, err = _git("fetch", "--quiet", "origin", timeout=45)
     if not ok:
         return {"available": False, "latest": "", "local": "", "notes": "",
                 "error": f"Fetch failed: {err or 'network error'}"}
