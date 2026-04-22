@@ -38,27 +38,18 @@ _PALETTE = [
     "#f97316", "#ec4899", "#06b6d4", "#84cc16", "#a78bfa",
 ]
 
-# Matplotlib dark style matching the app
-_MPL_STYLE = {
-    "figure.facecolor":  T.BG,
-    "axes.facecolor":    T.CARD,
-    "axes.edgecolor":    T.BORDER,
-    "text.color":        T.TEXT_DIM,
-    "axes.labelcolor":   T.LABEL,
-    "xtick.color":       T.MUTED,
-    "ytick.color":       T.MUTED,
-    "grid.color":        T.BORDER,
-    "grid.alpha":        0.7,
-    "axes.grid":         True,
-    "axes.spines.top":   False,
-    "axes.spines.right": False,
-    "lines.linewidth":   2.2,
-    "font.size":         10,
-    "axes.titlesize":    11,
-    "axes.labelsize":    10,
-    "xtick.labelsize":   9,
-    "ytick.labelsize":   9,
-}
+def _style_ax(ax, xlabel: str = "", ylabel: str = ""):
+    """Apply the same clean style used by PayoffChart across the app."""
+    ax.set_facecolor(T.CARD)
+    ax.tick_params(colors=T.MUTED, labelsize=8, length=3)
+    for spine in ax.spines.values():
+        spine.set_color(T.BORDER)
+        spine.set_linewidth(0.8)
+    if xlabel:
+        ax.set_xlabel(xlabel, color=T.MUTED, fontsize=9)
+    if ylabel:
+        ax.set_ylabel(ylabel, color=T.MUTED, fontsize=9)
+    ax.grid(color=T.BORDER, alpha=0.25, linewidth=0.6)
 
 
 # ── background workers ────────────────────────────────────────────────────────
@@ -202,8 +193,10 @@ class _AllocationRow(QFrame):
 def _make_canvas(width_px=500, height_px=300) -> FigureCanvasQTAgg:
     """Return an MPL canvas sized to the given pixel dimensions."""
     dpi = 96
-    fig = Figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi)
+    fig = Figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi,
+                 facecolor=T.CARD, tight_layout=True)
     canvas = FigureCanvasQTAgg(fig)
+    canvas.setStyleSheet(f"background: {T.CARD};")
     canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     canvas.setFixedHeight(height_px)
     return canvas
@@ -226,98 +219,73 @@ def _draw_spy_chart(canvas: FigureCanvasQTAgg,
                     bwd: float, bwg: float):
     """
     SPY scenario chart.
-    X: SPY price  (±25 % of current)
-    Y: estimated account value / SPY price
-
-    Shows how many "SPY shares" the account is worth as the market moves.
-    The curve bends upward for net-long portfolios and downward for net-short.
+    X: SPY price  (±25 % of current).  Y: account value / SPY price.
     """
-    with plt.rc_context(_MPL_STYLE):
-        fig = canvas.figure
-        fig.clear()
-        ax  = fig.add_subplot(111)
+    fig = canvas.figure
+    fig.clear()
+    fig.patch.set_facecolor(T.CARD)
+    ax  = fig.add_subplot(111)
 
-        x   = np.linspace(spy * 0.75, spy * 1.25, 400)
-        ds  = x - spy                           # ΔSPY
-        pnl = bwd * ds + 0.5 * bwg * ds ** 2   # Greek-estimated P&L
-        y   = (net_liq + pnl) / x              # account value normalised by SPY
+    x   = np.linspace(spy * 0.75, spy * 1.25, 400)
+    ds  = x - spy
+    pnl = bwd * ds + 0.5 * bwg * ds ** 2
+    y   = (net_liq + pnl) / x
+    y0  = net_liq / spy
 
-        # Current value (horizontal baseline)
-        y0  = net_liq / spy
+    ax.axhline(y0,  color=T.MUTED,   linewidth=0.8, linestyle="--", alpha=0.6)
+    ax.axvline(spy, color=T.BORDER_H, linewidth=0.6, linestyle=":",  alpha=0.6)
 
-        ax.axhline(y0, color=T.BORDER_H, linewidth=1, linestyle="--", alpha=0.7,
-                   label="Current")
-        ax.axvline(spy, color=T.MUTED, linewidth=1, linestyle=":", alpha=0.6)
+    ax.fill_between(x, y0, y, where=(y >  y0), alpha=0.18,
+                    color=T.GREEN, interpolate=True)
+    ax.fill_between(x, y0, y, where=(y <= y0), alpha=0.18,
+                    color=T.RED,   interpolate=True)
+    ax.plot(x, y, color=T.ACCENT, linewidth=1.8)
+    ax.scatter([spy], [y0], color=T.ACCENT, zorder=5, s=30)
 
-        ax.plot(x, y, color=T.PURPLE, linewidth=2.5)
-        ax.fill_between(x, y0, y, where=(y > y0),
-                        alpha=0.15, color=T.GREEN, interpolate=True)
-        ax.fill_between(x, y0, y, where=(y <= y0),
-                        alpha=0.15, color=T.RED, interpolate=True)
-
-        # Mark current point
-        ax.scatter([spy], [y0], color=T.ACCENT, zorder=5, s=50)
-
-        ax.set_xlabel("SPY Price  ($)")
-        ax.set_ylabel("Account Value / SPY  (shares equivalent)")
-        ax.set_title("SPY Scenario — Account Value Normalised to SPY")
-
-        # Format Y tick labels with commas
-        ax.yaxis.set_major_formatter(
-            matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}")
-        )
-        ax.xaxis.set_major_formatter(
-            matplotlib.ticker.FuncFormatter(lambda v, _: f"${v:,.0f}")
-        )
-        fig.tight_layout(pad=1.2)
-        canvas.draw()
+    _style_ax(ax, xlabel="SPY Price ($)", ylabel="Account / SPY (shares equiv)")
+    ax.yaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}")
+    )
+    ax.xaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda v, _: f"${v:,.0f}")
+    )
+    canvas.draw()
 
 
 def _draw_vix_chart(canvas: FigureCanvasQTAgg,
                     vix: float, net_liq: float, net_vega: float):
     """
     VIX scenario chart.
-    X: VIX level  (0.4× – 2.5× current, clamped to [5, 80])
-    Y: estimated account value / VIX level
-
-    Vega is approximated as linear: P&L ≈ net_vega × ΔVIX.
-    (VIX ≈ SPY 30-day IV in %; vega = $ per 1 vol-point.)
+    X: VIX level, Y: account value / VIX level.
     """
-    with plt.rc_context(_MPL_STYLE):
-        fig = canvas.figure
-        fig.clear()
-        ax  = fig.add_subplot(111)
+    fig = canvas.figure
+    fig.clear()
+    fig.patch.set_facecolor(T.CARD)
+    ax  = fig.add_subplot(111)
 
-        x_min = max(5.0,  vix * 0.4)
-        x_max = min(80.0, vix * 2.5)
-        x   = np.linspace(x_min, x_max, 400)
-        dv  = x - vix                   # ΔVIX
-        pnl = net_vega * dv             # vega × ΔVIX
-        y   = (net_liq + pnl) / x      # account value normalised by VIX
+    x_min = max(5.0,  vix * 0.4)
+    x_max = min(80.0, vix * 2.5)
+    x   = np.linspace(x_min, x_max, 400)
+    dv  = x - vix
+    pnl = net_vega * dv
+    y   = (net_liq + pnl) / x
+    y0  = net_liq / vix
 
-        y0  = net_liq / vix             # current baseline
+    ax.axhline(y0,  color=T.MUTED,   linewidth=0.8, linestyle="--", alpha=0.6)
+    ax.axvline(vix, color=T.BORDER_H, linewidth=0.6, linestyle=":",  alpha=0.6)
 
-        ax.axhline(y0, color=T.BORDER_H, linewidth=1, linestyle="--", alpha=0.7,
-                   label="Current")
-        ax.axvline(vix, color=T.MUTED, linewidth=1, linestyle=":", alpha=0.6)
+    ax.fill_between(x, y0, y, where=(y >  y0), alpha=0.18,
+                    color=T.GREEN, interpolate=True)
+    ax.fill_between(x, y0, y, where=(y <= y0), alpha=0.18,
+                    color=T.RED,   interpolate=True)
+    ax.plot(x, y, color=T.ACCENT, linewidth=1.8)
+    ax.scatter([vix], [y0], color=T.ACCENT, zorder=5, s=30)
 
-        ax.plot(x, y, color=T.TEAL, linewidth=2.5)
-        ax.fill_between(x, y0, y, where=(y > y0),
-                        alpha=0.15, color=T.GREEN, interpolate=True)
-        ax.fill_between(x, y0, y, where=(y <= y0),
-                        alpha=0.15, color=T.RED, interpolate=True)
-
-        ax.scatter([vix], [y0], color=T.ACCENT, zorder=5, s=50)
-
-        ax.set_xlabel("VIX Level")
-        ax.set_ylabel("Account Value / VIX  ($ per VIX unit)")
-        ax.set_title("VIX Scenario — Account Value Normalised to VIX")
-
-        ax.yaxis.set_major_formatter(
-            matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}")
-        )
-        fig.tight_layout(pad=1.2)
-        canvas.draw()
+    _style_ax(ax, xlabel="VIX Level", ylabel="Account / VIX")
+    ax.yaxis.set_major_formatter(
+        matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}")
+    )
+    canvas.draw()
 
 
 # ── main page ─────────────────────────────────────────────────────────────────
@@ -464,7 +432,7 @@ class RiskPage(QWidget):
         """Return a card containing a matplotlib pie chart."""
         card = QFrame()
         card.setStyleSheet(
-            f"QFrame {{ background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
             f"border-radius: 10px; }}"
         )
         inner = QVBoxLayout(card)
@@ -478,51 +446,48 @@ class RiskPage(QWidget):
         )
         inner.addWidget(title_lbl)
 
-        canvas = _make_canvas(width_px=380, height_px=300)
-        canvas.setFixedHeight(300)
+        canvas = _make_canvas(width_px=380, height_px=280)
+        canvas.setFixedHeight(280)
         inner.addWidget(canvas)
 
-        # Draw pie
         total = sum(values) or 1.0
         colors = [_PALETTE[i % len(_PALETTE)] for i in range(len(values))]
 
-        with plt.rc_context(_MPL_STYLE):
-            fig = canvas.figure
-            fig.clear()
-            fig.patch.set_facecolor(T.BG_ALT)
-            ax = fig.add_subplot(111)
-            ax.set_facecolor(T.BG_ALT)
+        fig = canvas.figure
+        fig.clear()
+        fig.patch.set_facecolor(T.CARD)
+        ax = fig.add_subplot(111)
+        ax.set_facecolor(T.CARD)
 
-            def fmt(pct):
-                return f"{pct:.1f}%" if pct >= 3 else ""
+        def fmt(pct):
+            return f"{pct:.0f}%" if pct >= 4 else ""
 
-            wedges, _, autotexts = ax.pie(
-                values,
-                labels=None,
-                colors=colors,
-                autopct=fmt,
-                startangle=90,
-                counterclock=False,
-                wedgeprops={"edgecolor": T.BG_ALT, "linewidth": 2},
-                pctdistance=0.72,
-                textprops={"color": "white", "fontsize": 9, "fontweight": "bold"},
-            )
-            ax.axis("equal")
+        wedges, _, _ = ax.pie(
+            values,
+            labels=None,
+            colors=colors,
+            autopct=fmt,
+            startangle=90,
+            counterclock=False,
+            wedgeprops={"edgecolor": T.CARD, "linewidth": 1.5},
+            pctdistance=0.75,
+            textprops={"color": "white", "fontsize": 8, "fontweight": "bold"},
+        )
+        ax.axis("equal")
 
-            # Legend on the right
-            legend_labels = [
-                f"{lbl}  {v/total*100:.1f}%"
-                for lbl, v in zip(labels, values)
-            ]
-            ax.legend(
-                wedges, legend_labels,
-                loc="center left", bbox_to_anchor=(1.0, 0.5),
-                frameon=False, fontsize=8,
-                labelcolor=T.TEXT_DIM,
-            )
-
-            fig.tight_layout(pad=0.5)
-            canvas.draw()
+        # Right-side legend
+        legend_labels = [
+            f"{lbl}  ·  {v/total*100:.1f}%"
+            for lbl, v in zip(labels, values)
+        ]
+        ax.legend(
+            wedges, legend_labels,
+            loc="center left", bbox_to_anchor=(1.02, 0.5),
+            frameon=False, fontsize=8,
+            labelcolor=T.TEXT_DIM,
+            handlelength=1.2, handletextpad=0.6,
+        )
+        canvas.draw()
 
         return card
 
