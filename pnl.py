@@ -1,64 +1,43 @@
 """
-YTD P&L calculation using the official TastyTrade Python SDK.
+YTD P&L calculation via raw TastyTrade API calls.
 
-The SDK gives us verified field names, typed responses, and methods like
-get_net_liquidating_value_history() and get_history() that we'd otherwise
-have to reverse-engineer.  This module isolates everything SDK-specific so
-the rest of the app stays decoupled.
-
-Authentication
-──────────────
-Our app uses OAuth (refresh-token + client-secret) but the SDK only ships
-with email/password Session.__init__.  We construct a Session manually,
-attaching our existing Bearer access token to its httpx client, so SDK
-methods work exactly as if the user had logged in through the SDK.
+No SDK dependency — uses only `requests` (already bundled in every install).
+This means the auto-updater can deliver this code to existing users without
+needing them to download a new .app.
 
 Algorithm
 ─────────
-    P/L YTD w/Fees  =  NetLiq_today − NetLiq_Jan1 − Net Deposits YTD
+    P/L YTD w/Fees  =  NetLiq_today − NetLiq_Jan1 − Net Cash Flow YTD
     P/L YTD (gross) =  P/L YTD w/Fees + Fees YTD
 
 NetLiq already reflects every fee paid (came out of cash), so the delta
 is naturally net-of-fees.  Adding fees back gives the gross figure.
+
+"Net Cash Flow" includes:
+  • External deposits / withdrawals / wires / ACH / transfers / rollovers
+  • Daily Mark-to-Market settlements on futures (broker tracks this
+    separately from P&L on their UI)
 """
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
-from decimal import Decimal
 from typing import Optional
 
-from httpx import Client
-from tastytrade import Account, Session
-from tastytrade.account import Transaction
+import requests
 
+BASE = "https://api.tastyworks.com"
+UA   = "options-dashboard/1.0"
 
-_API_URL = "https://api.tastyworks.com"
-_UA      = "options-dashboard/1.0"
+# TastyTrade datetime format expected by /net-liq/history
+_TT_DATE_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
-
-# ── Session construction (OAuth) ──────────────────────────────────────────────
-
-def make_oauth_session(access_token: str) -> Session:
-    """
-    Build a Session object that uses our existing OAuth access token,
-    bypassing the SDK's email+password login flow.
-    """
-    s = Session.__new__(Session)
-    s.is_test       = False
-    s.proxy         = None
-    s.session_token = access_token
-    s.user          = None
-    s.remember_token = None
-    s.sync_client = Client(
-        base_url=_API_URL,
-        headers={
-            "Accept":        "application/json",
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {access_token}",
-            "User-Agent":    _UA,
-        },
-    )
-    return s
+# Sub-types of "Money Movement" we treat as cash flow (excluded from P&L).
+# Anything else (Balance Adjustment, Credit Interest, Subscription Fee, …)
+# stays inside P&L.  Substring match, case-insensitive.
+_DEPOSIT_KEYWORDS = (
+    "deposit", "withdrawal", "withdraw", "wire", "ach",
+    "transfer", "rollover", "mark to market",
+)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -72,42 +51,95 @@ def _to_float(v) -> float:
         return 0.0
 
 
-def _tx_fees(t: Transaction) -> float:
-    """
-    Sum every explicit fee field as positive dollars.
-    The SDK returns commission etc. signed (e.g. -0.75 for a $0.75 debit) so
-    we take abs() of each field to get a positive "fees paid" total.
-    """
-    return (abs(_to_float(t.commission))
-            + abs(_to_float(t.clearing_fees))
-            + abs(_to_float(t.regulatory_fees))
-            + abs(_to_float(t.proprietary_index_option_fees)))
+def _headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type":  "application/json",
+        "User-Agent":    UA,
+    }
 
 
-# Sub-types of "Money Movement" that represent cash flow we want to subtract
-# from the NetLiq delta (i.e. they shouldn't show up in P/L YTD):
-#   • Real external cash:     Deposit, Withdrawal, Wire, ACH, Transfer, Rollover
-#   • Daily futures cash settlement: Mark to Market — TastyTrade tracks
-#     futures P&L outside of NetLiq delta, so we exclude these flows here too
-# Anything not in this list (Balance Adjustment, Credit Interest, Subscription
-# Fee, …) stays inside P&L.  Match case-insensitively against substrings.
-_DEPOSIT_KEYWORDS = (
-    "deposit", "withdrawal", "withdraw", "wire", "ach",
-    "transfer", "rollover", "mark to market",
-)
-
-
-def _is_external_money_movement(t: Transaction) -> bool:
-    """True if this transaction represents external cash entering/leaving the account."""
-    if (t.transaction_type or "").lower() != "money movement":
+def _is_external_money_movement(t: dict) -> bool:
+    """True if this Money-Movement transaction is cash flow (not P&L)."""
+    if (t.get("transaction-type") or "").lower() != "money movement":
         return False
-    sub = (t.transaction_sub_type or "").lower()
+    sub = (t.get("transaction-sub-type") or "").lower()
     return any(kw in sub for kw in _DEPOSIT_KEYWORDS)
 
 
-def _tx_signed_value(t: Transaction) -> float:
-    """Signed dollar value (positive = money in, negative = money out)."""
-    return _to_float(t.value)
+def _signed_value(t: dict) -> float:
+    """
+    Raw API returns `value` as an unsigned amount + a separate `value-effect`
+    field ("Credit" / "Debit").  Convert to a signed dollar number where
+    positive = money in (deposit / credit), negative = money out.
+    """
+    v = _to_float(t.get("value"))
+    eff = (t.get("value-effect") or "").lower()
+    return v if "credit" in eff else -v
+
+
+def _tx_fees(t: dict) -> float:
+    """Sum every fee field (always returns ≥ 0)."""
+    return (abs(_to_float(t.get("commission")))
+            + abs(_to_float(t.get("clearing-fees")))
+            + abs(_to_float(t.get("regulatory-fees")))
+            + abs(_to_float(t.get("proprietary-index-option-fees"))))
+
+
+# ── API calls ─────────────────────────────────────────────────────────────────
+
+def _get_balances(token: str, account_number: str) -> dict:
+    r = requests.get(
+        f"{BASE}/accounts/{account_number}/balances",
+        headers=_headers(token), timeout=15,
+    )
+    r.raise_for_status()
+    return r.json().get("data", {}) or {}
+
+
+def _get_net_liq_history(token: str, account_number: str,
+                         start_time: datetime) -> list:
+    """
+    GET /accounts/{num}/net-liq/history?start-time=YYYY-MM-DDTHH:MM:SSZ
+    Returns list of OHLC snapshots with .close field for each day.
+    """
+    r = requests.get(
+        f"{BASE}/accounts/{account_number}/net-liq/history",
+        headers=_headers(token),
+        params={"start-time": start_time.strftime(_TT_DATE_FMT)},
+        timeout=15,
+    )
+    r.raise_for_status()
+    return r.json().get("data", {}).get("items", []) or []
+
+
+def _get_history_ytd(token: str, account_number: str) -> list:
+    """
+    Paginate through /accounts/{num}/transactions for the current year.
+    Returns all transaction dicts.
+    """
+    items = []
+    year_start = f"{date.today().year}-01-01"
+    page = 0
+    while page < 40:   # safety cap (40 × 250 = 10,000 txns)
+        try:
+            r = requests.get(
+                f"{BASE}/accounts/{account_number}/transactions",
+                headers=_headers(token),
+                params={"per-page": 250, "page-offset": page,
+                        "start-date": year_start},
+                timeout=30,
+            )
+        except requests.exceptions.RequestException:
+            break
+        if r.status_code != 200:
+            break
+        batch = r.json().get("data", {}).get("items", []) or []
+        items.extend(batch)
+        if len(batch) < 250:
+            break
+        page += 1
+    return items
 
 
 # ── main entry point ──────────────────────────────────────────────────────────
@@ -115,76 +147,62 @@ def _tx_signed_value(t: Transaction) -> float:
 def compute_ytd_pnl(access_token: str, account_number: str,
                     raise_on_error: bool = False) -> Optional[dict]:
     """
-    Compute YTD P&L numbers for one account using verified TastyTrade SDK
-    methods.  Returns a dict on success, or None on any failure (so caller
-    can fall back to a different algorithm).
+    Compute YTD P&L numbers using raw TastyTrade API calls (no SDK).
 
-    Set raise_on_error=True for debugging — propagates exceptions so the
-    failing line is visible.
+    Returns a dict on success, None on any failure (so caller can fall back).
+    Set raise_on_error=True for debugging — propagates exceptions.
 
     Result dict shape:
         {
             "p_l_ytd":           float,   # gross of fees
-            "p_l_ytd_w_fees":    float,   # net of fees (NetLiq delta)
+            "p_l_ytd_w_fees":    float,   # net of fees
             "ytd_fees":          float,   # ≥ 0
             "ytd_net_deposits":  float,   # signed: + = deposit, − = withdrawal
             "year_start_net_liq":float,
             "current_net_liq":   float,
+            "unknown_subs":      dict,    # diagnostic: unrecognized MM sub-types
         }
     """
     try:
-        session = make_oauth_session(access_token)
-        # Pydantic v2: must use model_construct() to skip validation but still
-        # set up internal model state.  __new__ alone leaves the object broken.
-        account = Account.model_construct(account_number=account_number)
-
         year       = date.today().year
         year_start = datetime(year, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
         # ── 1. Current NetLiq ────────────────────────────────────────────────
-        current_balance = account.get_balances(session)
-        current_nl      = _to_float(current_balance.net_liquidating_value)
+        bal        = _get_balances(access_token, account_number)
+        current_nl = _to_float(bal.get("net-liquidating-value"))
 
-        # ── 2. NetLiq at Jan 1 (last EOD snapshot ≤ year start) ─────────────
-        nl_history = account.get_net_liquidating_value_history(
-            session, start_time=year_start
-        )
-        # The endpoint returns history starting AT or just AFTER start_time,
-        # so the earliest entry is approximately year-open NetLiq.
+        # ── 2. NetLiq at Jan 1 (first snapshot >= year start) ───────────────
+        nl_history = _get_net_liq_history(access_token, account_number, year_start)
         if nl_history:
-            # Snapshot objects use either `.close` or `.net-liquidating-value`
-            # depending on SDK version — try both.
-            first = nl_history[0]
             year_start_nl = (
-                _to_float(getattr(first, "close", None))
-                or _to_float(getattr(first, "net_liquidating_value", None))
-                or _to_float(getattr(first, "open", None))
+                _to_float(nl_history[0].get("close"))
+                or _to_float(nl_history[0].get("open"))
+                or current_nl
             )
-            if not year_start_nl:
-                year_start_nl = current_nl
         else:
             year_start_nl = current_nl
 
-        # ── 3. YTD transactions: separate deposits + sum fees ────────────────
-        txns = account.get_history(session, start_date=date(year, 1, 1))
+        # ── 3. YTD transactions: separate cash flow + sum fees ──────────────
+        txns = _get_history_ytd(access_token, account_number)
 
         ytd_fees     = 0.0
         net_deposits = 0.0
-        unknown_subs: dict = {}   # {sub_type: total_value}  for diagnostics
+        unknown_subs: dict = {}
         for t in txns:
-            ttype = (t.transaction_type or "").lower()
+            ttype = (t.get("transaction-type") or "").lower()
             if ttype in ("trade", "receive deliver"):
                 ytd_fees += _tx_fees(t)
             elif ttype == "money movement":
                 if _is_external_money_movement(t):
-                    net_deposits += _tx_signed_value(t)
+                    net_deposits += _signed_value(t)
                 else:
-                    sub = t.transaction_sub_type or "(none)"
+                    sub = t.get("transaction-sub-type") or "(none)"
                     if sub not in ("Balance Adjustment", "Credit Interest",
                                     "Debit Interest", "Subscription Fee"):
-                        unknown_subs[sub] = unknown_subs.get(sub, 0.0) + _to_float(t.value)
+                        unknown_subs[sub] = unknown_subs.get(sub, 0.0) \
+                                          + _signed_value(t)
 
-        # ── 4. Apply the formula ─────────────────────────────────────────────
+        # ── 4. Apply formula ────────────────────────────────────────────────
         p_l_w_fees = current_nl - year_start_nl - net_deposits
         p_l_gross  = p_l_w_fees + ytd_fees
 
@@ -195,7 +213,7 @@ def compute_ytd_pnl(access_token: str, account_number: str,
             "ytd_net_deposits":    net_deposits,
             "year_start_net_liq":  year_start_nl,
             "current_net_liq":     current_nl,
-            "unknown_subs":        unknown_subs,   # for unknown-subtype warnings
+            "unknown_subs":        unknown_subs,
         }
 
     except Exception:

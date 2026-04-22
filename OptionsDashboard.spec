@@ -1,26 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
-
-# tastytrade SDK + its market-calendars dependency need explicit collection
-# because they use lazy imports / data files PyInstaller doesn't auto-detect.
-_hidden = (
-    collect_submodules('tastytrade')
-    + collect_submodules('pandas_market_calendars')
-    + ['websockets', 'httpx', 'pydantic']
-)
-_datas = (
-    collect_data_files('tastytrade')
-    + collect_data_files('pandas_market_calendars')
-)
-
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=_datas,
-    hiddenimports=_hidden,
+    datas=[],
+    hiddenimports=['websockets'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
