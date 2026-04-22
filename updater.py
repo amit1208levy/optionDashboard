@@ -1,8 +1,14 @@
 """Git-based updater — check GitHub for new commits, pull, relaunch."""
 import os
 import subprocess
+import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _is_frozen_bundle() -> bool:
+    """Running inside a PyInstaller .app bundle (not a live git checkout)?"""
+    return getattr(sys, "frozen", False) or "Contents/Resources" in HERE
 
 
 def _git(*args, timeout=15):
@@ -33,9 +39,12 @@ def check_latest():
         "notes":  recent commit subjects (joined),
         "error":  str }
     """
-    if not is_git_repo():
-        return {"available": False, "latest": "", "local": "", "notes": "",
-                "error": "Not a git checkout — reinstall from GitHub."}
+    # Bundled .app: there's no live repo inside, so auto-update can't work
+    # via git.  Return "no update available" silently — the user will get
+    # new versions through a replacement .app rather than git pull.
+    if _is_frozen_bundle() or not is_git_repo():
+        return {"available": False, "latest": "", "local": "",
+                "notes": "", "error": ""}
 
     # Allow up to 45 s on slow connections; retry once before giving up.
     ok, _, err = _git("fetch", "--quiet", "origin", timeout=45)
