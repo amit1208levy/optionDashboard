@@ -94,7 +94,7 @@ def _is_external_money_movement(t: dict) -> bool:
     if any(kw in sub for kw in _EXPLICIT_EXTERNAL_SUBTYPES):
         return True
 
-    # Ambiguous "transfer" → inspect description
+    # Ambiguous "transfer" → inspect description first, then default external
     if "transfer" in sub:
         # Any TT account number (e.g. 5WZ12345) in the description means
         # it's a transfer BETWEEN two TT accounts — treat as internal.
@@ -102,11 +102,12 @@ def _is_external_money_movement(t: dict) -> bool:
             return False
         if any(kw in desc for kw in _INTERNAL_HINTS):
             return False
-        if any(kw in desc for kw in _EXTERNAL_HINTS):
-            return True
-        # Default for unlabeled Transfers: treat as internal so we never
-        # erroneously inflate P&L by counting a cash move between accounts.
-        return False
+        # Default: treat as external cash flow (subtract from P&L).
+        # Most users' transfers are bank deposits/withdrawals; the less-
+        # common case of an internal transfer between two TT accounts gets
+        # tagged with a TT account number or "internal" in the description
+        # which the checks above already catch.
+        return True
 
     return False
 
