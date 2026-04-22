@@ -417,6 +417,29 @@ def get_futures_active_contracts(token, roots):
         return {}
 
 
+def get_option_chain(token, symbol):
+    """
+    Fetch the nested option chain for an equity/ETF symbol.
+    Returns a list of expirations, each with strikes + call/put OCC symbols.
+    Silently returns [] on error.
+    """
+    if not symbol:
+        return []
+    try:
+        r = requests.get(
+            f"{BASE}/option-chains/{symbol}/nested",
+            headers=auth_headers(token), timeout=15,
+        )
+        if r.status_code != 200:
+            return []
+        items = r.json().get("data", {}).get("items", []) or []
+        if not items:
+            return []
+        return items[0].get("expirations", []) or []
+    except requests.exceptions.RequestException:
+        return []
+
+
 def get_market_data(token, equity_options=None, future_options=None, equities=None, futures=None):
     """
     Snapshot quotes + Greeks for options and stocks/futures. Returns {symbol: quote dict}.

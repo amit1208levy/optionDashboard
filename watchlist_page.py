@@ -307,9 +307,104 @@ class _FetchWorker(QThread):
 
 # ── Position sizer dialog ─────────────────────────────────────────────────────
 
+class _PremiumFetchWorker(QThread):
+    """Fetch the option-chain closest to (target_dte, target_delta) and
+    return the mark price + the actual delta/DTE that matched."""
+    done = pyqtSignal(dict)   # {"premium": float, "delta": float, "dte": int, "strike": float, "error": str}
+
+    def __init__(self, token, ticker, target_dte, target_delta_pct, direction="call"):
+        super().__init__()
+        self.token          = token
+        self.ticker         = ticker
+        self.target_dte     = target_dte
+        self.target_delta   = target_delta_pct / 100.0   # slider is 20 → 0.20
+        self.direction      = direction    # "call" or "put"
+
+    def run(self):
+        from datetime import date
+        from collections import OrderedDict
+        try:
+            expirations = api.get_option_chain(self.token, self.ticker)
+            if not expirations:
+                self.done.emit({"error": "no option chain"})
+                return
+
+            # Pick the expiration closest to target DTE
+            today = date.today()
+            def dte_for(exp):
+                raw = exp.get("expiration-date") or ""
+                try:
+                    return (date.fromisoformat(raw[:10]) - today).days
+                except ValueError:
+                    return 10**9
+            best_exp = min(expirations, key=lambda e: abs(dte_for(e) - self.target_dte))
+            actual_dte = dte_for(best_exp)
+
+            # Collect option symbols for all strikes at that expiration
+            strikes = best_exp.get("strikes", []) or []
+            if not strikes:
+                self.done.emit({"error": "no strikes"})
+                return
+
+            sym_key = "call" if self.direction == "call" else "put"
+            sym_to_strike = {}
+            syms = []
+            for s in strikes:
+                sym = s.get(sym_key)
+                if sym:
+                    syms.append(sym)
+                    try:
+                        sym_to_strike[sym] = float(s.get("strike-price") or 0)
+                    except (TypeError, ValueError):
+                        sym_to_strike[sym] = 0.0
+
+            # Fetch market data (mark + delta) for all these option symbols
+            quotes = api.get_market_data(self.token, equity_options=syms)
+
+            # Find the strike whose |delta| is closest to our target
+            best_sym, best_gap = None, 99.0
+            for sym in syms:
+                q = quotes.get(sym) or {}
+                try:
+                    d = abs(float(q.get("delta") or 0))
+                except (TypeError, ValueError):
+                    continue
+                gap = abs(d - self.target_delta)
+                if gap < best_gap:
+                    best_gap, best_sym = gap, sym
+            if not best_sym:
+                self.done.emit({"error": "no deltas returned (market closed?)"})
+                return
+
+            q   = quotes[best_sym]
+            try:
+                bid = float(q.get("bid") or 0)
+                ask = float(q.get("ask") or 0)
+                mark = (bid + ask) / 2.0 if (bid > 0 and ask > 0) else float(q.get("mark") or 0)
+            except (TypeError, ValueError):
+                mark = 0.0
+            try:
+                delta = abs(float(q.get("delta") or 0))
+            except (TypeError, ValueError):
+                delta = 0.0
+
+            self.done.emit({
+                "premium": mark,
+                "delta":   delta,
+                "dte":     actual_dte,
+                "strike":  sym_to_strike.get(best_sym, 0.0),
+                "error":   "",
+            })
+        except Exception as e:
+            self.done.emit({"error": str(e)})
+
+
 class PositionSizerDialog(QDialog):
-    def __init__(self, ticker, price, nlv, parent=None):
+    def __init__(self, ticker, price, nlv, parent=None, token=None):
         super().__init__(parent)
+        self.ticker = ticker
+        self.token  = token
+        self._fetch_worker = None
         self.setWindowTitle(f"Position Sizer — {ticker}")
         self.setMinimumWidth(460)
         self.setStyleSheet(f"background: {T.BG}; color: {T.TEXT};")
@@ -340,12 +435,13 @@ class PositionSizerDialog(QDialog):
             "Stock / ETF  (equity)",
         ])
         self.strategy_combo.currentIndexChanged.connect(self._recalc)
+        self.strategy_combo.currentIndexChanged.connect(self._auto_fetch_premium)
         lay.addWidget(self.strategy_combo)
 
         self._lbl(lay, "Max capital allocation  (% of NLV)")
         pct_row = QHBoxLayout()
         self.pct_slider = QSlider(Qt.Orientation.Horizontal)
-        self.pct_slider.setRange(1, 20)
+        self.pct_slider.setRange(1, 100)
         self.pct_slider.setValue(5)
         self.pct_slider.valueChanged.connect(self._recalc)
         self.pct_val = QLabel("5%")
@@ -355,15 +451,25 @@ class PositionSizerDialog(QDialog):
         pct_row.addWidget(self.pct_val)
         lay.addLayout(pct_row)
 
+        # Warning shown when allocation exceeds safe threshold
+        self.pct_warn_lbl = QLabel("")
+        self.pct_warn_lbl.setStyleSheet(
+            f"color: {T.YELLOW}; font-size: 10px; border: none; "
+            f"background: transparent; padding-top: 2px;"
+        )
+        self.pct_warn_lbl.setWordWrap(True)
+        lay.addWidget(self.pct_warn_lbl)
+
         self._sep(lay)
 
-        self._lbl(lay, "Premium per contract  (option price as shown on chain)")
+        self._lbl(lay, "Premium per contract  (auto-fetched from option chain)")
         cp_row = QHBoxLayout()
         self.cp_spin = QDoubleSpinBox()
         self.cp_spin.setRange(0.01, 99_999)
         self.cp_spin.setDecimals(2)
         self.cp_spin.setSingleStep(0.10)
         self.cp_spin.setValue(max(round(price * 0.02 * 4) / 4, 0.05))
+        self._match_lbl = QLabel("")   # shows matched DTE/delta after auto-fetch
         self.cp_spin.setStyleSheet(
             f"QDoubleSpinBox {{ background: {T.CARD}; color: {T.TEXT}; "
             f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 4px 8px; }}"
@@ -394,12 +500,20 @@ class PositionSizerDialog(QDialog):
         cp_row.addStretch()
         lay.addLayout(cp_row)
 
-        self._lbl(lay, "Delta  (of the option leg, e.g. 20 = 20Δ)")
+        # Match-info line (populated by _auto_fetch_premium)
+        self._match_lbl.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 10px; border: none; "
+            f"background: transparent; padding-left: 2px;"
+        )
+        lay.addWidget(self._match_lbl)
+
+        self._lbl(lay, "Delta  (of the option leg — e.g. 20 = 20Δ; 50+ = ITM)")
         delta_row = QHBoxLayout()
         self.delta_slider = QSlider(Qt.Orientation.Horizontal)
-        self.delta_slider.setRange(1, 50)
+        self.delta_slider.setRange(1, 95)
         self.delta_slider.setValue(20)
         self.delta_slider.valueChanged.connect(self._recalc)
+        self.delta_slider.sliderReleased.connect(self._auto_fetch_premium)
         self.delta_val = QLabel("20Δ")
         self.delta_val.setFixedWidth(42)
         self.delta_val.setStyleSheet(f"color: {T.ACCENT}; font-weight: bold; border: none;")
@@ -407,12 +521,13 @@ class PositionSizerDialog(QDialog):
         delta_row.addWidget(self.delta_val)
         lay.addLayout(delta_row)
 
-        self._lbl(lay, "Estimated DTE  (days to expiration)")
+        self._lbl(lay, "Estimated DTE  (1d – 2y, for LEAPs)")
         dte_row = QHBoxLayout()
         self.dte_slider = QSlider(Qt.Orientation.Horizontal)
-        self.dte_slider.setRange(1, 180)
+        self.dte_slider.setRange(1, 730)
         self.dte_slider.setValue(45)
         self.dte_slider.valueChanged.connect(self._recalc)
+        self.dte_slider.sliderReleased.connect(self._auto_fetch_premium)
         self.dte_val = QLabel("45d")
         self.dte_val.setFixedWidth(42)
         self.dte_val.setStyleSheet(f"color: {T.ACCENT}; font-weight: bold; border: none;")
@@ -470,6 +585,50 @@ class PositionSizerDialog(QDialog):
         self.price = price
         self._recalc()
 
+        # Kick off an initial auto-fetch so the premium starts accurate
+        if self.token:
+            self._auto_fetch_premium()
+
+    def _auto_fetch_premium(self):
+        """Fetch option-chain premium matching the current DTE + Delta sliders."""
+        if not self.token:
+            return
+        # Only equity/ETF options; skip for "Stock / ETF" and "Long Option"
+        idx = self.strategy_combo.currentIndex()
+        if idx == 4:   # Stock/ETF has no option premium
+            return
+        # Avoid overlapping fetches
+        if self._fetch_worker and self._fetch_worker.isRunning():
+            return
+
+        # Direction: short strategies usually price off puts; use put-side
+        # for short-put / strangle / naked-put and calls for long/naked-call.
+        direction = "put" if idx in (0, 2) else "call"
+
+        self._match_lbl.setText("Fetching option chain…")
+        self._fetch_worker = _PremiumFetchWorker(
+            self.token, self.ticker,
+            target_dte=self.dte_slider.value(),
+            target_delta_pct=self.delta_slider.value(),
+            direction=direction,
+        )
+        self._fetch_worker.done.connect(self._on_premium_fetched)
+        self._fetch_worker.start()
+
+    def _on_premium_fetched(self, result):
+        if result.get("error"):
+            self._match_lbl.setText(f"Auto-fetch failed: {result['error']} — enter manually")
+            return
+        self.cp_spin.blockSignals(True)
+        self.cp_spin.setValue(result["premium"])
+        self.cp_spin.blockSignals(False)
+        self._match_lbl.setText(
+            f"Matched: strike ${result['strike']:.2f}  ·  "
+            f"{int(result['delta']*100)}Δ  ·  {result['dte']}d  ·  "
+            f"mark ${result['premium']:.2f}"
+        )
+        self._recalc()
+
     def _sep(self, lay):
         s = QFrame()
         s.setFrameShape(QFrame.Shape.HLine)
@@ -508,6 +667,14 @@ class PositionSizerDialog(QDialog):
         self.pct_val.setText(f"{pct}%")
         self.delta_val.setText(f"{delta_raw}Δ")
         self.dte_val.setText(f"{dte}d")
+        # Allocation warning
+        if pct >= 30:
+            self.pct_warn_lbl.setText(
+                f"⚠  {pct}% is aggressive. Conventional wisdom: keep any single "
+                f"trade ≤ 30% of portfolio (5% is typical)."
+            )
+        else:
+            self.pct_warn_lbl.setText("")
         prem_per = cp * mult
         self.cp_total_lbl.setText(f"= ${prem_per:,.2f} / contract")
         sides      = 2 if idx == 0 else 1
@@ -1420,5 +1587,5 @@ class WatchlistPage(QWidget):
             idx += 1
 
     def _open_sizer(self, ticker, price, nlv):
-        dlg = PositionSizerDialog(ticker, price, nlv, self)
+        dlg = PositionSizerDialog(ticker, price, nlv, self, token=self.token)
         dlg.exec()
