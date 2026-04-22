@@ -91,11 +91,15 @@ def _tx_signed_value(t: Transaction) -> float:
 
 # ── main entry point ──────────────────────────────────────────────────────────
 
-def compute_ytd_pnl(access_token: str, account_number: str) -> Optional[dict]:
+def compute_ytd_pnl(access_token: str, account_number: str,
+                    raise_on_error: bool = False) -> Optional[dict]:
     """
     Compute YTD P&L numbers for one account using verified TastyTrade SDK
     methods.  Returns a dict on success, or None on any failure (so caller
     can fall back to a different algorithm).
+
+    Set raise_on_error=True for debugging — propagates exceptions so the
+    failing line is visible.
 
     Result dict shape:
         {
@@ -109,12 +113,9 @@ def compute_ytd_pnl(access_token: str, account_number: str) -> Optional[dict]:
     """
     try:
         session = make_oauth_session(access_token)
-        account = Account.__new__(Account)
-        account.account_number = account_number
-        # Pydantic v2 needs every required field set; be defensive.
-        for f in Account.model_fields:
-            if not hasattr(account, f):
-                setattr(account, f, None)
+        # Pydantic v2: must use model_construct() to skip validation but still
+        # set up internal model state.  __new__ alone leaves the object broken.
+        account = Account.model_construct(account_number=account_number)
 
         year       = date.today().year
         year_start = datetime(year, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
@@ -127,11 +128,19 @@ def compute_ytd_pnl(access_token: str, account_number: str) -> Optional[dict]:
         nl_history = account.get_net_liquidating_value_history(
             session, start_time=year_start
         )
-        # The endpoint actually returns history starting AT or just AFTER
-        # start_time, so the earliest entry is approximately our year-open
-        # NetLiq.  If it's empty, no YTD activity → use current NetLiq.
+        # The endpoint returns history starting AT or just AFTER start_time,
+        # so the earliest entry is approximately year-open NetLiq.
         if nl_history:
-            year_start_nl = _to_float(nl_history[0].close)
+            # Snapshot objects use either `.close` or `.net-liquidating-value`
+            # depending on SDK version — try both.
+            first = nl_history[0]
+            year_start_nl = (
+                _to_float(getattr(first, "close", None))
+                or _to_float(getattr(first, "net_liquidating_value", None))
+                or _to_float(getattr(first, "open", None))
+            )
+            if not year_start_nl:
+                year_start_nl = current_nl
         else:
             year_start_nl = current_nl
 
@@ -145,8 +154,6 @@ def compute_ytd_pnl(access_token: str, account_number: str) -> Optional[dict]:
             if ttype in ("trade", "receive deliver"):
                 ytd_fees += _tx_fees(t)
             elif ttype == "money movement":
-                # Includes deposits, withdrawals, transfers, interest.
-                # value carries the sign already.
                 net_deposits += _tx_signed_value(t)
 
         # ── 4. Apply the formula ─────────────────────────────────────────────
@@ -163,4 +170,6 @@ def compute_ytd_pnl(access_token: str, account_number: str) -> Optional[dict]:
         }
 
     except Exception:
+        if raise_on_error:
+            raise
         return None
