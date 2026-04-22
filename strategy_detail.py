@@ -833,10 +833,45 @@ class StrategyDetailPage(QWidget):
     # ── Payoff chart ────────────────────────────────────────────────────────
 
     def _build_chart_card(self):
-        frame, lay = self._section_frame("Payoff at Expiration")
-        chart = PayoffChart(self.strategy, height=3.6)
-        chart.setMinimumHeight(320)
-        lay.addWidget(chart)
+        # Group legs by underlying root — multi-ticker strategies get one
+        # payoff chart per underlying, since each curve is only meaningful
+        # against a single underlying's price axis.
+        from collections import OrderedDict
+        from models import Strategy as _Strategy
+        groups: "OrderedDict[str, list]" = OrderedDict()
+        for leg in self.strategy.legs:
+            root = leg.root or leg.underlying or "—"
+            groups.setdefault(root, []).append(leg)
+
+        # Single ticker → original behavior
+        if len(groups) <= 1:
+            frame, lay = self._section_frame("Payoff at Expiration")
+            chart = PayoffChart(self.strategy, height=3.6)
+            chart.setMinimumHeight(320)
+            lay.addWidget(chart)
+            return frame
+
+        # Multi-ticker → one chart per underlying, stacked vertically
+        frame, lay = self._section_frame(
+            f"Payoff at Expiration ({len(groups)} underlyings)"
+        )
+        for root, legs in groups.items():
+            sub_label = QLabel(root)
+            sub_label.setStyleSheet(
+                f"color: {T.ACCENT}; font-size: 12px; font-weight: bold; "
+                f"border: none; background: transparent; padding-top: 10px;"
+            )
+            lay.addWidget(sub_label)
+
+            sub_strategy = _Strategy(
+                f"{self.strategy.key}:{root}",
+                legs,
+                custom_name=root,
+                is_custom=True,
+            )
+            chart = PayoffChart(sub_strategy, height=3.0)
+            chart.setMinimumHeight(260)
+            lay.addWidget(chart)
         return frame
 
     # ── Legs table ──────────────────────────────────────────────────────────
