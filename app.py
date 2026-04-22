@@ -157,7 +157,12 @@ class PortfolioWorker(QThread):
             fu_opts = [p.symbol for p in positions
                        if p.is_option and p.instrument_type == "Future Option"]
             equities = [p.symbol for p in positions
-                        if not p.is_option and p.instrument_type == "Equity"]
+                        if not p.is_option and not p.is_future
+                        and p.instrument_type == "Equity"]
+            # Pure futures (not options) need quotes via the futures= param,
+            # not equities= — the API distinguishes by symbol type.
+            futures = [p.symbol for p in positions
+                       if not p.is_option and p.is_future]
 
             # Futures need "/" prefix on /market-metrics queries; equities
             # don't.  Determine which roots are futures by checking whether
@@ -172,7 +177,8 @@ class PortfolioWorker(QThread):
                 f_quotes  = ex.submit(api.get_market_data, self.token,
                                       equity_options=eq_opts,
                                       future_options=fu_opts,
-                                      equities=equities)
+                                      equities=equities,
+                                      futures=futures)
                 f_metrics = ex.submit(api.get_market_metrics, self.token, metric_syms)
                 quotes  = f_quotes.result()
                 metrics = f_metrics.result()

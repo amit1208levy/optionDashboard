@@ -97,6 +97,10 @@ class Position:
 
         self.call_put, self.strike = parse_option_symbol(self.symbol)
         self.is_option = self.call_put in ("C", "P")
+        # is_future: any futures-derived position (Future, Future Option, etc.)
+        # Futures differ from equities: notional ≠ cash, delta = 1 per contract
+        # times multiplier, no shares concept.
+        self.is_future = "future" in (self.instrument_type or "").lower()
 
         # Monetary (cost basis / market value always positive)
         notional_open = self.quantity * self.multiplier * self.avg_open_price
@@ -259,7 +263,12 @@ class Strategy:
         n = len(legs)
         if n == 1:
             l = legs[0]
-            return f"{l.direction_label} {l.type_label}" if l.is_option else f"{l.direction_label} Shares"
+            if l.is_option:
+                return f"{l.direction_label} {l.type_label}"
+            # Differentiate futures contracts from stock shares
+            if l.is_future:
+                return f"{l.direction_label} {l.root} Future"
+            return f"{l.direction_label} Shares"
         if n == 2 and len(opts) == 2:
             a, b = sorted(opts, key=lambda l: (l.strike or 0))
             if a.call_put == b.call_put:
@@ -1154,16 +1163,27 @@ def portfolio_greeks(positions, metrics_by_root=None):
     metrics_by_root = metrics_by_root or {}
 
     for p in positions:
-        if not p.is_option:
+        if p.is_option:
+            sign = p.sign  # +1 long / -1 short
+            # Equity options: greeks are per-share; 100 shares per contract.
+            # Futures options: greeks are already per-contract; no extra multiplier.
+            mult = 100 if not _is_future_option(p.instrument_type) else 1
+            d = _to_float(p.delta) * p.quantity * mult * sign
+            g = _to_float(p.gamma) * p.quantity * mult * sign
+            t = _to_float(p.theta) * p.quantity * mult * sign
+            v = _to_float(p.vega)  * p.quantity * mult * sign
+        elif p.is_future:
+            # Pure futures contract: linear payoff, delta = 1 per $1 move in
+            # underlying × contract multiplier.  No gamma/theta/vega.
+            d = p.sign * p.quantity * (p.multiplier or 1)
+            g = t = v = 0.0
+        elif p.instrument_type == "Equity":
+            # Stock: delta = 1 per share.
+            d = p.sign * p.quantity
+            g = t = v = 0.0
+        else:
             continue
-        sign = p.sign  # +1 long / -1 short
-        # Equity options: greeks are per-share; 100 shares per contract.
-        # Futures options: greeks are already per-contract; no extra multiplier.
-        mult = 100 if not _is_future_option(p.instrument_type) else 1
-        d = _to_float(p.delta) * p.quantity * mult * sign
-        g = _to_float(p.gamma) * p.quantity * mult * sign
-        t = _to_float(p.theta) * p.quantity * mult * sign
-        v = _to_float(p.vega)  * p.quantity * mult * sign
+
         net_delta += d
         net_gamma += g
         net_theta += t
