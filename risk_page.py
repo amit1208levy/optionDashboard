@@ -214,78 +214,196 @@ def _bw_gamma(positions, metrics_by_root) -> float:
     return total
 
 
-def _draw_spy_chart(canvas: FigureCanvasQTAgg,
+class _ScenarioChart(QFrame):
+    """
+    Scenario chart wrapper with hover tooltip + zoom buttons.
+    Used for both SPY and VIX scenario charts on the Risk page.
+    """
+
+    def __init__(self, parent=None, height_px=300):
+        super().__init__(parent)
+        self.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 10px; }}"
+        )
+        self.setFixedHeight(height_px + 12)
+
+        # Canvas
+        self.canvas = _make_canvas(width_px=800, height_px=height_px)
+        self.canvas.setParent(self)
+
+        # Zoom buttons overlaid top-right
+        self.zoom_in_btn  = self._zoom_btn("＋", self)
+        self.zoom_out_btn = self._zoom_btn("－", self)
+        self.zoom_in_btn.clicked.connect(self._on_zoom_in)
+        self.zoom_out_btn.clicked.connect(self._on_zoom_out)
+
+        # Hover state
+        self._xs: list = []
+        self._ys: list = []
+        self._cursor_line = None
+        self._cursor_dot  = None
+        self._annot       = None
+        self._ax          = None
+        self._zoom_factor = 1.0
+        self._base_xmin   = 0.0
+        self._base_xmax   = 0.0
+        self._center      = 0.0      # current x (SPY or VIX)
+        self._fmt_x       = lambda v: f"{v:,.2f}"
+        self._fmt_y       = lambda v: f"{v:,.2f}"
+        self._xlabel      = "X"
+        self._ylabel      = "Y"
+
+        self.canvas.mpl_connect("motion_notify_event", self._on_motion)
+
+    def _zoom_btn(self, text, parent):
+        btn = QPushButton(text, parent)
+        btn.setFixedSize(26, 24)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(
+            f"QPushButton {{ background: {T.BG_ALT}; color: {T.TEXT}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 4px; "
+            f"font-size: 14px; font-weight: bold; padding: 0; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+        )
+        return btn
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        w, h = self.width(), self.height()
+        self.canvas.setGeometry(0, 0, w, h - 12)
+        # Zoom buttons in top-right corner
+        self.zoom_out_btn.move(w - 64, 8)
+        self.zoom_in_btn.move(w - 34, 8)
+        self.zoom_out_btn.raise_()
+        self.zoom_in_btn.raise_()
+
+    # ── plotting (called by subclass-like closures) ──────────────────────────
+
+    def draw(self, x: np.ndarray, y: np.ndarray, center: float,
+             accent: str, xlabel: str, ylabel: str,
+             fmt_x, fmt_y):
+        self._xs = list(x)
+        self._ys = list(y)
+        self._center = center
+        self._base_xmin = float(x.min())
+        self._base_xmax = float(x.max())
+        self._zoom_factor = 1.0
+        self._fmt_x = fmt_x
+        self._fmt_y = fmt_y
+        self._xlabel = xlabel
+        self._ylabel = ylabel
+
+        fig = self.canvas.figure
+        fig.clear()
+        fig.patch.set_facecolor(T.CARD)
+        ax  = fig.add_subplot(111)
+        self._ax = ax
+
+        y0 = y[(np.abs(x - center)).argmin()] if len(x) else 0
+        ax.axhline(y0, color=T.MUTED, linewidth=0.8, linestyle="--", alpha=0.6)
+        ax.axvline(center, color=T.BORDER_H, linewidth=0.6, linestyle=":", alpha=0.6)
+        ax.fill_between(x, y0, y, where=(y >  y0), alpha=0.18,
+                        color=T.GREEN, interpolate=True)
+        ax.fill_between(x, y0, y, where=(y <= y0), alpha=0.18,
+                        color=T.RED,   interpolate=True)
+        ax.plot(x, y, color=accent, linewidth=1.8)
+        ax.scatter([center], [y0], color=T.ACCENT, zorder=5, s=30)
+
+        _style_ax(ax, xlabel=xlabel, ylabel=ylabel)
+        ax.xaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: fmt_x(v)))
+        ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: fmt_y(v)))
+
+        # Hover cursor
+        self._cursor_line = ax.axvline(x[0], color=T.ACCENT, linewidth=0.8,
+                                       alpha=0.5, visible=False)
+        self._cursor_dot, = ax.plot([x[0]], [y[0]], "o", color=T.ACCENT,
+                                    markersize=5, visible=False)
+        self._annot = ax.annotate(
+            "", xy=(0, 0), xytext=(10, 12), textcoords="offset points",
+            ha="left", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.4", fc=T.BG_ALT, ec=T.BORDER, alpha=0.95),
+            color=T.TEXT, fontsize=9, visible=False,
+        )
+        self.canvas.draw()
+
+    def _apply_zoom(self):
+        if not self._ax:
+            return
+        half = (self._base_xmax - self._base_xmin) / 2.0 * self._zoom_factor
+        self._ax.set_xlim(self._center - half, self._center + half)
+        self.canvas.draw_idle()
+
+    def _on_zoom_in(self):
+        self._zoom_factor = max(self._zoom_factor * 0.75, 0.1)
+        self._apply_zoom()
+
+    def _on_zoom_out(self):
+        self._zoom_factor = min(self._zoom_factor / 0.75, 4.0)
+        self._apply_zoom()
+
+    def _on_motion(self, event):
+        if event.inaxes != self._ax or not self._xs:
+            self._hide_cursor()
+            return
+        x = event.xdata
+        if x is None:
+            self._hide_cursor()
+            return
+        idx = min(range(len(self._xs)), key=lambda i: abs(self._xs[i] - x))
+        sx, sy = self._xs[idx], self._ys[idx]
+        self._cursor_line.set_xdata([sx, sx])
+        self._cursor_line.set_visible(True)
+        self._cursor_dot.set_data([sx], [sy])
+        self._cursor_dot.set_visible(True)
+        self._annot.xy = (sx, sy)
+        self._annot.set_text(
+            f"{self._xlabel}: {self._fmt_x(sx)}\n"
+            f"{self._ylabel}: {self._fmt_y(sy)}"
+        )
+        self._annot.set_visible(True)
+        self.canvas.draw_idle()
+
+    def _hide_cursor(self):
+        if self._cursor_line is None:
+            return
+        self._cursor_line.set_visible(False)
+        self._cursor_dot.set_visible(False)
+        self._annot.set_visible(False)
+        self.canvas.draw_idle()
+
+
+def _draw_spy_chart(chart: "_ScenarioChart",
                     spy: float, net_liq: float,
                     bwd: float, bwg: float):
-    """
-    SPY scenario chart.
-    X: SPY price  (±25 % of current).  Y: account value / SPY price.
-    """
-    fig = canvas.figure
-    fig.clear()
-    fig.patch.set_facecolor(T.CARD)
-    ax  = fig.add_subplot(111)
-
+    """SPY scenario chart — account value / SPY across ±25% price range."""
     x   = np.linspace(spy * 0.75, spy * 1.25, 400)
     ds  = x - spy
     pnl = bwd * ds + 0.5 * bwg * ds ** 2
     y   = (net_liq + pnl) / x
-    y0  = net_liq / spy
-
-    ax.axhline(y0,  color=T.MUTED,   linewidth=0.8, linestyle="--", alpha=0.6)
-    ax.axvline(spy, color=T.BORDER_H, linewidth=0.6, linestyle=":",  alpha=0.6)
-
-    ax.fill_between(x, y0, y, where=(y >  y0), alpha=0.18,
-                    color=T.GREEN, interpolate=True)
-    ax.fill_between(x, y0, y, where=(y <= y0), alpha=0.18,
-                    color=T.RED,   interpolate=True)
-    ax.plot(x, y, color=T.ACCENT, linewidth=1.8)
-    ax.scatter([spy], [y0], color=T.ACCENT, zorder=5, s=30)
-
-    _style_ax(ax, xlabel="SPY Price ($)", ylabel="Account / SPY (shares equiv)")
-    ax.yaxis.set_major_formatter(
-        matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}")
+    chart.draw(
+        x, y, center=spy, accent=T.ACCENT,
+        xlabel="SPY Price", ylabel="Account / SPY",
+        fmt_x=lambda v: f"${v:,.0f}",
+        fmt_y=lambda v: f"{v:,.2f}",
     )
-    ax.xaxis.set_major_formatter(
-        matplotlib.ticker.FuncFormatter(lambda v, _: f"${v:,.0f}")
-    )
-    canvas.draw()
 
 
-def _draw_vix_chart(canvas: FigureCanvasQTAgg,
+def _draw_vix_chart(chart: "_ScenarioChart",
                     vix: float, net_liq: float, net_vega: float):
-    """
-    VIX scenario chart.
-    X: VIX level, Y: account value / VIX level.
-    """
-    fig = canvas.figure
-    fig.clear()
-    fig.patch.set_facecolor(T.CARD)
-    ax  = fig.add_subplot(111)
-
+    """VIX scenario chart — account value / VIX across 0.4×–2.5× current VIX."""
     x_min = max(5.0,  vix * 0.4)
     x_max = min(80.0, vix * 2.5)
     x   = np.linspace(x_min, x_max, 400)
     dv  = x - vix
     pnl = net_vega * dv
     y   = (net_liq + pnl) / x
-    y0  = net_liq / vix
-
-    ax.axhline(y0,  color=T.MUTED,   linewidth=0.8, linestyle="--", alpha=0.6)
-    ax.axvline(vix, color=T.BORDER_H, linewidth=0.6, linestyle=":",  alpha=0.6)
-
-    ax.fill_between(x, y0, y, where=(y >  y0), alpha=0.18,
-                    color=T.GREEN, interpolate=True)
-    ax.fill_between(x, y0, y, where=(y <= y0), alpha=0.18,
-                    color=T.RED,   interpolate=True)
-    ax.plot(x, y, color=T.ACCENT, linewidth=1.8)
-    ax.scatter([vix], [y0], color=T.ACCENT, zorder=5, s=30)
-
-    _style_ax(ax, xlabel="VIX Level", ylabel="Account / VIX")
-    ax.yaxis.set_major_formatter(
-        matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}")
+    chart.draw(
+        x, y, center=vix, accent=T.ACCENT,
+        xlabel="VIX", ylabel="Account / VIX",
+        fmt_x=lambda v: f"{v:.1f}",
+        fmt_y=lambda v: f"{v:,.2f}",
     )
-    canvas.draw()
 
 
 # ── main page ─────────────────────────────────────────────────────────────────
@@ -297,8 +415,8 @@ class RiskPage(QWidget):
         super().__init__(parent)
         self.portfolio = portfolio
         self._worker   = None
-        self._spy_canvas = None
-        self._vix_canvas = None
+        self._spy_chart = None
+        self._vix_chart = None
         self.setStyleSheet(T.BASE_STYLE)
 
         root_lay = QVBoxLayout(self)
@@ -418,13 +536,6 @@ class RiskPage(QWidget):
             err.setWordWrap(True)
             self.body.addWidget(err)
             self.body.addStretch()
-
-    def _on_prices(self, spy: float, vix: float,
-                   net_liq: float, bwd: float, bwg: float, net_vega: float):
-        if self._spy_canvas:
-            _draw_spy_chart(self._spy_canvas, spy, net_liq, bwd, bwg)
-        if self._vix_canvas:
-            _draw_vix_chart(self._vix_canvas, vix, net_liq, net_vega)
 
     # ── pie chart helper ──────────────────────────────────────────────────────
 
@@ -579,11 +690,10 @@ class RiskPage(QWidget):
     # ── chart sections ────────────────────────────────────────────────────────
 
     def _build_chart_section(self, title: str, accent_color: str, key: str):
-        """Create a card with a section header and an embedded matplotlib canvas."""
+        """Create a card with a section header and an embedded scenario chart."""
         self.body.addWidget(self._section_header(title))
         card, lay = self._card_frame()
 
-        # Loading placeholder shown while worker fetches prices
         loading = QLabel("Fetching market data…")
         loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
         loading.setStyleSheet(
@@ -591,30 +701,28 @@ class RiskPage(QWidget):
         )
         lay.addWidget(loading)
 
-        # Canvas (hidden until prices arrive)
-        canvas = _make_canvas(width_px=800, height_px=300)
-        canvas.setVisible(False)
-        lay.addWidget(canvas)
+        chart = _ScenarioChart(height_px=300)
+        chart.setVisible(False)
+        lay.addWidget(chart)
 
         self.body.addWidget(card)
 
-        # Store canvas + loading label so we can swap them in _on_prices
         if key == "spy":
-            self._spy_canvas   = canvas
-            self._spy_loading  = loading
+            self._spy_chart   = chart
+            self._spy_loading = loading
         else:
-            self._vix_canvas   = canvas
-            self._vix_loading  = loading
+            self._vix_chart   = chart
+            self._vix_loading = loading
 
     def _on_prices(self, spy: float, vix: float,
                    net_liq: float, bwd: float, bwg: float, net_vega: float):
         """Called on GUI thread when the price worker completes."""
-        if self._spy_canvas:
-            _draw_spy_chart(self._spy_canvas, spy, net_liq, bwd, bwg)
+        if getattr(self, "_spy_chart", None):
+            _draw_spy_chart(self._spy_chart, spy, net_liq, bwd, bwg)
             self._spy_loading.setVisible(False)
-            self._spy_canvas.setVisible(True)
+            self._spy_chart.setVisible(True)
 
-        if self._vix_canvas:
-            _draw_vix_chart(self._vix_canvas, vix, net_liq, net_vega)
+        if getattr(self, "_vix_chart", None):
+            _draw_vix_chart(self._vix_chart, vix, net_liq, net_vega)
             self._vix_loading.setVisible(False)
-            self._vix_canvas.setVisible(True)
+            self._vix_chart.setVisible(True)
