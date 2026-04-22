@@ -94,19 +94,18 @@ def _is_external_money_movement(t: dict) -> bool:
     if any(kw in sub for kw in _EXPLICIT_EXTERNAL_SUBTYPES):
         return True
 
-    # Ambiguous "transfer" → inspect description first, then default external
+    # Ambiguous "transfer" → inspect description for explicit "internal"
+    # hints, otherwise treat as external cash flow.
     if "transfer" in sub:
-        # Any TT account number (e.g. 5WZ12345) in the description means
-        # it's a transfer BETWEEN two TT accounts — treat as internal.
-        if _TT_ACCT_RE.search(desc):
-            return False
+        # TastyTrade's own P/L calculation treats every transfer (even
+        # between two of a user's own accounts) as a cash deposit/withdrawal
+        # on each account individually.  So we only consider a transfer
+        # "internal" (skip from P&L) when the description is UNAMBIGUOUSLY
+        # one — e.g. "journal entry", "sweep", "margin transfer".  Merely
+        # mentioning another account number is not enough: TT shows the
+        # source/dest account in every transfer description.
         if any(kw in desc for kw in _INTERNAL_HINTS):
             return False
-        # Default: treat as external cash flow (subtract from P&L).
-        # Most users' transfers are bank deposits/withdrawals; the less-
-        # common case of an internal transfer between two TT accounts gets
-        # tagged with a TT account number or "internal" in the description
-        # which the checks above already catch.
         return True
 
     return False
