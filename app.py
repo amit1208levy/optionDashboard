@@ -711,13 +711,18 @@ class PortfolioScreen(QWidget):
             )
 
     def _toggle_live(self, on):
-        self._style_live_btn(on, streaming=False)
         if on:
+            # Show "Connecting…" (or "Live" if we've learned WS isn't available)
+            mode = "rest" if getattr(self, "_ws_unavailable", False) else "connecting"
+            self._style_live_btn(True, streaming=False, mode=mode)
             self._live_timer.start()
             self._start_streamer()
         else:
+            # Clicking OFF — cancel any in-progress connect immediately and
+            # go back to the "not live" state.
             self._live_timer.stop()
             self._stop_streamer()
+            self._style_live_btn(False)
 
     def _start_streamer(self):
         """Create and start the DXLink quote streamer."""
@@ -759,6 +764,13 @@ class PortfolioScreen(QWidget):
     def _on_streamer_status(self, status: str):
         """Handle QuoteStreamer status changes on the GUI thread."""
         print(f"[streamer] status → {status!r}", file=sys.stderr, flush=True)
+
+        # If Live mode was turned off, or we already marked WS as unavailable,
+        # ignore any late in-flight status events (the worker might still be
+        # emitting "connecting" from inside its retry loop while we shut down).
+        if not self.live_btn.isChecked() or getattr(self, "_ws_unavailable", False):
+            return
+
         if status == "connected":
             self._style_live_btn(True, streaming=True)
             self.status_lbl.setText("")
