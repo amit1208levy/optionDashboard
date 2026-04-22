@@ -1211,18 +1211,28 @@ class PortfolioScreen(QWidget):
             self.ytd_gross_lbl.setText("—")
 
         # ── YTD W/Fees  (TastyTrade formula: P/L YTD − YTD fees) ────────────
-        # Subtract every fee field on every YTD Trade / Receive-Deliver record
-        # to match what TastyTrade displays as "P/L YTD w/f".
+        # Sum every numeric field on each YTD Trade / Receive-Deliver record
+        # whose name contains "fee" or "commission".  Generic matching catches
+        # every fee TastyTrade charges (reg, exchange, clearing, options, etc.)
+        # including any new fee types they might add in the future.
         try:
             ytd_fees = 0.0
             for t in ytd_txns:
                 if (t.get("transaction-type") or "") not in ("Trade", "Receive Deliver"):
                     continue
-                for fee_key in ("commission", "clearing-fees",
-                                "proprietary-index-option-fees",
-                                "regulatory-fees", "exchange-fees"):
+                for k, v in t.items():
+                    if v is None:
+                        continue
+                    kl = str(k).lower()
+                    # Skip id/effect/description fields that carry "fee" in the
+                    # name but aren't amounts.
+                    if not ("fee" in kl or "commission" in kl):
+                        continue
+                    if kl.endswith("-effect") or kl.endswith("-id") \
+                            or "description" in kl:
+                        continue
                     try:
-                        ytd_fees += abs(float(t.get(fee_key) or 0))
+                        ytd_fees += abs(float(v))
                     except (TypeError, ValueError):
                         pass
 
