@@ -243,49 +243,59 @@ class _FetchWorker(QThread):
 
         # Known futures roots — these should always resolve as futures, not as
         # accidentally-matching stock tickers (e.g. "ES" the equity is
-        # Eversource Energy at ~$66, NOT E-mini S&P at ~$5,800).  Source of
-        # truth is the contract-multiplier table in models.py.
+        # Eversource Energy at ~$66, NOT E-mini S&P at ~$5,800).
         from models import _CONTRACT_MULT
+        from concurrent.futures import ThreadPoolExecutor
         known_futures_roots = set(_CONTRACT_MULT.keys())
 
         futures_tickers = [t for t in self.tickers
                            if t.startswith("/") or t in known_futures_roots]
         equity_tickers  = [t for t in self.tickers if t not in futures_tickers]
+        roots = [t.lstrip("/") for t in futures_tickers]
 
-        # Fetch equities + equity metrics in the usual way
-        metrics = api.get_market_metrics(self.token, equity_tickers) if equity_tickers else {}
-        quotes  = api.get_market_data(self.token, equities=equity_tickers) if equity_tickers else {}
+        # ── Fire ALL independent API calls in parallel ──────────────────────
+        # Old path ran these sequentially (~1.2s total).  In parallel the
+        # whole fetch is bounded by the slowest single call (~250ms).
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            f_eq_m  = ex.submit(api.get_market_metrics, self.token, equity_tickers) \
+                      if equity_tickers else None
+            f_eq_q  = ex.submit(api.get_market_data, self.token, equities=equity_tickers) \
+                      if equity_tickers else None
+            f_fut_m = ex.submit(api.get_market_metrics, self.token,
+                                [f"/{r}" for r in roots]) if roots else None
+            # Futures quotes need active-contract resolution first; submit that
+            f_fut_r = ex.submit(api.get_futures_active_contracts, self.token, roots) \
+                      if roots else None
 
-        # Fetch futures separately with proper symbol format
-        if futures_tickers:
-            # Normalize: strip leading slash for lookup maps
-            roots = [t.lstrip("/") for t in futures_tickers]
+            metrics = f_eq_m.result() if f_eq_m else {}
+            quotes  = f_eq_q.result() if f_eq_q else {}
 
-            # Metrics need "/" prefix
-            fut_metrics = api.get_market_metrics(self.token, [f"/{r}" for r in roots])
-            # Store under the user-entered ticker (bare root) so lookups work
-            for r in roots:
-                for key in (f"/{r}", r):
-                    if key in fut_metrics:
-                        metrics[r] = fut_metrics[key]
-                        break
+            if roots:
+                # Merge futures metrics, keyed by bare root
+                fut_metrics = f_fut_m.result() if f_fut_m else {}
+                for r in roots:
+                    for key in (f"/{r}", r):
+                        if key in fut_metrics:
+                            metrics[r] = fut_metrics[key]
+                            break
 
-            # Quotes: resolve roots to active contract symbols, then fetch
-            root_map    = api.get_futures_active_contracts(self.token, roots)
-            fut_syms    = []
-            sym_to_root = {}
-            for root in roots:
-                contract = root_map.get(root) or f"/{root}"
-                fut_syms.append(contract)
-                sym_to_root[contract] = root
-            fut_quotes = api.get_market_data(self.token, futures=fut_syms)
-            for sym, q in fut_quotes.items():
-                root = sym_to_root.get(sym) or sym_to_root.get("/" + sym.lstrip("/"))
-                if root:
-                    quotes[root] = q
+                # Build futures quote fetch once active contracts are resolved
+                root_map = f_fut_r.result() if f_fut_r else {}
+                fut_syms    = []
+                sym_to_root = {}
+                for root in roots:
+                    contract = root_map.get(root) or f"/{root}"
+                    fut_syms.append(contract)
+                    sym_to_root[contract] = root
+                # This one runs in the main thread since we needed root_map
+                fut_quotes = api.get_market_data(self.token, futures=fut_syms)
+                for sym, q in fut_quotes.items():
+                    root = sym_to_root.get(sym) or sym_to_root.get("/" + sym.lstrip("/"))
+                    if root:
+                        quotes[root] = q
 
         # Fallback for equity tickers that returned no price (maybe they were
-        # actually futures roots we didn't know about)
+        # unknown futures roots)
         missing = [t for t in equity_tickers if not _has_price(quotes.get(t))]
         if missing:
             root_map = api.get_futures_active_contracts(self.token, missing)
@@ -1025,6 +1035,13 @@ class _TickerRow(QFrame):
 class WatchlistPage(QWidget):
     back_requested = pyqtSignal()
 
+    # Class-level cache survives widget recreations — re-opening the page
+    # within _CACHE_TTL seconds skips the fetch and renders instantly.
+    _CACHE_TTL  = 30.0                    # seconds
+    _cache      = {"ts": 0.0,
+                   "metrics": {}, "quotes": {},
+                   "tickers": set()}      # shared across all instances
+
     # ── Init ──────────────────────────────────────────────────────────────────
 
     def __init__(self, token, nlv, parent=None):
@@ -1264,7 +1281,8 @@ class WatchlistPage(QWidget):
         self.refresh_btn = QPushButton("↻  Refresh")
         self.refresh_btn.setFixedHeight(32)
         self.refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.refresh_btn.clicked.connect(self._fetch)
+        # Explicit refresh bypasses the cache
+        self.refresh_btn.clicked.connect(lambda: self._fetch(force=True))
         hl.addWidget(self.refresh_btn)
 
         return hdr
@@ -1495,16 +1513,39 @@ class WatchlistPage(QWidget):
 
     # ── Fetch ─────────────────────────────────────────────────────────────────
 
-    def _fetch(self):
+    def _fetch(self, force: bool = False):
         if not self._tickers:
             return
         if self._worker and self._worker.isRunning():
             return
+
+        # Serve from cache if fresh (≤ 30s) and ticker set unchanged
+        import time
+        cache = type(self)._cache
+        age = time.time() - cache["ts"]
+        if (not force
+                and age < self._CACHE_TTL
+                and cache["tickers"] == set(self._tickers)
+                and cache["quotes"]):
+            self._on_fetch_done(cache["metrics"], cache["quotes"])
+            return
+
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("Loading…")
         self._worker = _FetchWorker(self.token, list(self._tickers), self)
-        self._worker.done.connect(self._on_fetch_done)
+        self._worker.done.connect(self._on_fetch_done_and_cache)
         self._worker.start()
+
+    def _on_fetch_done_and_cache(self, metrics, quotes):
+        # Store to class-level cache so re-opening the page is instant
+        import time
+        type(self)._cache = {
+            "ts":      time.time(),
+            "metrics": metrics,
+            "quotes":  quotes,
+            "tickers": set(self._tickers),
+        }
+        self._on_fetch_done(metrics, quotes)
 
     def _on_fetch_done(self, metrics, quotes):
         self.refresh_btn.setEnabled(True)
