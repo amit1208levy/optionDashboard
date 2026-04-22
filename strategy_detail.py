@@ -541,36 +541,66 @@ class StrategyDetailPage(QWidget):
     # ── Metrics card ────────────────────────────────────────────────────────
 
     def _build_metrics_card(self):
-        s = self.strategy
-        max_profit, max_loss, breakevens = strategy_extremes(s)
+        from collections import OrderedDict
+        from models import Strategy as _Strategy
+
+        # Group legs by underlying so multi-ticker strategies can show
+        # per-underlying risk metrics (max profit / loss / breakeven
+        # are only meaningful against a single underlying's price axis).
+        groups: "OrderedDict[str, list]" = OrderedDict()
+        for leg in self.strategy.legs:
+            root = leg.root or leg.underlying or "—"
+            groups.setdefault(root, []).append(leg)
 
         frame, lay = self._section_frame("Risk Metrics")
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(6)
-
-        def cell(col, label, value, color=T.TEXT):
-            grid.addWidget(self._metric_box(label, value, color), 0, col)
-
-        cell(0, "Max Profit",
-             "Unlimited" if max_profit == float("inf") else money(max_profit),
-             T.GREEN)
-        cell(1, "Max Loss",
-             "Unlimited" if max_loss == float("-inf") else money(max_loss, signed=True),
-             T.RED if max_loss and max_loss != 0 else T.MUTED)
-
+        # Capital required is an account-level number (not per-ticker) so
+        # we show it once at the top regardless of ticker count.
         cap_required, cap_source = self._capital_required_with_source()
-        cap_box = self._capital_box(cap_required, cap_source)
-        grid.addWidget(cap_box, 0, 2)
+        cap_row = QHBoxLayout()
+        cap_row.addWidget(self._capital_box(cap_required, cap_source))
+        cap_row.addStretch()
+        lay.addLayout(cap_row)
 
-        be_text = "  /  ".join(f"${b:,.2f}" for b in breakevens[:2]) if breakevens else "—"
-        cell(3, "Breakeven", be_text, T.TEXT_DIM)
+        # Per-underlying: one row of (Max Profit | Max Loss | Breakeven)
+        # Single ticker → header hidden, just show the row.
+        for root, legs in groups.items():
+            if len(groups) > 1:
+                sub_label = QLabel(root)
+                sub_label.setStyleSheet(
+                    f"color: {T.ACCENT}; font-size: 12px; font-weight: bold; "
+                    f"border: none; background: transparent; padding-top: 8px;"
+                )
+                lay.addWidget(sub_label)
 
-        for i in range(4):
-            grid.setColumnStretch(i, 1)
+            sub_strategy = _Strategy(
+                f"{self.strategy.key}:{root}",
+                legs,
+                custom_name=root,
+                is_custom=True,
+            )
+            max_profit, max_loss, breakevens = strategy_extremes(sub_strategy)
 
-        lay.addLayout(grid)
+            grid = QGridLayout()
+            grid.setHorizontalSpacing(14)
+            grid.setVerticalSpacing(6)
+
+            def cell(col, label, value, color=T.TEXT):
+                grid.addWidget(self._metric_box(label, value, color), 0, col)
+
+            cell(0, "Max Profit",
+                 "Unlimited" if max_profit == float("inf") else money(max_profit),
+                 T.GREEN)
+            cell(1, "Max Loss",
+                 "Unlimited" if max_loss == float("-inf") else money(max_loss, signed=True),
+                 T.RED if max_loss and max_loss != 0 else T.MUTED)
+            be_text = "  /  ".join(f"${b:,.2f}" for b in breakevens[:2]) if breakevens else "—"
+            cell(2, "Breakeven", be_text, T.TEXT_DIM)
+
+            for i in range(3):
+                grid.setColumnStretch(i, 1)
+            lay.addLayout(grid)
+
         return frame
 
     # ── Capital required (auto + override) ──────────────────────────────────
