@@ -45,8 +45,13 @@ _EXPLICIT_EXTERNAL_SUBTYPES = (
 #   • External (to an outside bank)                → subtract from P&L
 import re as _re
 _TT_ACCT_RE = _re.compile(r"\b[0-9][A-Z]{2}\d{5}\b", _re.IGNORECASE)
-_INTERNAL_HINTS = ("internal", "account transfer", "between accounts",
-                   "journal", "sweep", "inter-account")
+# "Journal" is how TastyTrade labels ALL between-account transfers in the
+# description, but they still count those as cash flow for per-account P/L —
+# so it's NOT a reliable "skip from P&L" marker.  Same for "account transfer".
+# Only genuinely-neutral movements (margin sweeps, internal margin shuffles
+# that don't touch cash-available) count as truly internal.
+_INTERNAL_HINTS = ("sweep", "margin adjustment", "margin transfer",
+                   "inter-account margin")
 _EXTERNAL_HINTS = ("bank", "ach", "wire", "external", "check",
                    "to bank", "from bank")
 
