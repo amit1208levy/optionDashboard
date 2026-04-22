@@ -56,19 +56,29 @@ def main() -> int:
             print("  EXCEPTION in pnl.compute_ytd_pnl():")
             traceback.print_exc()
 
-        # 2. Show Money Movement breakdown from the raw transactions
+        # 2. Show Money Movement breakdown + individual big transactions
         print("\n[Money Movement breakdown]")
         try:
             txns = pnl._get_history_ytd(token, num)
             from collections import defaultdict
-            mm_by_sub = defaultdict(lambda: {"count": 0, "sum": 0.0})
+            mm_by_sub = defaultdict(lambda: {"count": 0, "sum": 0.0, "rows": []})
             for t in txns:
                 if (t.get("transaction-type") or "").lower() == "money movement":
                     sub = t.get("transaction-sub-type") or "(none)"
+                    val = pnl._signed_value(t)
                     mm_by_sub[sub]["count"] += 1
-                    mm_by_sub[sub]["sum"]   += pnl._signed_value(t)
+                    mm_by_sub[sub]["sum"]   += val
+                    # Keep big ones so we can print their descriptions
+                    if abs(val) >= 100:
+                        mm_by_sub[sub]["rows"].append(t)
+
             for sub, info in sorted(mm_by_sub.items()):
                 print(f"  {sub:35s} count={info['count']:>3d}  sum={info['sum']:+.2f}")
+                for t in info["rows"]:
+                    desc = (t.get("description") or "").strip()[:70]
+                    print(f"      ${pnl._signed_value(t):+.2f}  "
+                          f"date={t.get('executed-at', '')[:10]}  "
+                          f"desc: {desc}")
         except Exception:
             print("  EXCEPTION:")
             traceback.print_exc()
