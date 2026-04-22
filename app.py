@@ -59,7 +59,8 @@ class PortfolioWorker(QThread):
     # YTD transaction TTL: don't re-fetch within the same hour.
     _YTD_TTL_SECONDS = 3600
 
-    def __init__(self, token, creds=None, ytd_cache=None, year_start_cache=None):
+    def __init__(self, token, creds=None, ytd_cache=None, year_start_cache=None,
+                 pnl_cache=None):
         super().__init__()
         self.token      = token
         self.creds      = creds
@@ -69,6 +70,9 @@ class PortfolioWorker(QThread):
         # year_start_cache holds Jan-1 NetLiq per account — doesn't change
         # during a session so we fetch it once and reuse forever.
         self._year_start_cache = year_start_cache if year_start_cache is not None else {}
+        # pnl_cache holds compute_ytd_pnl results with a 60s TTL — avoids
+        # hammering /net-liq/history (which rate-limits at 429) every refresh.
+        self._pnl_cache        = pnl_cache        if pnl_cache        is not None else {}
 
     # ── Per-account helpers ──────────────────────────────────────────────────
 
@@ -97,6 +101,27 @@ class PortfolioWorker(QThread):
         self._year_start_cache[num] = val
         return val
 
+    _PNL_TTL_SECONDS = 60   # cache YTD result for 1 minute
+
+    def _pnl(self, num):
+        """Return cached compute_ytd_pnl result if fresh; refetch otherwise."""
+        entry = self._pnl_cache.get(num)
+        if entry:
+            ts, result = entry
+            try:
+                age = (datetime.now(timezone.utc) -
+                       datetime.fromisoformat(ts)).total_seconds()
+                if age < self._PNL_TTL_SECONDS:
+                    return result
+            except ValueError:
+                pass
+        result = _pnl_mod.compute_ytd_pnl(self.token, num)
+        if result is not None:
+            self._pnl_cache[num] = (
+                datetime.now(timezone.utc).isoformat(), result
+            )
+        return result
+
     def _fetch_one(self, acct):
         """
         Fetch all data for one account using two parallel phases:
@@ -114,7 +139,7 @@ class PortfolioWorker(QThread):
                 f_pos = ex.submit(api.get_positions,  self.token, num)
                 f_ytd = ex.submit(self._ytd_txns,     num)
                 f_ny  = ex.submit(self._year_start_nl, num)
-                f_pnl = ex.submit(_pnl_mod.compute_ytd_pnl, self.token, num)
+                f_pnl = ex.submit(self._pnl, num)
                 balances      = f_bal.result()
                 positions_raw = f_pos.result()
                 ytd_txns      = f_ytd.result()
@@ -462,6 +487,7 @@ class PortfolioScreen(QWidget):
         self._strategy_cards  = []     # [StrategyCard] — current My Strategies cards
         self._ua_cards        = []     # [StrategyCard] — current Unassigned cards
         self._year_start_cache = {}    # {acct_num: jan1_net_liq} — fetched once per session
+        self._pnl_cache        = {}    # {acct_num: (timestamp, result)} — 60s TTL
 
         self.strategies_all = api.load_strategies()   # {acct_num: [entries]}
         self.history_all    = api.load_history()      # {acct_num: [entries]}
@@ -981,7 +1007,7 @@ class PortfolioScreen(QWidget):
         )
         self.status_lbl.setText("Loading portfolio…")
         self._worker = PortfolioWorker(self.token, self.creds, self._ytd_cache,
-                                       self._year_start_cache)
+                                       self._year_start_cache, self._pnl_cache)
         self._worker.done.connect(self._on_data)
         self._worker.start()
 

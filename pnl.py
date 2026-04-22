@@ -102,15 +102,24 @@ def _get_net_liq_history(token: str, account_number: str,
     """
     GET /accounts/{num}/net-liq/history?start-time=YYYY-MM-DDTHH:MM:SSZ
     Returns list of OHLC snapshots with .close field for each day.
+    Retries with backoff on 429 (rate-limit).
     """
-    r = requests.get(
-        f"{BASE}/accounts/{account_number}/net-liq/history",
-        headers=_headers(token),
-        params={"start-time": start_time.strftime(_TT_DATE_FMT)},
-        timeout=15,
-    )
+    import time
+    for attempt in range(4):
+        r = requests.get(
+            f"{BASE}/accounts/{account_number}/net-liq/history",
+            headers=_headers(token),
+            params={"start-time": start_time.strftime(_TT_DATE_FMT)},
+            timeout=15,
+        )
+        if r.status_code == 429:
+            time.sleep(0.5 * (attempt + 1))   # 0.5s, 1s, 1.5s, 2s
+            continue
+        r.raise_for_status()
+        return r.json().get("data", {}).get("items", []) or []
+    # All retries exhausted
     r.raise_for_status()
-    return r.json().get("data", {}).get("items", []) or []
+    return []
 
 
 def _get_history_ytd(token: str, account_number: str) -> list:
