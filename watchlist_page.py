@@ -240,30 +240,68 @@ class _FetchWorker(QThread):
         if not self.tickers:
             self.done.emit({}, {})
             return
-        metrics = api.get_market_metrics(self.token, self.tickers)
-        quotes  = api.get_market_data(self.token, equities=self.tickers)
-        missing = [t for t in self.tickers if not _has_price(quotes.get(t))]
+
+        # Known futures roots — these should always resolve as futures, not as
+        # accidentally-matching stock tickers (e.g. "ES" the equity is
+        # Eversource Energy at ~$66, NOT E-mini S&P at ~$5,800).  Source of
+        # truth is the contract-multiplier table in models.py.
+        from models import _CONTRACT_MULT
+        known_futures_roots = set(_CONTRACT_MULT.keys())
+
+        futures_tickers = [t for t in self.tickers
+                           if t.startswith("/") or t in known_futures_roots]
+        equity_tickers  = [t for t in self.tickers if t not in futures_tickers]
+
+        # Fetch equities + equity metrics in the usual way
+        metrics = api.get_market_metrics(self.token, equity_tickers) if equity_tickers else {}
+        quotes  = api.get_market_data(self.token, equities=equity_tickers) if equity_tickers else {}
+
+        # Fetch futures separately with proper symbol format
+        if futures_tickers:
+            # Normalize: strip leading slash for lookup maps
+            roots = [t.lstrip("/") for t in futures_tickers]
+
+            # Metrics need "/" prefix
+            fut_metrics = api.get_market_metrics(self.token, [f"/{r}" for r in roots])
+            # Store under the user-entered ticker (bare root) so lookups work
+            for r in roots:
+                for key in (f"/{r}", r):
+                    if key in fut_metrics:
+                        metrics[r] = fut_metrics[key]
+                        break
+
+            # Quotes: resolve roots to active contract symbols, then fetch
+            root_map    = api.get_futures_active_contracts(self.token, roots)
+            fut_syms    = []
+            sym_to_root = {}
+            for root in roots:
+                contract = root_map.get(root) or f"/{root}"
+                fut_syms.append(contract)
+                sym_to_root[contract] = root
+            fut_quotes = api.get_market_data(self.token, futures=fut_syms)
+            for sym, q in fut_quotes.items():
+                root = sym_to_root.get(sym) or sym_to_root.get("/" + sym.lstrip("/"))
+                if root:
+                    quotes[root] = q
+
+        # Fallback for equity tickers that returned no price (maybe they were
+        # actually futures roots we didn't know about)
+        missing = [t for t in equity_tickers if not _has_price(quotes.get(t))]
         if missing:
-            # Resolve futures roots (e.g. "ES") to active contracts ("/ESM26")
             root_map = api.get_futures_active_contracts(self.token, missing)
-            fut_syms   = []   # full contract symbols to fetch
-            sym_to_root = {}  # "/ESM26" -> "ES"  (to map results back)
+            fut_syms    = []
+            sym_to_root = {}
             for root in missing:
-                contract = root_map.get(root)
-                if contract:
-                    fut_syms.append(contract)
-                    sym_to_root[contract] = root
-                else:
-                    # Fallback: try "/ROOT" in case API supports it
-                    fallback = "/" + root
-                    fut_syms.append(fallback)
-                    sym_to_root[fallback] = root
+                contract = root_map.get(root) or f"/{root}"
+                fut_syms.append(contract)
+                sym_to_root[contract] = root
             if fut_syms:
                 fut_quotes = api.get_market_data(self.token, futures=fut_syms)
                 for sym, q in fut_quotes.items():
                     root = sym_to_root.get(sym) or sym_to_root.get("/" + sym.lstrip("/"))
                     if root and root in missing:
                         quotes[root] = q
+
         self.done.emit(metrics, quotes)
 
 
