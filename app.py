@@ -687,11 +687,11 @@ class PortfolioScreen(QWidget):
                 f"QPushButton:hover {{ background: {T.GREEN}; }}"
             )
         elif on and mode == "rest":
-            self.live_btn.setText("●  Live (15s)")
+            self.live_btn.setText("●  Live")
             self.live_btn.setStyleSheet(
-                f"QPushButton {{ background: {T.PURPLE}; color: white; border: none; "
+                f"QPushButton {{ background: {T.GREEN_D}; color: white; border: none; "
                 f"border-radius: 6px; padding: 0 10px; font-size: 11px; font-weight: bold; }}"
-                f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
+                f"QPushButton:hover {{ background: {T.GREEN}; }}"
             )
         elif on:
             self.live_btn.setText("⟳  Connecting")
@@ -721,6 +721,12 @@ class PortfolioScreen(QWidget):
 
     def _start_streamer(self):
         """Create and start the DXLink quote streamer."""
+        # Skip entirely if we've already determined the OAuth app has no
+        # streaming permission — avoids spamming 403 retries on every Live
+        # toggle.  User stays on REST 15s polling.
+        if getattr(self, "_ws_unavailable", False):
+            self._style_live_btn(True, mode="rest")
+            return
         self._stop_streamer()   # stop any previous instance
         s = _streamer_mod.QuoteStreamer(self.token, parent=self)
         s.price_update.connect(self._on_price_update)
@@ -759,21 +765,20 @@ class PortfolioScreen(QWidget):
             self._stream_fail_count = 0
             return
         if status.startswith("error"):
-            # Persistent errors (e.g. HTTP 403 = no streaming scope on OAuth
-            # app) → give up trying the WebSocket and show "Live (15s)" to
-            # indicate REST polling is still active.
+            # HTTP 403 = OAuth app lacks quote-streaming permission.  This is
+            # a permanent permission error, never retry — just fall back to
+            # REST polling (which is already running) and mark WS unavailable
+            # so we don't try again this session.
+            if "403" in status:
+                self._ws_unavailable = True
+                self._stop_streamer()
+                self._style_live_btn(True, mode="rest")
+                return
+            # Transient errors: give up after 2 retries
             self._stream_fail_count = getattr(self, "_stream_fail_count", 0) + 1
             if self._stream_fail_count >= 2:
                 self._stop_streamer()
                 self._style_live_btn(True, mode="rest")
-                if "403" in status:
-                    self.status_lbl.setStyleSheet(
-                        f"color: {T.YELLOW}; font-size: 11px; border: none; background: transparent;"
-                    )
-                    self.status_lbl.setText(
-                        "Live updates via 15s polling — your OAuth app doesn't "
-                        "have quote-streaming permission for real-time WebSocket."
-                    )
                 return
         elif status == "connecting":
             self._style_live_btn(True, streaming=False)
