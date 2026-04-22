@@ -120,6 +120,9 @@ class PortfolioWorker(QThread):
                 ytd_txns      = f_ytd.result()
                 year_start_nl = f_ny.result()
                 ytd_pnl       = f_pnl.result()
+            # Debug: log SDK path success/failure to stderr
+            print(f"[pnl] account {num}: SDK returned {'OK' if ytd_pnl else 'NONE (using fallback)'}",
+                  file=sys.stderr, flush=True)
 
             positions = [Position(p) for p in positions_raw]
 
