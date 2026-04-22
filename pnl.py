@@ -216,7 +216,12 @@ def compute_ytd_pnl(access_token: str, account_number: str,
             "unknown_subs":        unknown_subs,
         }
 
-    except Exception:
+    except Exception as e:
         if raise_on_error:
             raise
+        # Log to stderr so we can see why it failed in the live app
+        import sys, traceback
+        print(f"[pnl] account {account_number} failed: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
         return None
