@@ -545,8 +545,9 @@ class StrategyDetailPage(QWidget):
         from models import Strategy as _Strategy
 
         # Group legs by underlying so multi-ticker strategies can show
-        # per-underlying risk metrics (max profit / loss / breakeven
-        # are only meaningful against a single underlying's price axis).
+        # per-underlying risk metrics (max profit / loss / breakeven /
+        # capital requirement are only meaningful against a single
+        # underlying's price axis).
         groups: "OrderedDict[str, list]" = OrderedDict()
         for leg in self.strategy.legs:
             root = leg.root or leg.underlying or "—"
@@ -554,16 +555,32 @@ class StrategyDetailPage(QWidget):
 
         frame, lay = self._section_frame("Risk Metrics")
 
-        # Capital required is an account-level number (not per-ticker) so
-        # we show it once at the top regardless of ticker count.
-        cap_required, cap_source = self._capital_required_with_source()
-        cap_row = QHBoxLayout()
-        cap_row.addWidget(self._capital_box(cap_required, cap_source))
-        cap_row.addStretch()
-        lay.addLayout(cap_row)
+        # For single-ticker: show the normal Capital Required box at the top
+        # (keeps the existing delta/DTE distribution, override support, etc.).
+        # For multi-ticker: compute capital per ticker using the same algorithm
+        # and show a TOTAL box at the top plus per-ticker values in each row.
+        if len(groups) <= 1:
+            cap_required, cap_source = self._capital_required_with_source()
+            cap_row = QHBoxLayout()
+            cap_row.addWidget(self._capital_box(cap_required, cap_source))
+            cap_row.addStretch()
+            lay.addLayout(cap_row)
+            per_ticker_cap: dict = {}
+        else:
+            # Compute per-ticker capital (same algorithm as the single case)
+            per_ticker_cap = {}
+            for root, legs in groups.items():
+                sub = _Strategy(f"{self.strategy.key}:{root}", legs,
+                                custom_name=root, is_custom=True)
+                per_ticker_cap[root] = capital_for_strategy(sub) or 0.0
+            total_cap = sum(per_ticker_cap.values())
 
-        # Per-underlying: one row of (Max Profit | Max Loss | Breakeven)
-        # Single ticker → header hidden, just show the row.
+            cap_row = QHBoxLayout()
+            cap_row.addWidget(self._capital_box(total_cap, "total"))
+            cap_row.addStretch()
+            lay.addLayout(cap_row)
+
+        # Per-underlying: Max Profit | Max Loss | Breakeven | Capital (if multi)
         for root, legs in groups.items():
             if len(groups) > 1:
                 sub_label = QLabel(root)
@@ -597,7 +614,13 @@ class StrategyDetailPage(QWidget):
             be_text = "  /  ".join(f"${b:,.2f}" for b in breakevens[:2]) if breakevens else "—"
             cell(2, "Breakeven", be_text, T.TEXT_DIM)
 
-            for i in range(3):
+            cols = 3
+            if len(groups) > 1:
+                cap = per_ticker_cap.get(root, 0.0)
+                cell(3, "Capital Req.", money(cap) if cap else "—", T.TEXT_DIM)
+                cols = 4
+
+            for i in range(cols):
                 grid.setColumnStretch(i, 1)
             lay.addLayout(grid)
 
@@ -694,14 +717,17 @@ class StrategyDetailPage(QWidget):
 
         top = QHBoxLayout()
         top.setSpacing(4)
-        l = QLabel("CAPITAL REQUIRED")
+        label_text = "TOTAL CAPITAL REQUIRED" if source == "total" else "CAPITAL REQUIRED"
+        l = QLabel(label_text)
         l.setStyleSheet(
             f"color: {T.MUTED}; font-size: 9px; font-weight: bold; letter-spacing: 0.5px; "
             f"background: transparent; border: none;"
         )
         top.addWidget(l)
         top.addStretch()
-        if isinstance(self.strategy, StrategyInstance):
+        # Hide the manual-edit button when showing the multi-ticker total
+        # (overrides are a single-ticker concept in the strategy config)
+        if isinstance(self.strategy, StrategyInstance) and source != "total":
             edit = QPushButton("✎")
             edit.setFixedSize(18, 18)
             edit.setCursor(Qt.CursorShape.PointingHandCursor)
