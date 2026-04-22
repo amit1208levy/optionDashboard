@@ -16,6 +16,7 @@ import theme as T
 import api
 import updater
 import streamer as _streamer_mod
+import pnl as _pnl_mod
 from version import VERSION
 from models import (
     Position, StrategyInstance, unassigned_positions, group_unassigned,
@@ -107,16 +108,18 @@ class PortfolioWorker(QThread):
         if not num:
             return None
         try:
-            # ── Phase 1: four independent calls in parallel ──────────────
-            with ThreadPoolExecutor(max_workers=4) as ex:
+            # ── Phase 1: five independent calls in parallel ──────────────
+            with ThreadPoolExecutor(max_workers=5) as ex:
                 f_bal = ex.submit(api.get_balances,   self.token, num)
                 f_pos = ex.submit(api.get_positions,  self.token, num)
                 f_ytd = ex.submit(self._ytd_txns,     num)
                 f_ny  = ex.submit(self._year_start_nl, num)
+                f_pnl = ex.submit(_pnl_mod.compute_ytd_pnl, self.token, num)
                 balances      = f_bal.result()
                 positions_raw = f_pos.result()
                 ytd_txns      = f_ytd.result()
                 year_start_nl = f_ny.result()
+                ytd_pnl       = f_pnl.result()
 
             positions = [Position(p) for p in positions_raw]
 
@@ -157,6 +160,7 @@ class PortfolioWorker(QThread):
                 "metrics":            metrics,
                 "ytd_txns":           ytd_txns,
                 "year_start_net_liq": year_start_nl,
+                "ytd_pnl_sdk":        ytd_pnl,   # may be None if SDK call failed
             }
         except Exception:
             return None   # account-level error: skip this account gracefully
@@ -1209,86 +1213,72 @@ class PortfolioScreen(QWidget):
         except (ValueError, TypeError):
             self.day_pnl_lbl.setText("—")
 
-        # ── YTD P&L via the NetLiq-delta formula ────────────────────────────
-        # Account-level math that works for any broker:
-        #
-        #     P/L YTD w/Fees  =  NetLiq_today − NetLiq_Jan1 − Net Deposits YTD
-        #     P/L YTD (gross) =  P/L YTD w/Fees + Fees YTD
-        #
-        # NetLiq already reflects every cent paid in fees (they came out of
-        # cash), so the delta is naturally net-of-fees.  Adding fees back gives
-        # the gross figure.  No reliance on broker-specific gain/loss fields.
+        # ── YTD P&L (TastyTrade SDK preferred, fallback to manual math) ─────
+        # Primary path uses the official tastytrade SDK for verified field
+        # names and the get_net_liquidating_value_history() endpoint.  If the
+        # SDK call failed (e.g. session token issue), fall back to summing
+        # transactions ourselves.
+        ytd_pnl = acct.get("ytd_pnl_sdk")
 
-        # Sum YTD fees (any "fee" or "commission" field) — generic matcher
-        # catches every fee type the broker may charge, current or future.
-        ytd_fees = 0.0
-        for t in ytd_txns:
-            if (t.get("transaction-type") or "") not in ("Trade", "Receive Deliver"):
-                continue
-            for k, v in t.items():
-                if v is None:
+        if ytd_pnl is not None:
+            ytd_total      = ytd_pnl["p_l_ytd"]
+            ytd_wf         = ytd_pnl["p_l_ytd_w_fees"]
+            ytd_fees       = ytd_pnl["ytd_fees"]
+            net_deposits   = ytd_pnl["ytd_net_deposits"]
+            year_start_nl  = ytd_pnl["year_start_net_liq"]
+            current_nl     = ytd_pnl["current_net_liq"]
+        else:
+            # Fallback: same NetLiq-delta math but with our manual transaction
+            # parsing.  Less robust because field names are guessed.
+            ytd_fees = 0.0
+            for t in ytd_txns:
+                if (t.get("transaction-type") or "") not in ("Trade", "Receive Deliver"):
                     continue
-                kl = str(k).lower()
-                if not ("fee" in kl or "commission" in kl):
-                    continue
-                if kl.endswith("-effect") or kl.endswith("-id") \
-                        or "description" in kl:
+                for k, v in t.items():
+                    if v is None: continue
+                    kl = str(k).lower()
+                    if not ("fee" in kl or "commission" in kl): continue
+                    if kl.endswith("-effect") or kl.endswith("-id") or "description" in kl:
+                        continue
+                    try: ytd_fees += abs(float(v))
+                    except (TypeError, ValueError): pass
+
+            net_deposits = 0.0
+            for t in ytd_txns:
+                if (t.get("transaction-type") or "").lower() != "money movement":
                     continue
                 try:
-                    ytd_fees += abs(float(v))
-                except (TypeError, ValueError):
-                    pass
+                    val = float(t.get("value") or 0)
+                    eff = (t.get("value-effect") or "").lower()
+                    net_deposits += val if "credit" in eff else -val
+                except (TypeError, ValueError): pass
 
-        # Sum YTD net deposits / withdrawals (Money Movement transactions)
-        net_deposits = 0.0
-        for t in ytd_txns:
-            ttype = (t.get("transaction-type") or "").lower()
-            if ttype != "money movement":
-                continue
             try:
-                val = float(t.get("value") or 0)
-                eff = (t.get("value-effect") or "").lower()
-                net_deposits += val if "credit" in eff else -val
+                current_nl = float(bal.get("net-liquidating-value") or 0)
             except (TypeError, ValueError):
-                pass
+                current_nl = 0.0
+            year_start_nl = acct.get("year_start_net_liq") or current_nl
+            ytd_wf        = current_nl - year_start_nl - net_deposits
+            ytd_total     = ytd_wf + ytd_fees
 
-        try:
-            current_nl    = float(bal.get("net-liquidating-value") or 0)
-            year_start_nl = acct.get("year_start_net_liq")
+        self.ytd_gross_lbl.setText(money(ytd_total, signed=True))
+        self.ytd_gross_lbl.setStyleSheet(
+            f"color: {pnl_color(ytd_total)}; font-size: 22px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        self.ytd_pnl_lbl.setText(money(ytd_wf, signed=True))
+        self.ytd_pnl_lbl.setStyleSheet(
+            f"color: {pnl_color(ytd_wf)}; font-size: 22px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
 
-            if year_start_nl is not None:
-                ytd_wf    = current_nl - year_start_nl - net_deposits
-                ytd_total = ytd_wf + ytd_fees
-            else:
-                # Fallback if balance-snapshots endpoint failed: sum realized
-                # closed-trade P&L from balance + live unrealized.  Less exact.
-                ytd_total = _signed_gain("realized-year-gain") + sum(p.pnl for p in positions_now)
-                ytd_wf    = ytd_total - ytd_fees
-
-            self.ytd_gross_lbl.setText(money(ytd_total, signed=True))
-            self.ytd_gross_lbl.setStyleSheet(
-                f"color: {pnl_color(ytd_total)}; font-size: 22px; font-weight: bold; "
-                f"border: none; background: transparent;"
-            )
-            self.ytd_pnl_lbl.setText(money(ytd_wf, signed=True))
-            self.ytd_pnl_lbl.setStyleSheet(
-                f"color: {pnl_color(ytd_wf)}; font-size: 22px; font-weight: bold; "
-                f"border: none; background: transparent;"
-            )
-
-            # ── Cache values for live-mode incremental updates ──────────────
-            # When marks change between balance refreshes we approximate
-            # NetLiq_now ≈ NetLiq_at_balance_fetch + (open_pnl_now − open_pnl_at_fetch).
-            # Save the references the live path needs.
-            self._ytd_fees           = ytd_fees
-            self._ytd_net_deposits   = net_deposits
-            self._year_start_nl      = year_start_nl
-            self._balance_net_liq    = current_nl
-            self._open_pnl_at_fetch  = sum(p.pnl for p in positions_now)
-
-        except (ValueError, TypeError):
-            self.ytd_pnl_lbl.setText("—")
-            self.ytd_gross_lbl.setText("—")
+        # ── Cache values for live-mode incremental updates ──────────────────
+        # Live path approximates NetLiq_now ≈ NetLiq_at_fetch + Δopen_pnl.
+        self._ytd_fees           = ytd_fees
+        self._ytd_net_deposits   = net_deposits
+        self._year_start_nl      = year_start_nl
+        self._balance_net_liq    = current_nl
+        self._open_pnl_at_fetch  = sum(p.pnl for p in positions_now)
 
         self._clear_layout(self.my_container)
         self._clear_layout(self.ua_container)

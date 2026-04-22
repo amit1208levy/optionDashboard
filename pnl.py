@@ -1,0 +1,166 @@
+"""
+YTD P&L calculation using the official TastyTrade Python SDK.
+
+The SDK gives us verified field names, typed responses, and methods like
+get_net_liquidating_value_history() and get_history() that we'd otherwise
+have to reverse-engineer.  This module isolates everything SDK-specific so
+the rest of the app stays decoupled.
+
+Authentication
+──────────────
+Our app uses OAuth (refresh-token + client-secret) but the SDK only ships
+with email/password Session.__init__.  We construct a Session manually,
+attaching our existing Bearer access token to its httpx client, so SDK
+methods work exactly as if the user had logged in through the SDK.
+
+Algorithm
+─────────
+    P/L YTD w/Fees  =  NetLiq_today − NetLiq_Jan1 − Net Deposits YTD
+    P/L YTD (gross) =  P/L YTD w/Fees + Fees YTD
+
+NetLiq already reflects every fee paid (came out of cash), so the delta
+is naturally net-of-fees.  Adding fees back gives the gross figure.
+"""
+from __future__ import annotations
+
+from datetime import date, datetime, timezone
+from decimal import Decimal
+from typing import Optional
+
+from httpx import Client
+from tastytrade import Account, Session
+from tastytrade.account import Transaction
+
+
+_API_URL = "https://api.tastyworks.com"
+_UA      = "options-dashboard/1.0"
+
+
+# ── Session construction (OAuth) ──────────────────────────────────────────────
+
+def make_oauth_session(access_token: str) -> Session:
+    """
+    Build a Session object that uses our existing OAuth access token,
+    bypassing the SDK's email+password login flow.
+    """
+    s = Session.__new__(Session)
+    s.is_test       = False
+    s.proxy         = None
+    s.session_token = access_token
+    s.user          = None
+    s.remember_token = None
+    s.sync_client = Client(
+        base_url=_API_URL,
+        headers={
+            "Accept":        "application/json",
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent":    _UA,
+        },
+    )
+    return s
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _to_float(v) -> float:
+    if v is None:
+        return 0.0
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _tx_fees(t: Transaction) -> float:
+    """Sum every explicit fee field on a transaction.  Always returns ≥ 0."""
+    return (_to_float(t.commission)
+            + _to_float(t.clearing_fees)
+            + _to_float(t.regulatory_fees)
+            + _to_float(t.proprietary_index_option_fees))
+
+
+def _tx_signed_value(t: Transaction) -> float:
+    """
+    Return the signed dollar value of a Money-Movement transaction
+    (positive = credit / deposit, negative = debit / withdrawal).
+    The SDK doesn't expose value-effect cleanly so we infer sign from value.
+    """
+    return _to_float(t.value)
+
+
+# ── main entry point ──────────────────────────────────────────────────────────
+
+def compute_ytd_pnl(access_token: str, account_number: str) -> Optional[dict]:
+    """
+    Compute YTD P&L numbers for one account using verified TastyTrade SDK
+    methods.  Returns a dict on success, or None on any failure (so caller
+    can fall back to a different algorithm).
+
+    Result dict shape:
+        {
+            "p_l_ytd":           float,   # gross of fees
+            "p_l_ytd_w_fees":    float,   # net of fees (NetLiq delta)
+            "ytd_fees":          float,   # ≥ 0
+            "ytd_net_deposits":  float,   # signed: + = deposit, − = withdrawal
+            "year_start_net_liq":float,
+            "current_net_liq":   float,
+        }
+    """
+    try:
+        session = make_oauth_session(access_token)
+        account = Account.__new__(Account)
+        account.account_number = account_number
+        # Pydantic v2 needs every required field set; be defensive.
+        for f in Account.model_fields:
+            if not hasattr(account, f):
+                setattr(account, f, None)
+
+        year       = date.today().year
+        year_start = datetime(year, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        # ── 1. Current NetLiq ────────────────────────────────────────────────
+        current_balance = account.get_balances(session)
+        current_nl      = _to_float(current_balance.net_liquidating_value)
+
+        # ── 2. NetLiq at Jan 1 (last EOD snapshot ≤ year start) ─────────────
+        nl_history = account.get_net_liquidating_value_history(
+            session, start_time=year_start
+        )
+        # The endpoint actually returns history starting AT or just AFTER
+        # start_time, so the earliest entry is approximately our year-open
+        # NetLiq.  If it's empty, no YTD activity → use current NetLiq.
+        if nl_history:
+            year_start_nl = _to_float(nl_history[0].close)
+        else:
+            year_start_nl = current_nl
+
+        # ── 3. YTD transactions: separate deposits + sum fees ────────────────
+        txns = account.get_history(session, start_date=date(year, 1, 1))
+
+        ytd_fees     = 0.0
+        net_deposits = 0.0
+        for t in txns:
+            ttype = (t.transaction_type or "").lower()
+            if ttype in ("trade", "receive deliver"):
+                ytd_fees += _tx_fees(t)
+            elif ttype == "money movement":
+                # Includes deposits, withdrawals, transfers, interest.
+                # value carries the sign already.
+                net_deposits += _tx_signed_value(t)
+
+        # ── 4. Apply the formula ─────────────────────────────────────────────
+        p_l_w_fees = current_nl - year_start_nl - net_deposits
+        p_l_gross  = p_l_w_fees + ytd_fees
+
+        return {
+            "p_l_ytd":             p_l_gross,
+            "p_l_ytd_w_fees":      p_l_w_fees,
+            "ytd_fees":            ytd_fees,
+            "ytd_net_deposits":    net_deposits,
+            "year_start_net_liq":  year_start_nl,
+            "current_net_liq":     current_nl,
+        }
+
+    except Exception:
+        return None

@@ -2,3 +2,5 @@ PyQt6>=6.6
 requests>=2.28
 matplotlib>=3.7
 websockets>=13.0
+tastytrade>=9.0,<10
+pandas-market-calendars<5
