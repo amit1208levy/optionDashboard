@@ -1184,25 +1184,30 @@ class PortfolioScreen(QWidget):
             self.day_pnl_lbl.setText("—")
 
         # ── P/L YTD  (TastyTrade formula: realized-closed + open/unrealized) ───
-        # TastyTrade's "P/L YTD" in their UI is NOT closed-only — it includes the
-        # current mark-to-market value of every still-open position.  Reference
-        # verified against TastyTrade account table:
-        #   P/L YTD = realized-year-gain + Σ position.pnl   (open unrealized)
-        # This makes P/L YTD and Open P&L overlap intentionally, which matches
-        # the broker's displayed numbers.
+        # TastyTrade's "P/L YTD" in their UI includes both realized YTD and
+        # current mark-to-market of open positions.  If TT exposes the field
+        # "unrealized-year-gain" in the balance response we use it directly —
+        # that is the exact number TT displays.  Otherwise we fall back to
+        # summing live position P&L.
         try:
             ytd_realized = _signed_gain("realized-year-gain")
-            open_pnl_now = sum(p.pnl for p in positions_now)
-            ytd_total    = ytd_realized + open_pnl_now
+
+            # Prefer TT's own field if present (most accurate)
+            if bal.get("unrealized-year-gain") is not None:
+                unrealized_ytd = _signed_gain("unrealized-year-gain")
+            else:
+                unrealized_ytd = sum(p.pnl for p in positions_now)
+
+            ytd_total = ytd_realized + unrealized_ytd
             self.ytd_gross_lbl.setText(money(ytd_total, signed=True))
             self.ytd_gross_lbl.setStyleSheet(
                 f"color: {pnl_color(ytd_total)}; font-size: 22px; font-weight: bold; "
                 f"border: none; background: transparent;"
             )
         except (ValueError, TypeError):
-            ytd_realized = 0.0
-            open_pnl_now = 0.0
-            ytd_total    = 0.0
+            ytd_realized   = 0.0
+            unrealized_ytd = 0.0
+            ytd_total      = 0.0
             self.ytd_gross_lbl.setText("—")
 
         # ── YTD W/Fees  (TastyTrade formula: P/L YTD − YTD fees) ────────────

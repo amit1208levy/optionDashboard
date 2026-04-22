@@ -198,7 +198,18 @@ def get_balances(token, account_number):
         f"{BASE}/accounts/{account_number}/balances",
         headers=auth_headers(token), timeout=10,
     )
-    return r.json().get("data", {}) if r.status_code == 200 else {}
+    data = r.json().get("data", {}) if r.status_code == 200 else {}
+    # One-time diagnostic: write the full balance response for the first
+    # account we see, so we can inspect every field TastyTrade returns.
+    # Delete the file to refresh.  Never includes credentials.
+    try:
+        diag = os.path.join(HERE, ".balance-diag.json")
+        if data and not os.path.exists(diag):
+            with open(diag, "w") as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+    except Exception:
+        pass
+    return data
 
 
 def get_positions(token, account_number):
