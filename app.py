@@ -744,6 +744,7 @@ class PortfolioScreen(QWidget):
 
     def _on_streamer_status(self, status: str):
         """Handle QuoteStreamer status changes on the GUI thread."""
+        print(f"[streamer] status → {status!r}", file=sys.stderr, flush=True)
         if status == "connected":
             self._style_live_btn(True, streaming=True)
             self.status_lbl.setText("")
