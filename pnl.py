@@ -84,13 +84,16 @@ def _tx_fees(t: Transaction) -> float:
             + abs(_to_float(t.proprietary_index_option_fees)))
 
 
-# Sub-types of "Money Movement" that represent EXTERNAL cash flow.
-# Anything else (Balance Adjustment, Credit Interest, Subscription Fee, …) is
-# part of P&L, NOT a deposit/withdrawal — including it would corrupt the
-# NetLiq-delta math.  Match case-insensitively against substrings.
+# Sub-types of "Money Movement" that represent cash flow we want to subtract
+# from the NetLiq delta (i.e. they shouldn't show up in P/L YTD):
+#   • Real external cash:     Deposit, Withdrawal, Wire, ACH, Transfer, Rollover
+#   • Daily futures cash settlement: Mark to Market — TastyTrade tracks
+#     futures P&L outside of NetLiq delta, so we exclude these flows here too
+# Anything not in this list (Balance Adjustment, Credit Interest, Subscription
+# Fee, …) stays inside P&L.  Match case-insensitively against substrings.
 _DEPOSIT_KEYWORDS = (
     "deposit", "withdrawal", "withdraw", "wire", "ach",
-    "transfer", "rollover",
+    "transfer", "rollover", "mark to market",
 )
 
 
