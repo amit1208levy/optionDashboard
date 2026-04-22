@@ -170,12 +170,19 @@ def compute_ytd_pnl(access_token: str, account_number: str,
 
         ytd_fees     = 0.0
         net_deposits = 0.0
+        unknown_subs: dict = {}   # {sub_type: total_value}  for diagnostics
         for t in txns:
             ttype = (t.transaction_type or "").lower()
             if ttype in ("trade", "receive deliver"):
                 ytd_fees += _tx_fees(t)
-            if _is_external_money_movement(t):
-                net_deposits += _tx_signed_value(t)
+            elif ttype == "money movement":
+                if _is_external_money_movement(t):
+                    net_deposits += _tx_signed_value(t)
+                else:
+                    sub = t.transaction_sub_type or "(none)"
+                    if sub not in ("Balance Adjustment", "Credit Interest",
+                                    "Debit Interest", "Subscription Fee"):
+                        unknown_subs[sub] = unknown_subs.get(sub, 0.0) + _to_float(t.value)
 
         # ── 4. Apply the formula ─────────────────────────────────────────────
         p_l_w_fees = current_nl - year_start_nl - net_deposits
@@ -188,6 +195,7 @@ def compute_ytd_pnl(access_token: str, account_number: str,
             "ytd_net_deposits":    net_deposits,
             "year_start_net_liq":  year_start_nl,
             "current_net_liq":     current_nl,
+            "unknown_subs":        unknown_subs,   # for unknown-subtype warnings
         }
 
     except Exception:

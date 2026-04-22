@@ -1227,7 +1227,28 @@ class PortfolioScreen(QWidget):
             net_deposits   = ytd_pnl["ytd_net_deposits"]
             year_start_nl  = ytd_pnl["year_start_net_liq"]
             current_nl     = ytd_pnl["current_net_liq"]
+            # Surface unknown Money-Movement sub-types so we can extend the
+            # filter without users having to debug.  Shown only when material.
+            unk = ytd_pnl.get("unknown_subs") or {}
+            material = {k: v for k, v in unk.items() if abs(v) >= 1.0}
+            if material:
+                self.status_lbl.setStyleSheet(
+                    f"color: {T.YELLOW}; font-size: 11px; border: none; background: transparent;"
+                )
+                desc = ", ".join(f"{k}: ${v:+.0f}" for k, v in material.items())
+                self.status_lbl.setText(
+                    f"YTD: unrecognized money-movement sub-types — {desc}. "
+                    f"Counted as P&L; report to dev if this is wrong."
+                )
         else:
+            # SDK call failed → numbers will be approximate.  Warn the user.
+            self.status_lbl.setStyleSheet(
+                f"color: {T.YELLOW}; font-size: 11px; border: none; background: transparent;"
+            )
+            self.status_lbl.setText(
+                "YTD numbers are approximate (SDK fetch failed — using fallback math)."
+            )
+
             # Fallback: same NetLiq-delta math but with our manual transaction
             # parsing.  Less robust because field names are guessed.
             ytd_fees = 0.0
