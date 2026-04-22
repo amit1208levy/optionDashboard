@@ -458,6 +458,74 @@ class RiskPage(QWidget):
         if self._vix_canvas:
             _draw_vix_chart(self._vix_canvas, vix, net_liq, net_vega)
 
+    # ── pie chart helper ──────────────────────────────────────────────────────
+
+    def _build_pie_chart(self, labels, values, title):
+        """Return a card containing a matplotlib pie chart."""
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame {{ background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 10px; }}"
+        )
+        inner = QVBoxLayout(card)
+        inner.setContentsMargins(14, 12, 14, 14)
+        inner.setSpacing(4)
+
+        title_lbl = QLabel(title)
+        title_lbl.setStyleSheet(
+            f"color: {T.LABEL}; font-size: 11px; font-weight: bold; "
+            f"letter-spacing: 0.5px; border: none; background: transparent;"
+        )
+        inner.addWidget(title_lbl)
+
+        canvas = _make_canvas(width_px=380, height_px=300)
+        canvas.setFixedHeight(300)
+        inner.addWidget(canvas)
+
+        # Draw pie
+        total = sum(values) or 1.0
+        colors = [_PALETTE[i % len(_PALETTE)] for i in range(len(values))]
+
+        with plt.rc_context(_MPL_STYLE):
+            fig = canvas.figure
+            fig.clear()
+            fig.patch.set_facecolor(T.BG_ALT)
+            ax = fig.add_subplot(111)
+            ax.set_facecolor(T.BG_ALT)
+
+            def fmt(pct):
+                return f"{pct:.1f}%" if pct >= 3 else ""
+
+            wedges, _, autotexts = ax.pie(
+                values,
+                labels=None,
+                colors=colors,
+                autopct=fmt,
+                startangle=90,
+                counterclock=False,
+                wedgeprops={"edgecolor": T.BG_ALT, "linewidth": 2},
+                pctdistance=0.72,
+                textprops={"color": "white", "fontsize": 9, "fontweight": "bold"},
+            )
+            ax.axis("equal")
+
+            # Legend on the right
+            legend_labels = [
+                f"{lbl}  {v/total*100:.1f}%"
+                for lbl, v in zip(labels, values)
+            ]
+            ax.legend(
+                wedges, legend_labels,
+                loc="center left", bbox_to_anchor=(1.0, 0.5),
+                frameon=False, fontsize=8,
+                labelcolor=T.TEXT_DIM,
+            )
+
+            fig.tight_layout(pad=0.5)
+            canvas.draw()
+
+        return card
+
     # ── allocation section ────────────────────────────────────────────────────
 
     def _build_allocation(self, instances, unassigned, overrides):
@@ -471,35 +539,29 @@ class RiskPage(QWidget):
             self.body.addWidget(card)
             return
 
-        # ── stacked overview bar ─────────────────────────────────────────────
-        bar_outer = QFrame()
-        bar_outer.setFixedHeight(28)
-        bar_outer.setStyleSheet(
-            f"background: {T.BG_ALT}; border-radius: 8px; border: none;"
-        )
-        bar_lay = QHBoxLayout(bar_outer)
-        bar_lay.setContentsMargins(0, 0, 0, 0)
-        bar_lay.setSpacing(1)
-
-        for i, r in enumerate(rows):
-            seg = QFrame()
-            color = _PALETTE[i % len(_PALETTE)]
-            # Round left corners on first segment, right on last
-            radius = ""
-            if i == 0:
-                radius = "border-top-left-radius: 7px; border-bottom-left-radius: 7px;"
-            if i == len(rows) - 1:
-                radius += "border-top-right-radius: 7px; border-bottom-right-radius: 7px;"
-            seg.setStyleSheet(
-                f"QFrame {{ background: {color}; border: none; {radius} }}"
-            )
-            weight = max(1, int(r["pct"] * 10))
-            bar_lay.addWidget(seg, weight)
-
-        lay.addWidget(bar_outer)
+        # ── two pie charts side by side: by strategy | by ticker ─────────────
+        pie_row = QHBoxLayout()
+        pie_row.setSpacing(16)
+        pie_row.addWidget(self._build_pie_chart(
+            labels=[(r.get("name") or r["root"]) for r in rows],
+            values=[r["capital"] for r in rows],
+            title="By Strategy",
+        ))
+        # Aggregate by ticker
+        ticker_totals: dict = {}
+        for r in rows:
+            root = r["root"] or "—"
+            ticker_totals[root] = ticker_totals.get(root, 0.0) + r["capital"]
+        ticker_items = sorted(ticker_totals.items(), key=lambda x: x[1], reverse=True)
+        pie_row.addWidget(self._build_pie_chart(
+            labels=[t for t, _ in ticker_items],
+            values=[v for _, v in ticker_items],
+            title="By Ticker",
+        ))
+        lay.addLayout(pie_row)
 
         # ── column headers ───────────────────────────────────────────────────
-        lay.addSpacing(6)
+        lay.addSpacing(10)
         hdr_row = QHBoxLayout()
         hdr_row.setContentsMargins(22, 0, 0, 0)
         hdr_row.setSpacing(0)
