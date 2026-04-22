@@ -58,13 +58,16 @@ class PortfolioWorker(QThread):
     # YTD transaction TTL: don't re-fetch within the same hour.
     _YTD_TTL_SECONDS = 3600
 
-    def __init__(self, token, creds=None, ytd_cache=None):
+    def __init__(self, token, creds=None, ytd_cache=None, year_start_cache=None):
         super().__init__()
         self.token      = token
         self.creds      = creds
         # ytd_cache is a mutable dict shared with PortfolioScreen so it
         # survives across worker instances (i.e. across live-mode refreshes).
-        self._ytd_cache = ytd_cache if ytd_cache is not None else {}
+        self._ytd_cache        = ytd_cache        if ytd_cache        is not None else {}
+        # year_start_cache holds Jan-1 NetLiq per account — doesn't change
+        # during a session so we fetch it once and reuse forever.
+        self._year_start_cache = year_start_cache if year_start_cache is not None else {}
 
     # ── Per-account helpers ──────────────────────────────────────────────────
 
@@ -85,6 +88,14 @@ class PortfolioWorker(QThread):
         }
         return txns
 
+    def _year_start_nl(self, num):
+        """Return Jan-1 NetLiq for this account, cached indefinitely."""
+        if num in self._year_start_cache:
+            return self._year_start_cache[num]
+        val = api.get_year_start_net_liq(self.token, num)
+        self._year_start_cache[num] = val
+        return val
+
     def _fetch_one(self, acct):
         """
         Fetch all data for one account using two parallel phases:
@@ -96,14 +107,16 @@ class PortfolioWorker(QThread):
         if not num:
             return None
         try:
-            # ── Phase 1: three independent calls in parallel ─────────────
-            with ThreadPoolExecutor(max_workers=3) as ex:
+            # ── Phase 1: four independent calls in parallel ──────────────
+            with ThreadPoolExecutor(max_workers=4) as ex:
                 f_bal = ex.submit(api.get_balances,   self.token, num)
                 f_pos = ex.submit(api.get_positions,  self.token, num)
                 f_ytd = ex.submit(self._ytd_txns,     num)
+                f_ny  = ex.submit(self._year_start_nl, num)
                 balances      = f_bal.result()
                 positions_raw = f_pos.result()
                 ytd_txns      = f_ytd.result()
+                year_start_nl = f_ny.result()
 
             positions = [Position(p) for p in positions_raw]
 
@@ -137,12 +150,13 @@ class PortfolioWorker(QThread):
                 p.attach_quote(quotes.get(p.symbol))
 
             return {
-                "number":    num,
-                "nickname":  acct.get("nickname") or num,
-                "balances":  balances,
-                "positions": positions,
-                "metrics":   metrics,
-                "ytd_txns":  ytd_txns,
+                "number":             num,
+                "nickname":           acct.get("nickname") or num,
+                "balances":           balances,
+                "positions":          positions,
+                "metrics":            metrics,
+                "ytd_txns":           ytd_txns,
+                "year_start_net_liq": year_start_nl,
             }
         except Exception:
             return None   # account-level error: skip this account gracefully
@@ -437,9 +451,10 @@ class PortfolioScreen(QWidget):
         self._accounts  = []
         self._alerted   = {}   # {(strategy_id, condition_type): severity} — prevents repeat alerts
         self._ytd_cache = {}   # {account_number: {fetched_at, transactions}} — shared across workers
-        self._streamer       = None   # QuoteStreamer (live mode only)
-        self._strategy_cards = []     # [StrategyCard] — current My Strategies cards
-        self._ua_cards       = []     # [StrategyCard] — current Unassigned cards
+        self._streamer        = None   # QuoteStreamer (live mode only)
+        self._strategy_cards  = []     # [StrategyCard] — current My Strategies cards
+        self._ua_cards        = []     # [StrategyCard] — current Unassigned cards
+        self._year_start_cache = {}    # {acct_num: jan1_net_liq} — fetched once per session
 
         self.strategies_all = api.load_strategies()   # {acct_num: [entries]}
         self.history_all    = api.load_history()      # {acct_num: [entries]}
@@ -776,25 +791,35 @@ class PortfolioScreen(QWidget):
         except (TypeError, ValueError):
             pass
 
-        # ── Refresh P/L YTD and YTD W/Fees (they include open P&L) ───────────
-        # Both depend on the same open_pnl_now which just changed.
-        # ytd_realized + ytd_fees were cached by _render() so we don't need to
-        # re-iterate every YTD transaction on every quote tick.
+        # ── Refresh P/L YTD and YTD W/Fees with the NetLiq-delta formula ────
+        # NetLiq from the balance API only updates on the 15s polling cycle, so
+        # we approximate the live NetLiq as:
+        #   live_NetLiq ≈ NetLiq_at_balance_fetch + (open_pnl_now − open_pnl_at_fetch)
+        # which equals "current cash + current marked-to-market positions".
         try:
-            ytd_realized = getattr(self, "_ytd_realized", 0.0)
-            ytd_fees     = getattr(self, "_ytd_fees",     0.0)
-            ytd_total    = ytd_realized + total_pnl
-            self.ytd_gross_lbl.setText(money(ytd_total, signed=True))
-            self.ytd_gross_lbl.setStyleSheet(
-                f"color: {pnl_color(ytd_total)}; font-size: 22px; font-weight: bold; "
-                f"border: none; background: transparent;"
-            )
-            ytd_wf = ytd_total - ytd_fees
-            self.ytd_pnl_lbl.setText(money(ytd_wf, signed=True))
-            self.ytd_pnl_lbl.setStyleSheet(
-                f"color: {pnl_color(ytd_wf)}; font-size: 22px; font-weight: bold; "
-                f"border: none; background: transparent;"
-            )
+            year_start_nl     = getattr(self, "_year_start_nl",     None)
+            balance_net_liq   = getattr(self, "_balance_net_liq",   None)
+            open_pnl_at_fetch = getattr(self, "_open_pnl_at_fetch", None)
+            net_deposits      = getattr(self, "_ytd_net_deposits",  0.0)
+            ytd_fees          = getattr(self, "_ytd_fees",          0.0)
+
+            if (year_start_nl is not None
+                    and balance_net_liq is not None
+                    and open_pnl_at_fetch is not None):
+                live_net_liq = balance_net_liq + (total_pnl - open_pnl_at_fetch)
+                ytd_wf       = live_net_liq - year_start_nl - net_deposits
+                ytd_total    = ytd_wf + ytd_fees
+
+                self.ytd_gross_lbl.setText(money(ytd_total, signed=True))
+                self.ytd_gross_lbl.setStyleSheet(
+                    f"color: {pnl_color(ytd_total)}; font-size: 22px; font-weight: bold; "
+                    f"border: none; background: transparent;"
+                )
+                self.ytd_pnl_lbl.setText(money(ytd_wf, signed=True))
+                self.ytd_pnl_lbl.setStyleSheet(
+                    f"color: {pnl_color(ytd_wf)}; font-size: 22px; font-weight: bold; "
+                    f"border: none; background: transparent;"
+                )
         except (TypeError, ValueError):
             pass
 
@@ -948,7 +973,8 @@ class PortfolioScreen(QWidget):
             f"color: {T.MUTED}; font-size: 13px; border: none; background: transparent;"
         )
         self.status_lbl.setText("Loading portfolio…")
-        self._worker = PortfolioWorker(self.token, self.creds, self._ytd_cache)
+        self._worker = PortfolioWorker(self.token, self.creds, self._ytd_cache,
+                                       self._year_start_cache)
         self._worker.done.connect(self._on_data)
         self._worker.start()
 
@@ -1183,72 +1209,86 @@ class PortfolioScreen(QWidget):
         except (ValueError, TypeError):
             self.day_pnl_lbl.setText("—")
 
-        # ── P/L YTD  (TastyTrade formula: realized-closed + open/unrealized) ───
-        # TastyTrade's "P/L YTD" in their UI includes both realized YTD and
-        # current mark-to-market of open positions.  If TT exposes the field
-        # "unrealized-year-gain" in the balance response we use it directly —
-        # that is the exact number TT displays.  Otherwise we fall back to
-        # summing live position P&L.
+        # ── YTD P&L via the NetLiq-delta formula ────────────────────────────
+        # Account-level math that works for any broker:
+        #
+        #     P/L YTD w/Fees  =  NetLiq_today − NetLiq_Jan1 − Net Deposits YTD
+        #     P/L YTD (gross) =  P/L YTD w/Fees + Fees YTD
+        #
+        # NetLiq already reflects every cent paid in fees (they came out of
+        # cash), so the delta is naturally net-of-fees.  Adding fees back gives
+        # the gross figure.  No reliance on broker-specific gain/loss fields.
+
+        # Sum YTD fees (any "fee" or "commission" field) — generic matcher
+        # catches every fee type the broker may charge, current or future.
+        ytd_fees = 0.0
+        for t in ytd_txns:
+            if (t.get("transaction-type") or "") not in ("Trade", "Receive Deliver"):
+                continue
+            for k, v in t.items():
+                if v is None:
+                    continue
+                kl = str(k).lower()
+                if not ("fee" in kl or "commission" in kl):
+                    continue
+                if kl.endswith("-effect") or kl.endswith("-id") \
+                        or "description" in kl:
+                    continue
+                try:
+                    ytd_fees += abs(float(v))
+                except (TypeError, ValueError):
+                    pass
+
+        # Sum YTD net deposits / withdrawals (Money Movement transactions)
+        net_deposits = 0.0
+        for t in ytd_txns:
+            ttype = (t.get("transaction-type") or "").lower()
+            if ttype != "money movement":
+                continue
+            try:
+                val = float(t.get("value") or 0)
+                eff = (t.get("value-effect") or "").lower()
+                net_deposits += val if "credit" in eff else -val
+            except (TypeError, ValueError):
+                pass
+
         try:
-            ytd_realized = _signed_gain("realized-year-gain")
+            current_nl    = float(bal.get("net-liquidating-value") or 0)
+            year_start_nl = acct.get("year_start_net_liq")
 
-            # Prefer TT's own field if present (most accurate)
-            if bal.get("unrealized-year-gain") is not None:
-                unrealized_ytd = _signed_gain("unrealized-year-gain")
+            if year_start_nl is not None:
+                ytd_wf    = current_nl - year_start_nl - net_deposits
+                ytd_total = ytd_wf + ytd_fees
             else:
-                unrealized_ytd = sum(p.pnl for p in positions_now)
+                # Fallback if balance-snapshots endpoint failed: sum realized
+                # closed-trade P&L from balance + live unrealized.  Less exact.
+                ytd_total = _signed_gain("realized-year-gain") + sum(p.pnl for p in positions_now)
+                ytd_wf    = ytd_total - ytd_fees
 
-            ytd_total = ytd_realized + unrealized_ytd
             self.ytd_gross_lbl.setText(money(ytd_total, signed=True))
             self.ytd_gross_lbl.setStyleSheet(
                 f"color: {pnl_color(ytd_total)}; font-size: 22px; font-weight: bold; "
                 f"border: none; background: transparent;"
             )
-        except (ValueError, TypeError):
-            ytd_realized   = 0.0
-            unrealized_ytd = 0.0
-            ytd_total      = 0.0
-            self.ytd_gross_lbl.setText("—")
-
-        # ── YTD W/Fees  (TastyTrade formula: P/L YTD − YTD fees) ────────────
-        # Sum every numeric field on each YTD Trade / Receive-Deliver record
-        # whose name contains "fee" or "commission".  Generic matching catches
-        # every fee TastyTrade charges (reg, exchange, clearing, options, etc.)
-        # including any new fee types they might add in the future.
-        try:
-            ytd_fees = 0.0
-            for t in ytd_txns:
-                if (t.get("transaction-type") or "") not in ("Trade", "Receive Deliver"):
-                    continue
-                for k, v in t.items():
-                    if v is None:
-                        continue
-                    kl = str(k).lower()
-                    # Skip id/effect/description fields that carry "fee" in the
-                    # name but aren't amounts.
-                    if not ("fee" in kl or "commission" in kl):
-                        continue
-                    if kl.endswith("-effect") or kl.endswith("-id") \
-                            or "description" in kl:
-                        continue
-                    try:
-                        ytd_fees += abs(float(v))
-                    except (TypeError, ValueError):
-                        pass
-
-            # Cache for live-mode price updates so _on_price_update can
-            # recompute these tiles without re-reading all transactions.
-            self._ytd_realized = ytd_realized
-            self._ytd_fees     = ytd_fees
-
-            ytd_wf = ytd_total - ytd_fees
             self.ytd_pnl_lbl.setText(money(ytd_wf, signed=True))
             self.ytd_pnl_lbl.setStyleSheet(
                 f"color: {pnl_color(ytd_wf)}; font-size: 22px; font-weight: bold; "
                 f"border: none; background: transparent;"
             )
+
+            # ── Cache values for live-mode incremental updates ──────────────
+            # When marks change between balance refreshes we approximate
+            # NetLiq_now ≈ NetLiq_at_balance_fetch + (open_pnl_now − open_pnl_at_fetch).
+            # Save the references the live path needs.
+            self._ytd_fees           = ytd_fees
+            self._ytd_net_deposits   = net_deposits
+            self._year_start_nl      = year_start_nl
+            self._balance_net_liq    = current_nl
+            self._open_pnl_at_fetch  = sum(p.pnl for p in positions_now)
+
         except (ValueError, TypeError):
             self.ytd_pnl_lbl.setText("—")
+            self.ytd_gross_lbl.setText("—")
 
         self._clear_layout(self.my_container)
         self._clear_layout(self.ua_container)

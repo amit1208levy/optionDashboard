@@ -233,6 +233,44 @@ def get_transactions(token, account_number, per_page=250, max_pages=40):
     return items
 
 
+def get_year_start_net_liq(token, account_number):
+    """
+    Return the net-liquidating-value at the start of the current calendar year,
+    taken from the last trading-day EOD balance-snapshot on or before Jan 1.
+
+    Walks back up to 10 days to handle weekends / holidays (New Year's Day
+    is never a trading day).  Returns None if no snapshot found.
+    """
+    from datetime import date, timedelta
+    year = date.today().year
+    for days_back in range(0, 12):
+        target = date(year, 1, 1) - timedelta(days=days_back)
+        try:
+            r = requests.get(
+                f"{BASE}/accounts/{account_number}/balance-snapshots",
+                headers=auth_headers(token),
+                params={
+                    "snapshot-date": target.isoformat(),
+                    "time-of-day":   "EOD",
+                },
+                timeout=10,
+            )
+            if r.status_code != 200:
+                continue
+            items = r.json().get("data", {}).get("items", []) or []
+            if not items:
+                continue
+            val = items[0].get("net-liquidating-value")
+            if val is not None:
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    continue
+        except requests.exceptions.RequestException:
+            continue
+    return None
+
+
 def get_transactions_ytd(token, account_number):
     """
     Fetch all Trade / Receive-Deliver transactions for the current calendar year.
