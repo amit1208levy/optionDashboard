@@ -247,6 +247,11 @@ class Strategy:
     def net_vega(self):  return self._agg("vega")
 
     def _agg(self, key):
+        """
+        Sum Greeks across legs.
+        Equity options: greeks are per-share → multiply by 100 (shares/contract)
+        Futures options: greeks are already per-contract → multiplier 1
+        """
         total = 0.0
         any_set = False
         for l in self.legs:
@@ -254,7 +259,8 @@ class Strategy:
             if v is None:
                 continue
             any_set = True
-            total += l.sign * l.quantity * 100 * v
+            mult = 1 if _is_future_option(l.instrument_type) else 100
+            total += l.sign * l.quantity * mult * v
         return total if any_set else None
 
     def _detect_name(self):
