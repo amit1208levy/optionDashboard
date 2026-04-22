@@ -207,7 +207,8 @@ def compute_ytd_pnl(access_token: str, account_number: str,
                 else:
                     sub = t.get("transaction-sub-type") or "(none)"
                     if sub not in ("Balance Adjustment", "Credit Interest",
-                                    "Debit Interest", "Subscription Fee"):
+                                    "Debit Interest", "Subscription Fee",
+                                    "Dividend", "Mark to Market"):
                         unknown_subs[sub] = unknown_subs.get(sub, 0.0) \
                                           + _signed_value(t)
 

@@ -56,49 +56,19 @@ def main() -> int:
             print("  EXCEPTION in pnl.compute_ytd_pnl():")
             traceback.print_exc()
 
-        # 2. Cross-check by running each SDK call individually
-        print("\n[Direct SDK calls]")
+        # 2. Show Money Movement breakdown from the raw transactions
+        print("\n[Money Movement breakdown]")
         try:
-            from tastytrade import Account
-            sess = pnl.make_oauth_session(token)
-            account = Account.model_construct(account_number=num)
-
-            print("  get_balances() ...")
-            bal = account.get_balances(sess)
-            print(f"    net_liquidating_value = {bal.net_liquidating_value}")
-
-            print("  get_history(start_date=Jan 1) ...")
-            from datetime import date
-            txns = account.get_history(sess, start_date=date(date.today().year, 1, 1))
-            print(f"    {len(txns)} transactions")
-            if txns:
-                t = txns[0]
-                print(f"    first: type={t.transaction_type!r} sub={t.transaction_sub_type!r} "
-                      f"value={t.value} commission={t.commission}")
-
-            # Breakdown of every Money Movement transaction so we can see
-            # which sub-types should count as deposits vs P&L
-            print("  Money Movement breakdown:")
+            txns = pnl._get_history_ytd(token, num)
             from collections import defaultdict
             mm_by_sub = defaultdict(lambda: {"count": 0, "sum": 0.0})
             for t in txns:
-                if (t.transaction_type or "").lower() == "money movement":
-                    sub = t.transaction_sub_type or "(none)"
+                if (t.get("transaction-type") or "").lower() == "money movement":
+                    sub = t.get("transaction-sub-type") or "(none)"
                     mm_by_sub[sub]["count"] += 1
-                    mm_by_sub[sub]["sum"]   += float(t.value or 0)
+                    mm_by_sub[sub]["sum"]   += pnl._signed_value(t)
             for sub, info in sorted(mm_by_sub.items()):
-                print(f"    {sub:35s} count={info['count']:>3d}  sum={info['sum']:+.2f}")
-
-            print("  get_net_liquidating_value_history(start_time=Jan 1) ...")
-            from datetime import datetime, timezone
-            start = datetime(date.today().year, 1, 1, tzinfo=timezone.utc)
-            hist = account.get_net_liquidating_value_history(sess, start_time=start)
-            print(f"    {len(hist)} snapshots")
-            if hist:
-                first = hist[0]
-                print(f"    first snapshot fields: {list(first.model_fields.keys())}")
-                print(f"    first snapshot data:   {first.model_dump()}")
-
+                print(f"  {sub:35s} count={info['count']:>3d}  sum={info['sum']:+.2f}")
         except Exception:
             print("  EXCEPTION:")
             traceback.print_exc()
