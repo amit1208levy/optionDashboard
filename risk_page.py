@@ -726,6 +726,15 @@ class RiskPage(QWidget):
         chart.setVisible(False)
         lay.addWidget(chart)
 
+        # ── Least-neutral strategies dropdown ────────────────────────────
+        # Shows strategies sorted by magnitude of their contribution to the
+        # axis this chart represents:
+        #   SPY → |beta-weighted delta|
+        #   VIX → |net vega|
+        metric_key = "bwd" if key == "spy" else "vega"
+        drop = self._build_least_neutral_dropdown(metric_key)
+        lay.addWidget(drop)
+
         self.body.addWidget(card)
 
         if key == "spy":
@@ -734,6 +743,157 @@ class RiskPage(QWidget):
         else:
             self._vix_chart   = chart
             self._vix_loading = loading
+
+    def _build_least_neutral_dropdown(self, metric_key: str):
+        """
+        Collapsible list of the strategies furthest from neutral for the
+        given risk axis: 'bwd' for SPY chart, 'vega' for VIX chart.
+        """
+        wrap = QFrame()
+        wrap.setStyleSheet(
+            f"QFrame {{ background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 8px; }}"
+        )
+        out = QVBoxLayout(wrap)
+        out.setContentsMargins(0, 0, 0, 0)
+        out.setSpacing(0)
+
+        label = ("Least-neutral strategies by |β-Wtd Δ|"
+                 if metric_key == "bwd"
+                 else "Least-neutral strategies by |Net Vega|")
+
+        # Toggle header
+        header = QPushButton(f"▸  {label}")
+        header.setCursor(Qt.CursorShape.PointingHandCursor)
+        header.setStyleSheet(
+            f"QPushButton {{ text-align: left; background: transparent; "
+            f"color: {T.TEXT_DIM}; border: none; padding: 10px 14px; "
+            f"font-size: 12px; font-weight: bold; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT}; }}"
+        )
+        out.addWidget(header)
+
+        body = QFrame()
+        body.setStyleSheet("background: transparent; border: none;")
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(14, 0, 14, 14)
+        body_lay.setSpacing(4)
+        body.setVisible(False)
+        out.addWidget(body)
+
+        # Build the sorted list now
+        rows = self._least_neutral_rows(metric_key)
+        if not rows:
+            empty = QLabel("No strategies to rank.")
+            empty.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 11px; border: none; padding: 6px 0;"
+            )
+            body_lay.addWidget(empty)
+        else:
+            for r in rows:
+                body_lay.addWidget(self._build_neutrality_row(r, metric_key))
+
+        def _toggle():
+            vis = not body.isVisible()
+            body.setVisible(vis)
+            header.setText(f"{'▾' if vis else '▸'}  {label}")
+        header.clicked.connect(_toggle)
+
+        return wrap
+
+    def _least_neutral_rows(self, metric_key: str):
+        """Return strategies sorted by |metric| descending, with ticker + P&L."""
+        from models import symbol_beta, _is_future_option, _CONTRACT_MULT
+
+        acct = self.portfolio.current_account() if self.portfolio else None
+        if not acct:
+            return []
+        positions   = acct["positions"]
+        metrics     = acct.get("metrics") or {}
+        strat_raw   = self.portfolio.strategies_raw
+        instances   = [StrategyInstance(d, positions) for d in strat_raw]
+        leftover    = unassigned_positions(positions, strat_raw)
+        unassigned  = group_unassigned(leftover)
+
+        def _strategy_bwd(s):
+            total = 0.0
+            for l in s.legs:
+                if not l.is_option or l.delta is None:
+                    continue
+                if _is_future_option(l.instrument_type):
+                    mult = float(_CONTRACT_MULT.get(l.root or "", 1))
+                else:
+                    mult = 100.0
+                beta = symbol_beta(metrics.get(l.root)) or 1.0
+                total += l.delta * l.quantity * mult * l.sign * beta
+            return total
+
+        def _metric(s):
+            if metric_key == "bwd":
+                return _strategy_bwd(s)
+            # Vega: dollar vega of the strategy
+            return s.net_vega or 0.0
+
+        rows = []
+        for s in instances + unassigned:
+            val = _metric(s)
+            if val is None:
+                continue
+            rows.append({
+                "name":  s.name,
+                "root":  s.root or "—",
+                "value": float(val),
+                "pnl":   s.pnl,
+            })
+        rows.sort(key=lambda r: abs(r["value"]), reverse=True)
+        return rows
+
+    def _build_neutrality_row(self, r, metric_key):
+        w = QFrame()
+        w.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 6px; }}"
+        )
+        hl = QHBoxLayout(w)
+        hl.setContentsMargins(10, 6, 10, 6)
+        hl.setSpacing(10)
+
+        name_lbl = QLabel(r["name"])
+        name_lbl.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 12px; font-weight: bold; border: none;"
+        )
+        hl.addWidget(name_lbl, 1)
+
+        root_lbl = QLabel(r["root"])
+        root_lbl.setStyleSheet(
+            f"color: white; background: {T.ACCENT}; border: none; border-radius: 4px; "
+            f"padding: 1px 6px; font-size: 10px; font-weight: bold;"
+        )
+        hl.addWidget(root_lbl)
+
+        val = r["value"]
+        # Color: green for long exposure, red for short.  For vega, negative
+        # vega is a short-vol position (risky if IV spikes), red.
+        val_color = pnl_color(val) if metric_key == "vega" else (
+            T.GREEN if val > 0 else (T.RED if val < 0 else T.MUTED)
+        )
+        label = "β-Wtd Δ" if metric_key == "bwd" else "Vega"
+        val_lbl = QLabel(f"{label} {val:+,.0f}")
+        val_lbl.setFixedWidth(150)
+        val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        val_lbl.setStyleSheet(
+            f"color: {val_color}; font-size: 12px; font-weight: bold; border: none;"
+        )
+        hl.addWidget(val_lbl)
+
+        pnl_lbl = QLabel(money(r["pnl"], signed=True))
+        pnl_lbl.setFixedWidth(100)
+        pnl_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        pnl_lbl.setStyleSheet(
+            f"color: {pnl_color(r['pnl'])}; font-size: 12px; font-weight: bold; border: none;"
+        )
+        hl.addWidget(pnl_lbl)
+        return w
 
     def _on_prices(self, spy: float, vix: float,
                    net_liq: float, bwd: float, bwg: float, net_vega: float):
