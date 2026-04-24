@@ -1571,23 +1571,36 @@ class PortfolioScreen(QWidget):
             f"border-radius: 6px; padding: 0 16px; font-weight: bold; }}"
             f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
         )
-        download.setText("⬇  Update now")
-        def _go():
-            download.setEnabled(False)
-            download.setText("Updating…")
-            ok, msg = updater.pull()
-            if not ok:
-                QMessageBox.warning(dlg, "Update failed", msg)
-                download.setEnabled(True)
-                download.setText("⬇  Update now")
-                return
-            QMessageBox.information(
-                dlg, "Update installed",
-                "The app will now relaunch with the new version.",
-            )
-            dlg.accept()
-            self._relaunch()
-        download.clicked.connect(_go)
+
+        # Bundled .app can't self-update via git — point the user to GitHub
+        # Releases instead so they can grab a fresh .app.
+        if result.get("bundle"):
+            download.setText("↗  Open GitHub")
+            def _go_bundle():
+                import webbrowser
+                webbrowser.open(
+                    "https://github.com/amit1208levy/optionDashboard/releases"
+                )
+                dlg.accept()
+            download.clicked.connect(_go_bundle)
+        else:
+            download.setText("⬇  Update now")
+            def _go():
+                download.setEnabled(False)
+                download.setText("Updating…")
+                ok, msg = updater.pull()
+                if not ok:
+                    QMessageBox.warning(dlg, "Update failed", msg)
+                    download.setEnabled(True)
+                    download.setText("⬇  Update now")
+                    return
+                QMessageBox.information(
+                    dlg, "Update installed",
+                    "The app will now relaunch with the new version.",
+                )
+                dlg.accept()
+                self._relaunch()
+            download.clicked.connect(_go)
         row.addWidget(download)
         lay.addLayout(row)
         dlg.exec()
