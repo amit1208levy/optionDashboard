@@ -1870,18 +1870,7 @@ class _LegGroupDialog(QDialog):
 
         self._boxes = []
         for leg in all_legs:
-            cb = QCheckBox(self._leg_label(leg))
-            cb.setChecked(leg.symbol in selected)
-            cb.setStyleSheet(
-                f"QCheckBox {{ color: {T.TEXT}; font-size: 12px; border: none; }}"
-                f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
-                f"border: 1px solid {T.BORDER}; background: {T.BG_ALT}; }}"
-                f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; "
-                f"border-color: {T.ACCENT}; }}"
-            )
-            cb.leg_symbol = leg.symbol
-            self._boxes.append(cb)
-            root.addWidget(cb)
+            root.addWidget(self._build_leg_row(leg, leg.symbol in selected))
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1890,17 +1879,90 @@ class _LegGroupDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-    @staticmethod
-    def _leg_label(leg):
-        parts = [leg.direction_label]
+    def _build_leg_row(self, leg, selected):
+        """Checkbox row with full leg detail so the user can tell what they're picking."""
+        from strategy_card import money, pnl_color
+        row = QFrame()
+        row.setStyleSheet(
+            f"QFrame {{ background: #12151d; border: 1px solid {T.BORDER}; "
+            f"border-radius: 8px; }}"
+        )
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(12, 8, 12, 8)
+        hl.setSpacing(10)
+
+        cb = QCheckBox()
+        cb.setChecked(selected)
+        cb.setStyleSheet(
+            f"QCheckBox::indicator {{ width: 18px; height: 18px; border-radius: 4px; "
+            f"border: 1px solid {T.BORDER}; background: {T.BG_ALT}; }}"
+            f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+        )
+        cb.leg_symbol = leg.symbol
+        self._boxes.append(cb)
+        hl.addWidget(cb)
+
+        # Direction badge
+        dir_color = T.GREEN if leg.is_long else T.RED
+        dir_badge = QLabel(leg.direction_label[0])    # L / S
+        dir_badge.setFixedSize(22, 22)
+        dir_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dir_badge.setStyleSheet(
+            f"color: white; background: {dir_color}; "
+            f"border-radius: 5px; font-size: 11px; font-weight: bold;"
+        )
+        hl.addWidget(dir_badge)
+
+        # Info block: two lines
+        info = QVBoxLayout()
+        info.setSpacing(2)
+
+        # Headline: Root · Type Strike · Qty
+        head_parts = []
+        if leg.root:
+            head_parts.append(leg.root)
         if leg.is_option and leg.strike:
-            parts.append(f"{leg.type_label} {leg.strike:g}")
+            head_parts.append(f"{leg.type_label} {leg.strike:g}")
         else:
-            parts.append(leg.type_label)
+            head_parts.append(leg.type_label)
+        head_parts.append(f"×{leg.quantity:g}")
+        head = QLabel("  ·  ".join(head_parts))
+        head.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 13px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        info.addWidget(head)
+
+        # Detail: expiry · DTE · mark · P&L
+        bits = []
         if leg.expires_at:
-            parts.append(leg.expires_at.strftime("%b %d %Y"))
-        parts.append(f"×{leg.quantity:g}")
-        return "  ·  ".join(parts)
+            bits.append(leg.expires_at.strftime("%b %d %Y"))
+        if leg.dte is not None:
+            bits.append(f"{leg.dte}d")
+        bits.append(f"Mark ${leg.mark_price:,.2f}")
+        detail_left = QLabel("  ·  ".join(bits))
+        detail_left.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
+        )
+        info.addWidget(detail_left)
+
+        hl.addLayout(info, 1)
+
+        # P&L on the right
+        pnl_lbl = QLabel(money(leg.pnl, signed=True))
+        pnl_lbl.setStyleSheet(
+            f"color: {pnl_color(leg.pnl)}; font-size: 13px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        pnl_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        hl.addWidget(pnl_lbl)
+
+        # Clicking anywhere on the row toggles the checkbox
+        def _toggle(ev):
+            cb.setChecked(not cb.isChecked())
+        row.mousePressEvent = _toggle
+
+        return row
 
     def result_name(self):
         return self._name.text().strip()
