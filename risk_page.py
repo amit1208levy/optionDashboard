@@ -231,6 +231,9 @@ class _ScenarioChart(QFrame):
         # Canvas
         self.canvas = _make_canvas(width_px=800, height_px=height_px)
         self.canvas.setParent(self)
+        # Let mouse-wheel events propagate up to the scroll area instead of
+        # being swallowed by the matplotlib canvas.
+        self.canvas.wheelEvent = lambda ev: ev.ignore()
 
         # Zoom buttons overlaid top-right
         self.zoom_in_btn  = self._zoom_btn("＋", self)
@@ -350,12 +353,30 @@ class _ScenarioChart(QFrame):
         if x is None:
             self._hide_cursor()
             return
+        # Clamp to visible x range so the cursor never "jumps" to the edge
+        # sample when the mouse wanders past the plotted data.
+        xl, xr = self._ax.get_xlim()
+        if x < xl or x > xr:
+            self._hide_cursor()
+            return
+
         idx = min(range(len(self._xs)), key=lambda i: abs(self._xs[i] - x))
         sx, sy = self._xs[idx], self._ys[idx]
         self._cursor_line.set_xdata([sx, sx])
         self._cursor_line.set_visible(True)
         self._cursor_dot.set_data([sx], [sy])
         self._cursor_dot.set_visible(True)
+
+        # Flip the tooltip to the left side when we're close to the right
+        # edge so it doesn't render beyond the axes (and jitter back/forth).
+        mid_x = (xl + xr) / 2
+        if sx > mid_x:
+            self._annot.set_position((-80, 12))
+            self._annot.set_ha("left")
+        else:
+            self._annot.set_position((10, 12))
+            self._annot.set_ha("left")
+
         self._annot.xy = (sx, sy)
         self._annot.set_text(
             f"{self._xlabel}: {self._fmt_x(sx)}\n"
