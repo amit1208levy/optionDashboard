@@ -160,3 +160,103 @@ def pull():
     if ok:
         return True, out or "Up to date."
     return False, (err or out or "git pull failed.")
+
+
+# ── .app self-update (bundled mode) ──────────────────────────────────────────
+
+def _find_app_bundle_path():
+    """Return the absolute path of the running .app bundle, or None."""
+    if not _is_frozen_bundle():
+        return None
+    exe = sys.executable  # /…/OptionsDashboard.app/Contents/MacOS/OptionsDashboard
+    app = os.path.dirname(os.path.dirname(os.path.dirname(exe)))
+    return app if app.endswith(".app") else None
+
+
+# URL of the .app.zip we upload as a GitHub Release asset.
+# Using /releases/latest/download/<asset> auto-follows the most recent tag.
+_APP_ZIP_URL = (
+    "https://github.com/amit1208levy/optionDashboard/releases/latest/"
+    "download/OptionsDashboard.app.zip"
+)
+
+
+def self_install():
+    """
+    Download the latest .app.zip from GitHub Releases, unpack it, and replace
+    the running bundle.  The replace+relaunch is delegated to a detached
+    shell script so we can cleanly exit this process while it swaps the app.
+
+    Returns (ok, message).  On success the current process exits before
+    returning.
+    """
+    import tempfile, urllib.request, zipfile, subprocess
+
+    app_path = _find_app_bundle_path()
+    if not app_path:
+        return False, "Couldn't locate the running .app bundle."
+
+    tmpdir   = tempfile.mkdtemp(prefix="optdash-update-")
+    zip_path = os.path.join(tmpdir, "new.zip")
+
+    # 1. Download
+    try:
+        urllib.request.urlretrieve(_APP_ZIP_URL, zip_path)
+    except Exception as e:
+        return False, f"Download failed: {e}"
+
+    # 2. Unpack
+    extract_dir = os.path.join(tmpdir, "extracted")
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(extract_dir)
+    except Exception as e:
+        return False, f"Could not unzip download: {e}"
+
+    new_app = os.path.join(extract_dir, "OptionsDashboard.app")
+    if not os.path.isdir(new_app):
+        # Some zips nest the .app inside another folder
+        for entry in os.listdir(extract_dir):
+            cand = os.path.join(extract_dir, entry, "OptionsDashboard.app")
+            if os.path.isdir(cand):
+                new_app = cand
+                break
+    if not os.path.isdir(new_app):
+        return False, "Downloaded zip didn't contain OptionsDashboard.app."
+
+    # 3. Write a detached bash script that waits for us to exit, replaces the
+    #    bundle, and relaunches.  Running this inside the app itself would
+    #    delete our own binary out from under us.
+    script_path = os.path.join(tmpdir, "replace.sh")
+    our_pid     = os.getpid()
+    with open(script_path, "w") as f:
+        f.write(
+f"""#!/bin/bash
+# Wait for the old app to exit
+while kill -0 {our_pid} 2>/dev/null; do sleep 0.3; done
+sleep 0.5
+
+# Swap bundles
+rm -rf {app_path!r}
+mv {new_app!r} {app_path!r} || cp -R {new_app!r} {app_path!r}
+
+# Clear macOS quarantine attribute so Gatekeeper doesn't block launch
+xattr -cr {app_path!r} 2>/dev/null
+
+open {app_path!r}
+
+# Clean up temp dir
+rm -rf {tmpdir!r}
+"""
+        )
+    os.chmod(script_path, 0o755)
+
+    # 4. Launch the replace script detached, then return — caller will exit.
+    subprocess.Popen(
+        ["/bin/bash", script_path],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return True, "Downloaded — app will relaunch in a moment."

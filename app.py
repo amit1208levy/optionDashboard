@@ -1572,16 +1572,33 @@ class PortfolioScreen(QWidget):
             f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
         )
 
-        # Bundled .app can't self-update via git — point the user to GitHub
-        # Releases instead so they can grab a fresh .app.
+        # Bundled .app: download the latest .app.zip from GitHub Releases
+        # and self-replace.  Falls back to opening the releases page in a
+        # browser if the download/install failed.
         if result.get("bundle"):
-            download.setText("↗  Open GitHub")
+            download.setText("⬇  Update now")
             def _go_bundle():
-                import webbrowser
-                webbrowser.open(
-                    "https://github.com/amit1208levy/optionDashboard/releases"
-                )
+                download.setEnabled(False)
+                download.setText("Downloading…")
+                ok, msg = updater.self_install()
+                if not ok:
+                    import webbrowser
+                    QMessageBox.warning(
+                        dlg, "Update failed",
+                        f"{msg}\n\nOpening GitHub Releases so you can "
+                        f"download manually."
+                    )
+                    webbrowser.open(
+                        "https://github.com/amit1208levy/optionDashboard/releases"
+                    )
+                    download.setEnabled(True)
+                    download.setText("⬇  Update now")
+                    return
+                # Exit cleanly — the detached shell script will relaunch
+                # the new bundle once we're gone.
                 dlg.accept()
+                import sys
+                sys.exit(0)
             download.clicked.connect(_go_bundle)
         else:
             download.setText("⬇  Update now")
