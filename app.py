@@ -628,11 +628,23 @@ class PortfolioScreen(QWidget):
         risk_btn.clicked.connect(self.risk_requested.emit)
         hl.addWidget(risk_btn)
 
-        refresh_btn = QPushButton("↻  Refresh")
-        refresh_btn.setFixedHeight(32)
-        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        refresh_btn.clicked.connect(self._load_data)
-        hl.addWidget(refresh_btn)
+        self.refresh_btn = QPushButton("↻  Refresh")
+        self.refresh_btn.setFixedHeight(32)
+        self.refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.refresh_btn.clicked.connect(self._load_data)
+        hl.addWidget(self.refresh_btn)
+
+        # Spinner animation state for the refresh button
+        self._spin_timer = QTimer(self)
+        self._spin_timer.setInterval(90)
+        self._spin_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        self._spin_idx = 0
+        self._spin_timer.timeout.connect(self._on_spin_tick)
+
+        self._done_timer = QTimer(self)
+        self._done_timer.setInterval(1200)
+        self._done_timer.setSingleShot(True)
+        self._done_timer.timeout.connect(self._reset_refresh_btn)
 
         self.live_btn = QPushButton("○  Live")
         self.live_btn.setFixedHeight(32)
@@ -1045,12 +1057,42 @@ class PortfolioScreen(QWidget):
             f"color: {T.MUTED}; font-size: 13px; border: none; background: transparent;"
         )
         self.status_lbl.setText("Loading portfolio…")
+
+        # Start the spinner animation on the refresh button
+        self._spin_idx = 0
+        self._spin_timer.start()
+        self._done_timer.stop()
+        self.refresh_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.ACCENT}; "
+            f"border: 1px solid {T.ACCENT}; border-radius: 6px; padding: 0 12px; "
+            f"font-size: 11px; font-weight: bold; }}"
+        )
+
         self._worker = PortfolioWorker(self.token, self.creds, self._ytd_cache,
                                        self._year_start_cache, self._pnl_cache)
         self._worker.done.connect(self._on_data)
         self._worker.start()
 
+    def _on_spin_tick(self):
+        """Advance the refresh-button spinner frame."""
+        self._spin_idx = (self._spin_idx + 1) % len(self._spin_frames)
+        self.refresh_btn.setText(f"{self._spin_frames[self._spin_idx]}  Refreshing")
+
+    def _reset_refresh_btn(self):
+        """Return the refresh button to its idle state."""
+        self.refresh_btn.setText("↻  Refresh")
+        self.refresh_btn.setStyleSheet("")
+
     def _on_data(self, result):
+        # Stop spinner + show "✓ Updated" briefly, then reset
+        self._spin_timer.stop()
+        self.refresh_btn.setText("✓  Updated")
+        self.refresh_btn.setStyleSheet(
+            f"QPushButton {{ background: {T.GREEN_D}; color: white; border: none; "
+            f"border-radius: 6px; padding: 0 12px; font-size: 11px; font-weight: bold; }}"
+        )
+        self._done_timer.start()
+
         # If the worker refreshed an expired access token, adopt it so all
         # subsequent refreshes (live-mode timer, manual refresh) use the new one.
         if result.get("new_token"):
