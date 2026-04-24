@@ -939,6 +939,23 @@ class StrategyDetailPage(QWidget):
     def _build_legs_card(self):
         columns, enabled_greeks = _active_leg_columns()
         frame, lay = self._section_frame(f"Legs ({len(self.strategy.legs)})")
+
+        # + Add Leg button (only for saved instances)
+        if isinstance(self.strategy, StrategyInstance) and self.portfolio:
+            btn_row = QHBoxLayout()
+            btn_row.addStretch()
+            add_btn = QPushButton("+ Add Leg")
+            add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            add_btn.setFixedHeight(28)
+            add_btn.setStyleSheet(
+                f"QPushButton {{ background: {T.PURPLE}; color: white; border: none; "
+                f"border-radius: 6px; padding: 0 14px; font-size: 11px; font-weight: bold; }}"
+                f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
+            )
+            add_btn.clicked.connect(self._on_add_leg)
+            btn_row.addWidget(add_btn)
+            lay.addLayout(btn_row)
+
         lay.addWidget(LegHeader(columns))
 
         # Apply user-defined display order if one has been saved
@@ -957,6 +974,57 @@ class StrategyDetailPage(QWidget):
             body.reordered.connect(self._on_legs_reordered)
         lay.addWidget(body)
         return frame
+
+    def _on_add_leg(self):
+        """Pick an unassigned portfolio leg and attach it to this strategy."""
+        if not isinstance(self.strategy, StrategyInstance) or not self.portfolio:
+            return
+
+        positions = self.portfolio.current_positions()
+        strat_raw = self.portfolio.strategies_raw
+        # Find legs not already in THIS strategy
+        mine = set(self.strategy.leg_symbols)
+        assigned_anywhere = set()
+        owner = {}
+        for raw in strat_raw:
+            for sym in raw.get("legs", []) or []:
+                assigned_anywhere.add(sym)
+                owner[sym] = raw.get("name") or raw.get("id", "?")
+
+        candidates = [p for p in positions if p.symbol not in mine]
+        if not candidates:
+            QMessageBox.information(
+                self, "Add Leg",
+                "No other positions available to add."
+            )
+            return
+
+        dlg = _AddLegDialog(candidates, owner, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        symbols = dlg.result_symbols()
+        if not symbols:
+            return
+
+        # Update persistence: append to this strategy, remove from any others
+        raw = next(
+            (r for r in self.portfolio.strategies_raw if r["id"] == self.strategy.id),
+            None,
+        )
+        if raw is None:
+            return
+        for sym in symbols:
+            # Remove from other strategies first
+            for other in self.portfolio.strategies_raw:
+                if other["id"] == raw["id"]:
+                    continue
+                if sym in (other.get("legs") or []):
+                    other["legs"] = [s for s in other["legs"] if s != sym]
+            # Append to this one
+            if sym not in raw["legs"]:
+                raw["legs"].append(sym)
+        self.portfolio.save_strategies()
+        self.reopen_requested.emit(self.strategy)
 
     def _on_legs_reordered(self, new_symbols: list):
         """Persist the user-defined leg display order to the strategies JSON."""
@@ -1968,4 +2036,131 @@ class _LegGroupDialog(QDialog):
         return self._name.text().strip()
 
     def result_legs(self):
+        return [cb.leg_symbol for cb in self._boxes if cb.isChecked()]
+
+
+# ── Add-leg picker ──────────────────────────────────────────────────────────
+
+class _AddLegDialog(QDialog):
+    """Pick one or more positions to attach to the current strategy."""
+
+    def __init__(self, candidates, owner_by_sym, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Legs")
+        self.setMinimumWidth(520)
+        self.setStyleSheet(T.BASE_STYLE)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 20)
+        root.setSpacing(10)
+
+        title = QLabel("Add legs to this strategy")
+        title.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 14px; font-weight: bold; border: none;"
+        )
+        root.addWidget(title)
+
+        hint = QLabel(
+            "Picking a leg currently assigned to another strategy will move it here."
+        )
+        hint.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        # Scrollable list of candidate legs
+        from PyQt6.QtWidgets import QScrollArea as _SA
+        scroll = _SA()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        list_w = QWidget()
+        list_lay = QVBoxLayout(list_w)
+        list_lay.setContentsMargins(0, 0, 0, 0)
+        list_lay.setSpacing(6)
+
+        self._boxes = []
+        for p in candidates:
+            list_lay.addWidget(self._build_row(p, owner_by_sym.get(p.symbol)))
+        list_lay.addStretch()
+
+        scroll.setWidget(list_w)
+        scroll.setMinimumHeight(320)
+        root.addWidget(scroll, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _build_row(self, p, current_owner):
+        from strategy_card import money, pnl_color
+        row = QFrame()
+        row.setStyleSheet(
+            f"QFrame {{ background: #12151d; border: 1px solid {T.BORDER}; "
+            f"border-radius: 8px; }}"
+        )
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(12, 8, 12, 8)
+        hl.setSpacing(10)
+
+        cb = QCheckBox()
+        cb.setStyleSheet(
+            f"QCheckBox::indicator {{ width: 18px; height: 18px; border-radius: 4px; "
+            f"border: 1px solid {T.BORDER}; background: {T.BG_ALT}; }}"
+            f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+        )
+        cb.leg_symbol = p.symbol
+        self._boxes.append(cb)
+        hl.addWidget(cb)
+
+        dir_color = T.GREEN if p.is_long else T.RED
+        dir_badge = QLabel(p.direction_label[0])
+        dir_badge.setFixedSize(22, 22)
+        dir_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dir_badge.setStyleSheet(
+            f"color: white; background: {dir_color}; border-radius: 5px; "
+            f"font-size: 11px; font-weight: bold;"
+        )
+        hl.addWidget(dir_badge)
+
+        info = QVBoxLayout()
+        info.setSpacing(2)
+        head_parts = []
+        if p.root:
+            head_parts.append(p.root)
+        if p.is_option and p.strike:
+            head_parts.append(f"{p.type_label} {p.strike:g}")
+        else:
+            head_parts.append(p.type_label)
+        head_parts.append(f"×{p.quantity:g}")
+        head = QLabel("  ·  ".join(head_parts))
+        head.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 13px; font-weight: bold; border: none;"
+        )
+        info.addWidget(head)
+
+        bits = []
+        if p.expires_at:
+            bits.append(p.expires_at.strftime("%b %d %Y"))
+        if p.dte is not None:
+            bits.append(f"{p.dte}d")
+        bits.append(f"Mark ${p.mark_price:,.2f}")
+        if current_owner:
+            bits.append(f"(in '{current_owner}' — will be moved)")
+        detail = QLabel("  ·  ".join(bits))
+        detail.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
+        info.addWidget(detail)
+        hl.addLayout(info, 1)
+
+        pnl_lbl = QLabel(money(p.pnl, signed=True))
+        pnl_lbl.setStyleSheet(
+            f"color: {pnl_color(p.pnl)}; font-size: 12px; font-weight: bold; border: none;"
+        )
+        hl.addWidget(pnl_lbl)
+
+        row.mousePressEvent = lambda ev: cb.setChecked(not cb.isChecked())
+        return row
+
+    def result_symbols(self):
         return [cb.leg_symbol for cb in self._boxes if cb.isChecked()]
