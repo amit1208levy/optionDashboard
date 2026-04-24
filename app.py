@@ -1550,14 +1550,24 @@ class PortfolioScreen(QWidget):
             self.update_btn.setToolTip(f"Last update check failed: {err}")
             return
 
-        # Real errors → warn; success → info
+        # Real errors → warn; success → info + offer restart (so source users
+        # who already pulled can load the new code without closing manually).
         if err:
             QMessageBox.warning(self, "Update check failed", err)
         else:
-            QMessageBox.information(
-                self, "Up to date",
-                f"You're on the latest version (v{VERSION})."
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setWindowTitle("Up to date")
+            box.setText(f"You're on the latest version (v{VERSION}).")
+            box.setInformativeText(
+                "If you just pulled new code, restart to load it in memory."
             )
+            restart_btn = box.addButton("Restart now",
+                                         QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("OK", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is restart_btn:
+                self._relaunch()
 
     def _show_update_dialog(self, result):
         dlg = QDialog(self)
