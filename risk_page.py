@@ -580,6 +580,8 @@ class RiskPage(QWidget):
 
         canvas = _make_canvas(width_px=380, height_px=280)
         canvas.setFixedHeight(280)
+        # Let scroll-wheel events bubble up to the page scroll area
+        canvas.wheelEvent = lambda ev: ev.ignore()
         inner.addWidget(canvas)
 
         total = sum(values) or 1.0
