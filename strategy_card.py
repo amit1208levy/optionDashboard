@@ -160,6 +160,19 @@ class StrategyCard(QFrame):
             pop_c = T.GREEN if pop >= 60 else (T.YELLOW if pop >= 40 else T.RED)
         h.addWidget(self._stat("POP", pop_text, pop_c))
 
+        # Day P&L: sum over legs of sign × qty × mult × (mark − close_price)
+        day_pnl = sum(
+            l.sign * l.quantity * l.multiplier * (l.mark_price - l.close_price)
+            for l in strategy.legs
+            if l.close_price and l.close_price > 0 and l.mark_price
+        )
+        if day_pnl == 0:
+            day_text, day_c = "—", T.MUTED
+        else:
+            day_text = money(day_pnl, signed=True)
+            day_c = pnl_color(day_pnl)
+        h.addWidget(self._stat("Day P&L", day_text, day_c))
+
         h.addWidget(self._stat(
             "Open P&L",
             money(strategy.pnl, signed=True),
