@@ -1,11 +1,24 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os, subprocess
+
+# Stamp the current git SHA into the bundle so runtime update-checks can
+# know which commit this .app was built from.
+_sha_file = os.path.join(os.path.abspath(os.path.dirname(SPEC)), "_build_sha.txt")
+try:
+    sha = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"], text=True
+    ).strip()
+    with open(_sha_file, "w") as _f:
+        _f.write(sha)
+except Exception:
+    sha = "unknown"
 
 
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('_build_sha.txt', '.')],
     hiddenimports=['websockets'],
     hookspath=[],
     hooksconfig={},
