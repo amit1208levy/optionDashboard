@@ -799,6 +799,41 @@ class RiskPage(QWidget):
             )
             body_lay.addWidget(empty)
         else:
+            # Explainer for what the sign means
+            if metric_key == "bwd":
+                expl = ("Negative = bearish SPY exposure (gains if SPY drops). "
+                        "Positive = bullish. Values are shares-of-SPY equivalent.")
+            else:
+                expl = ("Negative = short vol (loses if IV spikes). "
+                        "Positive = long vol. Values are \\$ per 1 vol-point.")
+            expl_lbl = QLabel(expl)
+            expl_lbl.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 10px; border: none; "
+                f"padding: 2px 0 6px 0;"
+            )
+            expl_lbl.setWordWrap(True)
+            body_lay.addWidget(expl_lbl)
+
+            # Column headers
+            hdr = QHBoxLayout()
+            hdr.setSpacing(10)
+            for text, width, align in [
+                ("STRATEGY",  0,   Qt.AlignmentFlag.AlignLeft),
+                ("TICKER",    60,  Qt.AlignmentFlag.AlignCenter),
+                ("EXPOSURE", 160,  Qt.AlignmentFlag.AlignRight),
+                ("OPEN P&L", 100,  Qt.AlignmentFlag.AlignRight),
+            ]:
+                l = QLabel(text)
+                l.setStyleSheet(
+                    f"color: {T.MUTED}; font-size: 9px; font-weight: bold; "
+                    f"letter-spacing: 0.6px; border: none;"
+                )
+                if width:
+                    l.setFixedWidth(width)
+                l.setAlignment(align)
+                hdr.addWidget(l, 0 if width else 1)
+            body_lay.addLayout(hdr)
+
             for r in rows:
                 body_lay.addWidget(self._build_neutrality_row(r, metric_key))
 
@@ -864,42 +899,53 @@ class RiskPage(QWidget):
             f"border-radius: 6px; }}"
         )
         hl = QHBoxLayout(w)
-        hl.setContentsMargins(10, 6, 10, 6)
+        hl.setContentsMargins(10, 8, 10, 8)
         hl.setSpacing(10)
 
-        name_lbl = QLabel(r["name"])
+        # Strategy name on the left (takes all remaining space)
+        name_lbl = QLabel(r["name"] or "(unnamed)")
         name_lbl.setStyleSheet(
-            f"color: {T.TEXT}; font-size: 12px; font-weight: bold; border: none;"
+            f"color: {T.TEXT}; font-size: 12px; font-weight: bold; "
+            f"border: none; background: transparent;"
         )
         hl.addWidget(name_lbl, 1)
 
+        # Ticker badge — centered in its column
         root_lbl = QLabel(r["root"])
+        root_lbl.setFixedWidth(60)
+        root_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         root_lbl.setStyleSheet(
             f"color: white; background: {T.ACCENT}; border: none; border-radius: 4px; "
-            f"padding: 1px 6px; font-size: 10px; font-weight: bold;"
+            f"padding: 2px 0; font-size: 10px; font-weight: bold;"
         )
         hl.addWidget(root_lbl)
 
+        # Exposure: bullish/bearish (BWD) or long/short vol (Vega) +  number
         val = r["value"]
-        # Color: green for long exposure, red for short.  For vega, negative
-        # vega is a short-vol position (risky if IV spikes), red.
-        val_color = pnl_color(val) if metric_key == "vega" else (
-            T.GREEN if val > 0 else (T.RED if val < 0 else T.MUTED)
+        if metric_key == "bwd":
+            direction = "Bullish" if val > 0 else ("Bearish" if val < 0 else "Neutral")
+            val_color = T.GREEN if val > 0 else (T.RED if val < 0 else T.MUTED)
+            exp_text  = f"{direction}  ·  {val:+,.0f}"
+        else:
+            direction = "Long vol" if val > 0 else ("Short vol" if val < 0 else "Neutral")
+            val_color = T.GREEN if val > 0 else (T.RED if val < 0 else T.MUTED)
+            exp_text  = f"{direction}  ·  {val:+,.0f}"
+
+        exp_lbl = QLabel(exp_text)
+        exp_lbl.setFixedWidth(160)
+        exp_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        exp_lbl.setStyleSheet(
+            f"color: {val_color}; font-size: 12px; font-weight: bold; "
+            f"border: none; background: transparent;"
         )
-        label = "β-Wtd Δ" if metric_key == "bwd" else "Vega"
-        val_lbl = QLabel(f"{label} {val:+,.0f}")
-        val_lbl.setFixedWidth(150)
-        val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        val_lbl.setStyleSheet(
-            f"color: {val_color}; font-size: 12px; font-weight: bold; border: none;"
-        )
-        hl.addWidget(val_lbl)
+        hl.addWidget(exp_lbl)
 
         pnl_lbl = QLabel(money(r["pnl"], signed=True))
         pnl_lbl.setFixedWidth(100)
         pnl_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         pnl_lbl.setStyleSheet(
-            f"color: {pnl_color(r['pnl'])}; font-size: 12px; font-weight: bold; border: none;"
+            f"color: {pnl_color(r['pnl'])}; font-size: 12px; font-weight: bold; "
+            f"border: none; background: transparent;"
         )
         hl.addWidget(pnl_lbl)
         return w
