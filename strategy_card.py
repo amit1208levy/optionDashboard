@@ -1,5 +1,7 @@
-"""Compact strategy card — essentials only. Click opens full detail page."""
-from PyQt6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QLabel
+"""Compact strategy card — essentials only.
+Click toggles an expanded legs view; a 'View details' button inside the
+expanded section opens the full detail page."""
+from PyQt6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
 from PyQt6.QtCore import Qt, pyqtSignal
 
 import theme as T
@@ -51,6 +53,9 @@ class StrategyCard(QFrame):
         self.metrics = metrics or {}
         self._pnl_val_lbl = None   # QLabel — set by _stat() when is_pnl=True
         self._pnl_pct_lbl = None   # QLabel for pct sub-label
+        self._expanded  = False
+        self._body      = None     # expandable legs container (built lazily)
+        self._chevron   = None
         self.setObjectName("card")
         self.setStyleSheet(
             f"QFrame#card {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
@@ -59,9 +64,18 @@ class StrategyCard(QFrame):
         )
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        h = QHBoxLayout(self)
+        # Outer vertical layout: header row on top, expandable legs below
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Header row (what the card has always shown) ──────────────────
+        header = QFrame()
+        header.setStyleSheet("background: transparent; border: none;")
+        h = QHBoxLayout(header)
         h.setContentsMargins(22, 16, 22, 16)
         h.setSpacing(16)
+        outer.addWidget(header)
 
         # ── Left: name + badges ────────────────────────────────────────────
         left = QVBoxLayout()
@@ -137,12 +151,15 @@ class StrategyCard(QFrame):
             is_pnl=True,
         ))
 
-        chevron = QLabel("›")
-        chevron.setStyleSheet(
+        self._chevron = QLabel("›")
+        self._chevron.setStyleSheet(
             f"color: {T.MUTED}; font-size: 22px; font-weight: bold; "
             f"background: transparent; border: none;"
         )
-        h.addWidget(chevron)
+        h.addWidget(self._chevron)
+
+        # ── Expandable legs body (hidden until user clicks) ───────────────
+        self._outer_lay = outer
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -221,11 +238,134 @@ class StrategyCard(QFrame):
                 f"background: transparent; border: none;"
             )
 
+    # ── Expand / collapse logic ──────────────────────────────────────────────
+
+    def _build_body(self):
+        """Lazily construct the legs table shown when the card is expanded."""
+        if self._body is not None:
+            return
+        body = QFrame()
+        body.setStyleSheet(
+            f"QFrame {{ background: #12151d; border-top: 1px solid {T.BORDER}; "
+            f"border-bottom-left-radius: 13px; border-bottom-right-radius: 13px; }}"
+        )
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(22, 12, 22, 14)
+        lay.setSpacing(4)
+
+        # Header row
+        hdr = QHBoxLayout()
+        hdr.setSpacing(8)
+        for text, width, align in [
+            ("Leg",      0,  Qt.AlignmentFlag.AlignLeft),
+            ("Qty",     50,  Qt.AlignmentFlag.AlignRight),
+            ("Strike",  70,  Qt.AlignmentFlag.AlignRight),
+            ("DTE",     50,  Qt.AlignmentFlag.AlignRight),
+            ("Mark",    70,  Qt.AlignmentFlag.AlignRight),
+            ("P&L",     80,  Qt.AlignmentFlag.AlignRight),
+        ]:
+            lbl = QLabel(text)
+            lbl.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 9px; font-weight: bold; "
+                f"letter-spacing: 0.5px; border: none;"
+            )
+            if width:
+                lbl.setFixedWidth(width)
+            lbl.setAlignment(align)
+            hdr.addWidget(lbl, 0 if width else 1)
+        lay.addLayout(hdr)
+
+        # One row per leg
+        for leg in self.strategy.legs:
+            row = QHBoxLayout()
+            row.setSpacing(8)
+
+            direction = leg.direction_label[0]   # "L" / "S"
+            kind      = leg.type_label            # Call / Put / Stock / Future
+            name_lbl  = QLabel(f"{direction}  {kind}")
+            name_lbl.setStyleSheet(
+                f"color: {T.TEXT_DIM}; font-size: 11px; border: none;"
+            )
+            row.addWidget(name_lbl, 1)
+
+            qty_lbl = QLabel(f"{leg.sign * leg.quantity:+g}")
+            qty_lbl.setFixedWidth(50)
+            qty_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            qty_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 11px; border: none;")
+            row.addWidget(qty_lbl)
+
+            strike_lbl = QLabel(f"{leg.strike:g}" if leg.strike else "—")
+            strike_lbl.setFixedWidth(70)
+            strike_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            strike_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 11px; border: none;")
+            row.addWidget(strike_lbl)
+
+            dte_lbl = QLabel(f"{leg.dte}d" if leg.dte is not None else "—")
+            dte_lbl.setFixedWidth(50)
+            dte_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            dte_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 11px; border: none;")
+            row.addWidget(dte_lbl)
+
+            mark_lbl = QLabel(f"${leg.mark_price:,.2f}")
+            mark_lbl.setFixedWidth(70)
+            mark_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            mark_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 11px; border: none;")
+            row.addWidget(mark_lbl)
+
+            pnl_lbl = QLabel(money(leg.pnl, signed=True))
+            pnl_lbl.setFixedWidth(80)
+            pnl_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+            pnl_lbl.setStyleSheet(
+                f"color: {pnl_color(leg.pnl)}; font-size: 11px; "
+                f"font-weight: bold; border: none;"
+            )
+            row.addWidget(pnl_lbl)
+
+            lay.addLayout(row)
+
+        # "View details" button opens the full detail page
+        lay.addSpacing(4)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn = QPushButton("View full details →")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedHeight(28)
+        btn.setStyleSheet(
+            f"QPushButton {{ background: {T.PURPLE}; color: white; border: none; "
+            f"border-radius: 6px; padding: 0 14px; font-size: 11px; font-weight: bold; }}"
+            f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
+        )
+        btn.clicked.connect(lambda: self.clicked.emit(self.strategy))
+        btn_row.addWidget(btn)
+        lay.addLayout(btn_row)
+
+        self._body = body
+        self._body.setVisible(False)
+        self._outer_lay.addWidget(body)
+
+    def _set_expanded(self, expanded: bool):
+        self._expanded = expanded
+        if expanded:
+            self._build_body()
+        if self._body:
+            self._body.setVisible(expanded)
+        if self._chevron:
+            self._chevron.setText("⌄" if expanded else "›")
+
+    def toggle_expanded(self):
+        self._set_expanded(not self._expanded)
+
     # ── Events ──────────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit(self.strategy)
+            # If the click landed inside the expanded body, let its own
+            # widgets handle it (e.g. the "View details" button).
+            if (self._body is not None and self._body.isVisible()
+                    and self._body.geometry().contains(event.pos())):
+                super().mousePressEvent(event)
+                return
+            self.toggle_expanded()
             event.accept()
         else:
             super().mousePressEvent(event)
