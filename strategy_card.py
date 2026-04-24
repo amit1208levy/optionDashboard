@@ -295,109 +295,17 @@ class StrategyCard(QFrame):
         agg_row.addStretch()
         lay.addLayout(agg_row)
 
-        # ── Legs table ────────────────────────────────────────────────────
-        section_title = QLabel(f"Legs ({len(s.legs)})")
+        # ── Legs section ──────────────────────────────────────────────────
+        section_title = QLabel(f"LEGS  ·  {len(s.legs)}")
         section_title.setStyleSheet(
             f"color: {T.LABEL}; font-size: 11px; font-weight: bold; "
-            f"letter-spacing: 0.5px; border: none; background: transparent;"
+            f"letter-spacing: 0.8px; border: none; background: transparent;"
         )
         lay.addWidget(section_title)
 
-        cols = [
-            ("Leg",      0,   Qt.AlignmentFlag.AlignLeft),
-            ("Qty",      55,  Qt.AlignmentFlag.AlignRight),
-            ("Strike",   75,  Qt.AlignmentFlag.AlignRight),
-            ("DTE",      50,  Qt.AlignmentFlag.AlignRight),
-            ("Mark",     80,  Qt.AlignmentFlag.AlignRight),
-            ("Day P&L",  85,  Qt.AlignmentFlag.AlignRight),
-            ("Θ",        65,  Qt.AlignmentFlag.AlignRight),
-            ("P&L",      90,  Qt.AlignmentFlag.AlignRight),
-        ]
-        hdr = QHBoxLayout()
-        hdr.setSpacing(10)
-        for text, width, align in cols:
-            lbl = QLabel(text)
-            lbl.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
-                f"letter-spacing: 0.6px; border: none; background: transparent;"
-            )
-            if width:
-                lbl.setFixedWidth(width)
-            lbl.setAlignment(align)
-            hdr.addWidget(lbl, 0 if width else 1)
-        lay.addLayout(hdr)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"background: {T.BORDER}; max-height: 1px; border: none;")
-        lay.addWidget(sep)
-
-        # One row per leg
+        # Each leg is its own card — two lines: headline + Greeks
         for leg in s.legs:
-            row = QHBoxLayout()
-            row.setSpacing(10)
-
-            # Leg name: direction pill + type
-            leg_wrap = QHBoxLayout()
-            leg_wrap.setSpacing(6)
-            leg_wrap.setContentsMargins(0, 0, 0, 0)
-            direction = leg.direction_label     # "Long" / "Short"
-            dir_color = T.GREEN if leg.is_long else T.RED
-            dir_badge = QLabel(direction[0])    # "L" / "S"
-            dir_badge.setFixedSize(18, 18)
-            dir_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            dir_badge.setStyleSheet(
-                f"color: white; background: {dir_color}; "
-                f"border-radius: 4px; font-size: 10px; font-weight: bold;"
-            )
-            leg_wrap.addWidget(dir_badge)
-            kind_lbl = QLabel(leg.type_label)
-            kind_lbl.setStyleSheet(
-                f"color: {T.TEXT}; font-size: 12px; border: none; background: transparent;"
-            )
-            leg_wrap.addWidget(kind_lbl)
-            leg_wrap.addStretch()
-            leg_widget = QWidget()
-            leg_widget.setLayout(leg_wrap)
-            leg_widget.setStyleSheet("background: transparent;")
-            row.addWidget(leg_widget, 1)
-
-            def add(text, width, color=T.TEXT_DIM, bold=False):
-                l = QLabel(text)
-                l.setFixedWidth(width)
-                l.setAlignment(Qt.AlignmentFlag.AlignRight)
-                l.setStyleSheet(
-                    f"color: {color}; font-size: 12px; "
-                    f"font-weight: {'bold' if bold else 'normal'}; "
-                    f"border: none; background: transparent;"
-                )
-                row.addWidget(l)
-
-            add(f"{leg.sign * leg.quantity:+g}",           55)
-            add(f"{leg.strike:g}" if leg.strike else "—",  75)
-            add(f"{leg.dte}d" if leg.dte is not None else "—", 50)
-            add(f"${leg.mark_price:,.2f}",                 80)
-
-            # Day P&L per leg
-            if leg.close_price and leg.close_price > 0 and leg.mark_price:
-                leg_day = leg.sign * leg.quantity * leg.multiplier \
-                          * (leg.mark_price - leg.close_price)
-                add(money(leg_day, signed=True), 85, pnl_color(leg_day), bold=True)
-            else:
-                add("—", 85)
-
-            # Theta per leg in dollars-per-day (uses the contract $-multiplier
-            # so futures options aren't understated by the per-point factor)
-            if leg.theta is not None:
-                mult = leg.multiplier or (1 if _is_future_option(leg.instrument_type) else 100)
-                leg_theta = leg.theta * leg.quantity * mult * leg.sign
-                add(_fmt_greek(leg_theta), 65, pnl_color(leg_theta))
-            else:
-                add("—", 65)
-
-            add(money(leg.pnl, signed=True), 90, pnl_color(leg.pnl), bold=True)
-
-            lay.addLayout(row)
+            lay.addWidget(self._build_leg_card(leg))
 
         # ── "View details" button ─────────────────────────────────────────
         lay.addSpacing(6)
@@ -418,6 +326,145 @@ class StrategyCard(QFrame):
         self._body = body
         self._body.setVisible(False)
         self._outer_lay.addWidget(body)
+
+    def _build_leg_card(self, leg):
+        """Pretty per-leg detail card — headline on top, Greeks row below."""
+        from models import _is_future_option
+
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 10px; }}"
+        )
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(14, 10, 14, 12)
+        cl.setSpacing(6)
+
+        # ── Top line: L/S badge · type · strike · expiry ──────────────────
+        top = QHBoxLayout()
+        top.setSpacing(10)
+
+        dir_color = T.GREEN if leg.is_long else T.RED
+        dir_badge = QLabel(leg.direction_label[0])     # "L" / "S"
+        dir_badge.setFixedSize(22, 22)
+        dir_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        dir_badge.setStyleSheet(
+            f"color: white; background: {dir_color}; "
+            f"border-radius: 5px; font-size: 11px; font-weight: bold;"
+        )
+        top.addWidget(dir_badge)
+
+        # "Put 450" / "Call 5800" / "Shares" / "Future"
+        if leg.is_option and leg.strike:
+            headline = f"{leg.type_label}  {leg.strike:g}"
+        else:
+            headline = leg.type_label
+        name_lbl = QLabel(headline)
+        name_lbl.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 14px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        top.addWidget(name_lbl)
+
+        # Qty chip
+        qty_lbl = QLabel(f"×{leg.quantity:g}")
+        qty_lbl.setStyleSheet(
+            f"color: {T.MUTED}; background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 4px; padding: 1px 6px; font-size: 11px; font-weight: bold;"
+        )
+        top.addWidget(qty_lbl)
+
+        # Expiry + DTE + DIT
+        if leg.is_option and leg.expires_at:
+            exp_text = leg.expires_at.strftime("%b %d %Y")
+            detail = f"  {exp_text}"
+            if leg.dte is not None:
+                detail += f"  ·  {leg.dte}d left"
+            if leg.dit is not None:
+                detail += f"  ·  {leg.dit}d held"
+            exp_lbl = QLabel(detail)
+            exp_lbl.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
+            )
+            top.addWidget(exp_lbl)
+
+        top.addStretch()
+
+        # Right side: P&L (big) + % on one block
+        pnl  = leg.pnl
+        pnl_pct_lbl = QLabel()
+        pnl_val_lbl = QLabel(money(pnl, signed=True))
+        pnl_val_lbl.setStyleSheet(
+            f"color: {pnl_color(pnl)}; font-size: 15px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        pnl_val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        top.addWidget(pnl_val_lbl)
+
+        cl.addLayout(top)
+
+        # ── Bottom line: Entry → Mark, Day P&L, Greeks, IV ────────────────
+        bot = QHBoxLayout()
+        bot.setSpacing(14)
+
+        # Entry → Mark with arrow
+        arrow = "↑" if (leg.mark_price > leg.avg_open_price) else ("↓" if leg.mark_price < leg.avg_open_price else "·")
+        arrow_c = T.GREEN if (leg.mark_price > leg.avg_open_price) else (T.RED if leg.mark_price < leg.avg_open_price else T.MUTED)
+        price_lbl = QLabel(
+            f"Entry ${leg.avg_open_price:,.2f}   "
+            f"<span style='color:{arrow_c}'>{arrow}</span>   "
+            f"Mark ${leg.mark_price:,.2f}"
+        )
+        price_lbl.setStyleSheet(
+            f"color: {T.TEXT_DIM}; font-size: 11px; border: none; background: transparent;"
+        )
+        bot.addWidget(price_lbl)
+
+        # Day P&L pill
+        if leg.close_price and leg.close_price > 0 and leg.mark_price:
+            leg_day = leg.sign * leg.quantity * leg.multiplier \
+                      * (leg.mark_price - leg.close_price)
+            day_lbl = QLabel(f"Day {money(leg_day, signed=True)}")
+            day_lbl.setStyleSheet(
+                f"color: {pnl_color(leg_day)}; font-size: 11px; "
+                f"font-weight: bold; border: none; background: transparent;"
+            )
+            bot.addWidget(day_lbl)
+
+        bot.addStretch()
+
+        # Greeks (only for options)
+        if leg.is_option:
+            mult = leg.multiplier or (1 if _is_future_option(leg.instrument_type) else 100)
+            def _g(label, raw, color=T.TEXT_DIM):
+                if raw is None:
+                    return None
+                val = raw * leg.quantity * mult * leg.sign
+                g = QLabel(f"<span style='color:{T.MUTED}'>{label}</span> "
+                           f"<b>{_fmt_greek(val)}</b>")
+                g.setStyleSheet(
+                    f"color: {color}; font-size: 11px; border: none; background: transparent;"
+                )
+                return g
+
+            for g in (_g("Δ", leg.delta),
+                      _g("Γ", leg.gamma),
+                      _g("Θ", leg.theta, pnl_color(leg.theta * leg.sign) if leg.theta else T.MUTED),
+                      _g("V", leg.vega)):
+                if g is not None:
+                    bot.addWidget(g)
+
+            if leg.iv is not None:
+                iv_lbl = QLabel(
+                    f"<span style='color:{T.MUTED}'>IV</span> <b>{leg.iv*100:.0f}%</b>"
+                )
+                iv_lbl.setStyleSheet(
+                    f"color: {T.TEXT_DIM}; font-size: 11px; border: none; background: transparent;"
+                )
+                bot.addWidget(iv_lbl)
+
+        cl.addLayout(bot)
+        return card
 
     def _chip(self, label, value, color):
         """Little summary tile shown at the top of the expanded legs body."""
