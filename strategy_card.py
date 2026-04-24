@@ -1,11 +1,28 @@
 """Compact strategy card — essentials only.
 Click toggles an expanded legs view; a 'View details' button inside the
 expanded section opens the full detail page."""
-from PyQt6.QtWidgets import QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+from PyQt6.QtWidgets import (QFrame, QVBoxLayout, QHBoxLayout, QLabel,
+                              QPushButton, QWidget)
 from PyQt6.QtCore import Qt, pyqtSignal
 
 import theme as T
 from models import probability_of_profit, symbol_ivr, check_exit_conditions
+
+
+def _fmt_greek(v):
+    """Format a Greek value with sensible precision for the legs card."""
+    if v is None:
+        return "—"
+    av = abs(v)
+    if av < 0.0005:
+        return "~0"
+    if av < 0.01:
+        return f"{v:+.4f}"
+    if av < 0.1:
+        return f"{v:+.3f}"
+    if av < 100:
+        return f"{v:+.2f}"
+    return f"{v:+,.0f}"
 
 
 def money(v, signed=False, na="—"):
@@ -244,30 +261,65 @@ class StrategyCard(QFrame):
         """Lazily construct the legs table shown when the card is expanded."""
         if self._body is not None:
             return
+
         body = QFrame()
         body.setStyleSheet(
             f"QFrame {{ background: #12151d; border-top: 1px solid {T.BORDER}; "
             f"border-bottom-left-radius: 13px; border-bottom-right-radius: 13px; }}"
         )
         lay = QVBoxLayout(body)
-        lay.setContentsMargins(22, 12, 22, 14)
-        lay.setSpacing(4)
+        lay.setContentsMargins(22, 18, 22, 20)
+        lay.setSpacing(10)
 
-        # Header row
+        # ── Aggregate stats row (Day P&L + Greeks) ────────────────────────
+        from models import _is_future_option
+        s      = self.strategy
+        # Day P&L aggregate across legs
+        day_pnl = sum(
+            l.sign * l.quantity * l.multiplier * (l.mark_price - l.close_price)
+            for l in s.legs
+            if l.close_price and l.close_price > 0 and l.mark_price
+        )
+        net_delta = s.net_delta
+        net_theta = s.net_theta
+        net_vega  = s.net_vega
+
+        agg_row = QHBoxLayout()
+        agg_row.setSpacing(10)
+        agg_row.addWidget(self._chip("Day P&L",  money(day_pnl, signed=True),
+                                      pnl_color(day_pnl)))
+        agg_row.addWidget(self._chip("Net Δ",    _fmt_greek(net_delta), T.TEXT))
+        agg_row.addWidget(self._chip("Net Θ",    _fmt_greek(net_theta),
+                                      pnl_color(net_theta)))
+        agg_row.addWidget(self._chip("Net V",    _fmt_greek(net_vega),  T.TEXT))
+        agg_row.addStretch()
+        lay.addLayout(agg_row)
+
+        # ── Legs table ────────────────────────────────────────────────────
+        section_title = QLabel(f"Legs ({len(s.legs)})")
+        section_title.setStyleSheet(
+            f"color: {T.LABEL}; font-size: 11px; font-weight: bold; "
+            f"letter-spacing: 0.5px; border: none; background: transparent;"
+        )
+        lay.addWidget(section_title)
+
+        cols = [
+            ("Leg",      0,   Qt.AlignmentFlag.AlignLeft),
+            ("Qty",      55,  Qt.AlignmentFlag.AlignRight),
+            ("Strike",   75,  Qt.AlignmentFlag.AlignRight),
+            ("DTE",      50,  Qt.AlignmentFlag.AlignRight),
+            ("Mark",     80,  Qt.AlignmentFlag.AlignRight),
+            ("Day P&L",  85,  Qt.AlignmentFlag.AlignRight),
+            ("Θ",        65,  Qt.AlignmentFlag.AlignRight),
+            ("P&L",      90,  Qt.AlignmentFlag.AlignRight),
+        ]
         hdr = QHBoxLayout()
-        hdr.setSpacing(8)
-        for text, width, align in [
-            ("Leg",      0,  Qt.AlignmentFlag.AlignLeft),
-            ("Qty",     50,  Qt.AlignmentFlag.AlignRight),
-            ("Strike",  70,  Qt.AlignmentFlag.AlignRight),
-            ("DTE",     50,  Qt.AlignmentFlag.AlignRight),
-            ("Mark",    70,  Qt.AlignmentFlag.AlignRight),
-            ("P&L",     80,  Qt.AlignmentFlag.AlignRight),
-        ]:
+        hdr.setSpacing(10)
+        for text, width, align in cols:
             lbl = QLabel(text)
             lbl.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 9px; font-weight: bold; "
-                f"letter-spacing: 0.5px; border: none;"
+                f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
+                f"letter-spacing: 0.6px; border: none; background: transparent;"
             )
             if width:
                 lbl.setFixedWidth(width)
@@ -275,64 +327,87 @@ class StrategyCard(QFrame):
             hdr.addWidget(lbl, 0 if width else 1)
         lay.addLayout(hdr)
 
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"background: {T.BORDER}; max-height: 1px; border: none;")
+        lay.addWidget(sep)
+
         # One row per leg
-        for leg in self.strategy.legs:
+        for leg in s.legs:
             row = QHBoxLayout()
-            row.setSpacing(8)
+            row.setSpacing(10)
 
-            direction = leg.direction_label[0]   # "L" / "S"
-            kind      = leg.type_label            # Call / Put / Stock / Future
-            name_lbl  = QLabel(f"{direction}  {kind}")
-            name_lbl.setStyleSheet(
-                f"color: {T.TEXT_DIM}; font-size: 11px; border: none;"
+            # Leg name: direction pill + type
+            leg_wrap = QHBoxLayout()
+            leg_wrap.setSpacing(6)
+            leg_wrap.setContentsMargins(0, 0, 0, 0)
+            direction = leg.direction_label     # "Long" / "Short"
+            dir_color = T.GREEN if leg.is_long else T.RED
+            dir_badge = QLabel(direction[0])    # "L" / "S"
+            dir_badge.setFixedSize(18, 18)
+            dir_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            dir_badge.setStyleSheet(
+                f"color: white; background: {dir_color}; "
+                f"border-radius: 4px; font-size: 10px; font-weight: bold;"
             )
-            row.addWidget(name_lbl, 1)
-
-            qty_lbl = QLabel(f"{leg.sign * leg.quantity:+g}")
-            qty_lbl.setFixedWidth(50)
-            qty_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            qty_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 11px; border: none;")
-            row.addWidget(qty_lbl)
-
-            strike_lbl = QLabel(f"{leg.strike:g}" if leg.strike else "—")
-            strike_lbl.setFixedWidth(70)
-            strike_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            strike_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 11px; border: none;")
-            row.addWidget(strike_lbl)
-
-            dte_lbl = QLabel(f"{leg.dte}d" if leg.dte is not None else "—")
-            dte_lbl.setFixedWidth(50)
-            dte_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            dte_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 11px; border: none;")
-            row.addWidget(dte_lbl)
-
-            mark_lbl = QLabel(f"${leg.mark_price:,.2f}")
-            mark_lbl.setFixedWidth(70)
-            mark_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            mark_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 11px; border: none;")
-            row.addWidget(mark_lbl)
-
-            pnl_lbl = QLabel(money(leg.pnl, signed=True))
-            pnl_lbl.setFixedWidth(80)
-            pnl_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-            pnl_lbl.setStyleSheet(
-                f"color: {pnl_color(leg.pnl)}; font-size: 11px; "
-                f"font-weight: bold; border: none;"
+            leg_wrap.addWidget(dir_badge)
+            kind_lbl = QLabel(leg.type_label)
+            kind_lbl.setStyleSheet(
+                f"color: {T.TEXT}; font-size: 12px; border: none; background: transparent;"
             )
-            row.addWidget(pnl_lbl)
+            leg_wrap.addWidget(kind_lbl)
+            leg_wrap.addStretch()
+            leg_widget = QWidget()
+            leg_widget.setLayout(leg_wrap)
+            leg_widget.setStyleSheet("background: transparent;")
+            row.addWidget(leg_widget, 1)
+
+            def add(text, width, color=T.TEXT_DIM, bold=False):
+                l = QLabel(text)
+                l.setFixedWidth(width)
+                l.setAlignment(Qt.AlignmentFlag.AlignRight)
+                l.setStyleSheet(
+                    f"color: {color}; font-size: 12px; "
+                    f"font-weight: {'bold' if bold else 'normal'}; "
+                    f"border: none; background: transparent;"
+                )
+                row.addWidget(l)
+
+            add(f"{leg.sign * leg.quantity:+g}",           55)
+            add(f"{leg.strike:g}" if leg.strike else "—",  75)
+            add(f"{leg.dte}d" if leg.dte is not None else "—", 50)
+            add(f"${leg.mark_price:,.2f}",                 80)
+
+            # Day P&L per leg
+            if leg.close_price and leg.close_price > 0 and leg.mark_price:
+                leg_day = leg.sign * leg.quantity * leg.multiplier \
+                          * (leg.mark_price - leg.close_price)
+                add(money(leg_day, signed=True), 85, pnl_color(leg_day), bold=True)
+            else:
+                add("—", 85)
+
+            # Theta per leg (with futures-vs-equity multiplier)
+            if leg.theta is not None:
+                mult = 1 if _is_future_option(leg.instrument_type) else 100
+                leg_theta = leg.theta * leg.quantity * mult * leg.sign
+                add(_fmt_greek(leg_theta), 65, pnl_color(leg_theta))
+            else:
+                add("—", 65)
+
+            add(money(leg.pnl, signed=True), 90, pnl_color(leg.pnl), bold=True)
 
             lay.addLayout(row)
 
-        # "View details" button opens the full detail page
-        lay.addSpacing(4)
+        # ── "View details" button ─────────────────────────────────────────
+        lay.addSpacing(6)
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         btn = QPushButton("View full details →")
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setFixedHeight(28)
+        btn.setFixedHeight(34)
         btn.setStyleSheet(
             f"QPushButton {{ background: {T.PURPLE}; color: white; border: none; "
-            f"border-radius: 6px; padding: 0 14px; font-size: 11px; font-weight: bold; }}"
+            f"border-radius: 8px; padding: 0 18px; font-size: 12px; font-weight: bold; }}"
             f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
         )
         btn.clicked.connect(lambda: self.clicked.emit(self.strategy))
@@ -342,6 +417,29 @@ class StrategyCard(QFrame):
         self._body = body
         self._body.setVisible(False)
         self._outer_lay.addWidget(body)
+
+    def _chip(self, label, value, color):
+        """Little summary tile shown at the top of the expanded legs body."""
+        w = QFrame()
+        w.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 8px; }}"
+        )
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(14, 8, 14, 10)
+        lay.setSpacing(2)
+        l = QLabel(label.upper())
+        l.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 9px; font-weight: bold; "
+            f"letter-spacing: 0.6px; border: none; background: transparent;"
+        )
+        v = QLabel(value)
+        v.setStyleSheet(
+            f"color: {color}; font-size: 14px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        lay.addWidget(l); lay.addWidget(v)
+        return w
 
     def _set_expanded(self, expanded: bool):
         self._expanded = expanded
