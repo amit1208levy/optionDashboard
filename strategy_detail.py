@@ -20,7 +20,7 @@ _BASE_LEG_COLUMNS = [
     ("P&L",       90),
     ("Day",       80),   # day P&L (mark − prior close)
     ("Qty",       52),
-    ("Open",      84),   # net premium at open (credit/debit)
+    ("Premium",   90),   # credit received (short) / debit paid (long) at open
     ("Extrinsic", 76),   # current time-value of the option
 ]
 
