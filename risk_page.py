@@ -378,9 +378,16 @@ class _ScenarioChart(QFrame):
             self._annot.set_ha("left")
 
         self._annot.xy = (sx, sy)
+        # Delta vs. the current underlying price (the anchor dashed line)
+        delta   = sx - self._center
+        delta_s = "+" if delta >= 0 else "−"
+        pct = (delta / self._center * 100.0) if self._center else 0.0
+        pct_s   = "+" if pct >= 0 else "−"
         self._annot.set_text(
             f"{self._xlabel}: {self._fmt_x(sx)}\n"
-            f"{self._ylabel}: {self._fmt_y(sy)}"
+            f"{self._ylabel}: {self._fmt_y(sy)}\n"
+            f"vs now: {delta_s}{self._fmt_x(abs(delta))}   "
+            f"({pct_s}{abs(pct):.1f}%)"
         )
         self._annot.set_visible(True)
         self.canvas.draw_idle()
