@@ -386,9 +386,10 @@ class StrategyCard(QFrame):
             else:
                 add("—", 85)
 
-            # Theta per leg (with futures-vs-equity multiplier)
+            # Theta per leg in dollars-per-day (uses the contract $-multiplier
+            # so futures options aren't understated by the per-point factor)
             if leg.theta is not None:
-                mult = 1 if _is_future_option(leg.instrument_type) else 100
+                mult = leg.multiplier or (1 if _is_future_option(leg.instrument_type) else 100)
                 leg_theta = leg.theta * leg.quantity * mult * leg.sign
                 add(_fmt_greek(leg_theta), 65, pnl_color(leg_theta))
             else:

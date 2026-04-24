@@ -248,9 +248,11 @@ class Strategy:
 
     def _agg(self, key):
         """
-        Sum Greeks across legs.
-        Equity options: greeks are per-share → multiply by 100 (shares/contract)
-        Futures options: greeks are already per-contract → multiplier 1
+        Sum Greeks across legs, using the contract dollar-multiplier so the
+        result is in dollar-units across all instrument types:
+          Equity options  → per share → ×100
+          Futures options → per price-point → ×contract-$-multiplier (e.g.
+                            $50 for /ES, $5 for /MES)
         """
         total = 0.0
         any_set = False
@@ -259,7 +261,7 @@ class Strategy:
             if v is None:
                 continue
             any_set = True
-            mult = 1 if _is_future_option(l.instrument_type) else 100
+            mult = l.multiplier or (1 if _is_future_option(l.instrument_type) else 100)
             total += l.sign * l.quantity * mult * v
         return total if any_set else None
 
@@ -1171,9 +1173,13 @@ def portfolio_greeks(positions, metrics_by_root=None):
     for p in positions:
         if p.is_option:
             sign = p.sign  # +1 long / -1 short
-            # Equity options: greeks are per-share; 100 shares per contract.
-            # Futures options: greeks are already per-contract; no extra multiplier.
-            mult = 100 if not _is_future_option(p.instrument_type) else 1
+            # Greeks arrive per-unit-of-underlying:
+            #   Equity options → per share → multiply by 100 to get per-contract
+            #   Futures options → per price-point → multiply by the contract
+            #     $-per-point multiplier ($50 for /ES, $5 for /MES, …) to get
+            #     per-contract dollars.  p.multiplier holds this value for
+            #     both cases (TastyTrade sets it per position).
+            mult = p.multiplier or (100 if not _is_future_option(p.instrument_type) else 1)
             d = _to_float(p.delta) * p.quantity * mult * sign
             g = _to_float(p.gamma) * p.quantity * mult * sign
             t = _to_float(p.theta) * p.quantity * mult * sign
