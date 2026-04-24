@@ -248,11 +248,9 @@ class Strategy:
 
     def _agg(self, key):
         """
-        Sum Greeks across legs, using the contract dollar-multiplier so the
-        result is in dollar-units across all instrument types:
-          Equity options  → per share → ×100
-          Futures options → per price-point → ×contract-$-multiplier (e.g.
-                            $50 for /ES, $5 for /MES)
+        Sum Greeks across legs, converting each leg to dollar units:
+          Equity options  → ×100
+          Futures options → ×contract $-multiplier from _CONTRACT_MULT
         """
         total = 0.0
         any_set = False
@@ -261,7 +259,10 @@ class Strategy:
             if v is None:
                 continue
             any_set = True
-            mult = l.multiplier or (1 if _is_future_option(l.instrument_type) else 100)
+            if _is_future_option(l.instrument_type):
+                mult = float(_CONTRACT_MULT.get(l.root or "", 1))
+            else:
+                mult = 100.0
             total += l.sign * l.quantity * mult * v
         return total if any_set else None
 
@@ -1173,13 +1174,16 @@ def portfolio_greeks(positions, metrics_by_root=None):
     for p in positions:
         if p.is_option:
             sign = p.sign  # +1 long / -1 short
-            # Greeks arrive per-unit-of-underlying:
-            #   Equity options → per share → multiply by 100 to get per-contract
-            #   Futures options → per price-point → multiply by the contract
-            #     $-per-point multiplier ($50 for /ES, $5 for /MES, …) to get
-            #     per-contract dollars.  p.multiplier holds this value for
-            #     both cases (TastyTrade sets it per position).
-            mult = p.multiplier or (100 if not _is_future_option(p.instrument_type) else 1)
+            # Dollar multiplier per contract:
+            #   Equity options  → 100 (100 shares/contract)
+            #   Futures options → the contract's $-per-point value from the
+            #     _CONTRACT_MULT table ($50 /ES, $5 /MES, $1000 /ZB, …).
+            #     TT's position.multiplier field can be inconsistent across
+            #     futures-option roots so we look it up ourselves.
+            if _is_future_option(p.instrument_type):
+                mult = float(_CONTRACT_MULT.get(p.root or "", 1))
+            else:
+                mult = 100.0
             d = _to_float(p.delta) * p.quantity * mult * sign
             g = _to_float(p.gamma) * p.quantity * mult * sign
             t = _to_float(p.theta) * p.quantity * mult * sign

@@ -433,9 +433,13 @@ class StrategyCard(QFrame):
 
         bot.addStretch()
 
-        # Greeks (only for options)
+        # Greeks (only for options) — dollar multiplier from our own table
         if leg.is_option:
-            mult = leg.multiplier or (1 if _is_future_option(leg.instrument_type) else 100)
+            from models import _CONTRACT_MULT
+            if _is_future_option(leg.instrument_type):
+                mult = float(_CONTRACT_MULT.get(leg.root or "", 1))
+            else:
+                mult = 100.0
             def _g(label, raw, color=T.TEXT_DIM):
                 if raw is None:
                     return None
