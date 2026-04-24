@@ -3,7 +3,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QPushButton, QScrollArea, QSizePolicy, QInputDialog, QDialog, QSlider,
-    QMessageBox, QDoubleSpinBox,
+    QMessageBox, QDoubleSpinBox, QDialogButtonBox, QLineEdit, QCheckBox,
 )
 
 import api
@@ -372,6 +372,10 @@ class StrategyDetailPage(QWidget):
             body.addWidget(mkt_card)
         body.addWidget(self._build_chart_card())
         body.addWidget(self._build_legs_card())
+
+        # Leg groups — only for saved strategies (sub-groupings need persistence)
+        if isinstance(self.strategy, StrategyInstance):
+            body.addWidget(self._build_leg_groups_card())
 
         if isinstance(self.strategy, StrategyInstance):
             body.addWidget(self._build_exit_plan_card())
@@ -1476,6 +1480,201 @@ class StrategyDetailPage(QWidget):
         lay.addWidget(tl)
         return f, lay
 
+    # ── Leg groups ──────────────────────────────────────────────────────────
+
+    def _leg_groups(self):
+        """Return the raw list of leg groups stored on the strategy."""
+        if not isinstance(self.strategy, StrategyInstance):
+            return []
+        return self.strategy._raw.setdefault("leg_groups", [])
+
+    def _save_leg_groups(self, groups):
+        self.strategy._raw["leg_groups"] = groups
+        if self.portfolio:
+            self.portfolio.save_strategies()
+
+    def _build_leg_groups_card(self):
+        frame, lay = self._section_frame("Leg Groups")
+
+        # Hint + "+ New group" button row
+        hint_row = QHBoxLayout()
+        hint = QLabel(
+            "Organize legs into named sub-strategies (e.g. 'Call Spread' + "
+            "'Put Spread'). Each group gets its own payoff chart + Greeks."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
+        )
+        hint_row.addWidget(hint, 1)
+
+        add_btn = QPushButton("+ New group")
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        add_btn.setFixedHeight(30)
+        add_btn.setStyleSheet(
+            f"QPushButton {{ background: {T.PURPLE}; color: white; border: none; "
+            f"border-radius: 6px; padding: 0 14px; font-size: 11px; font-weight: bold; }}"
+            f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
+        )
+        add_btn.clicked.connect(self._on_add_leg_group)
+        hint_row.addWidget(add_btn)
+        lay.addLayout(hint_row)
+
+        groups = self._leg_groups()
+        if not groups:
+            empty = QLabel("No groups yet — click + New group to create one.")
+            empty.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 11px; padding: 16px; border: 1px dashed "
+                f"{T.BORDER}; border-radius: 8px; background: #12151d;"
+            )
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lay.addWidget(empty)
+        else:
+            for grp in groups:
+                lay.addWidget(self._build_single_group_card(grp))
+
+        return frame
+
+    def _build_single_group_card(self, grp):
+        """Build one card per leg-group: name, payoff chart, Greeks, metrics."""
+        from models import Strategy as _Strategy
+        from payoff_chart import PayoffChart
+
+        sym_set = set(grp.get("legs", []) or [])
+        group_legs = [l for l in self.strategy.legs if l.symbol in sym_set]
+
+        card = QFrame()
+        card.setStyleSheet(
+            f"QFrame {{ background: #12151d; border: 1px solid {T.BORDER}; "
+            f"border-radius: 10px; }}"
+        )
+        cl = QVBoxLayout(card)
+        cl.setContentsMargins(18, 14, 18, 16)
+        cl.setSpacing(10)
+
+        # Header: name + legs count + edit/delete
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        name_lbl = QLabel(grp.get("name") or "(unnamed)")
+        name_lbl.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 15px; font-weight: bold; border: none; background: transparent;"
+        )
+        top.addWidget(name_lbl)
+        count_lbl = QLabel(f"{len(group_legs)} legs")
+        count_lbl.setStyleSheet(
+            f"color: {T.MUTED}; background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 5px; padding: 2px 8px; font-size: 10px; font-weight: bold;"
+        )
+        top.addWidget(count_lbl)
+        top.addStretch()
+
+        edit_btn = QPushButton("Edit")
+        edit_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        edit_btn.setFixedHeight(26)
+        edit_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 5px; padding: 0 10px; font-size: 10px; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+        )
+        edit_btn.clicked.connect(lambda: self._on_edit_leg_group(grp))
+        top.addWidget(edit_btn)
+
+        del_btn = QPushButton("Delete")
+        del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        del_btn.setFixedHeight(26)
+        del_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.RED}; "
+            f"border: 1px solid {T.RED}; border-radius: 5px; padding: 0 10px; font-size: 10px; }}"
+            f"QPushButton:hover {{ background: {T.RED}; color: white; }}"
+        )
+        del_btn.clicked.connect(lambda: self._on_delete_leg_group(grp))
+        top.addWidget(del_btn)
+        cl.addLayout(top)
+
+        if not group_legs:
+            msg = QLabel("No legs assigned to this group yet — click Edit.")
+            msg.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 11px; border: none;"
+            )
+            cl.addWidget(msg)
+            return card
+
+        sub_strategy = _Strategy(
+            f"{self.strategy.key}:{grp.get('id')}",
+            group_legs,
+            custom_name=grp.get("name"),
+            is_custom=True,
+        )
+
+        # Metrics row: Δ, Θ, V, P&L, Max Profit, Max Loss
+        max_profit, max_loss, _ = strategy_extremes(sub_strategy)
+        metrics_row = QGridLayout()
+        metrics_row.setHorizontalSpacing(10)
+        metrics_row.setVerticalSpacing(6)
+
+        def mb(col, label, value, color=T.TEXT):
+            metrics_row.addWidget(self._metric_box(label, value, color), 0, col)
+
+        mb(0, "P&L",
+           money(sub_strategy.pnl, signed=True),
+           pnl_color(sub_strategy.pnl))
+        mb(1, "Max Profit",
+           "Unlimited" if max_profit == float("inf") else money(max_profit),
+           T.GREEN)
+        mb(2, "Max Loss",
+           "Unlimited" if max_loss == float("-inf") else money(max_loss, signed=True),
+           T.RED if max_loss and max_loss != 0 else T.MUTED)
+        mb(3, "Δ",  fmt_num(sub_strategy.net_delta, 2, signed=True), T.TEXT)
+        mb(4, "Θ",  fmt_num(sub_strategy.net_theta, 2, signed=True),
+           pnl_color(sub_strategy.net_theta))
+        mb(5, "V",  fmt_num(sub_strategy.net_vega,  2, signed=True), T.TEXT)
+
+        for i in range(6):
+            metrics_row.setColumnStretch(i, 1)
+        cl.addLayout(metrics_row)
+
+        # Payoff chart
+        chart = PayoffChart(sub_strategy, height=2.6)
+        chart.setMinimumHeight(220)
+        cl.addWidget(chart)
+
+        return card
+
+    def _on_add_leg_group(self):
+        import uuid
+        dlg = _LegGroupDialog(self.strategy.legs, name="", selected=set(), parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            groups = list(self._leg_groups())
+            groups.append({
+                "id":    uuid.uuid4().hex[:10],
+                "name":  dlg.result_name(),
+                "legs":  dlg.result_legs(),
+            })
+            self._save_leg_groups(groups)
+            self._refresh_reopen()
+
+    def _on_edit_leg_group(self, grp):
+        dlg = _LegGroupDialog(
+            self.strategy.legs,
+            name=grp.get("name", ""),
+            selected=set(grp.get("legs", [])),
+            parent=self,
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            grp["name"] = dlg.result_name()
+            grp["legs"] = dlg.result_legs()
+            self._save_leg_groups(self._leg_groups())
+            self._refresh_reopen()
+
+    def _on_delete_leg_group(self, grp):
+        groups = [g for g in self._leg_groups() if g.get("id") != grp.get("id")]
+        self._save_leg_groups(groups)
+        self._refresh_reopen()
+
+    def _refresh_reopen(self):
+        """Close this page and reopen the detail view to pick up new groups."""
+        self.reopen_requested.emit(self.strategy)
+
     def _metric_box(self, label, value, color):
         w = QFrame()
         w.setStyleSheet(
@@ -1627,3 +1826,84 @@ class WhatIfDialog(QDialog):
         self._res_labels["net_delta"].setText(fmt_num(res["net_delta"], 2, signed=True))
         self._res_labels["net_theta"].setText(fmt_num(res["net_theta"], 2, signed=True))
         self._res_labels["net_vega"].setText(fmt_num(res["net_vega"], 2, signed=True))
+
+
+# ── Leg-group editor dialog ──────────────────────────────────────────────────
+
+class _LegGroupDialog(QDialog):
+    """Edit a leg group's name + which legs belong to it."""
+
+    def __init__(self, all_legs, name="", selected=None, parent=None):
+        super().__init__(parent)
+        selected = set(selected or [])
+        self.setWindowTitle("Leg Group")
+        self.setMinimumWidth(460)
+        self.setStyleSheet(T.BASE_STYLE)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 20)
+        root.setSpacing(12)
+
+        title = QLabel("Group legs into a sub-strategy")
+        title.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 14px; font-weight: bold; border: none;"
+        )
+        root.addWidget(title)
+
+        # Name input
+        lbl = QLabel("Name")
+        lbl.setStyleSheet(
+            f"color: {T.LABEL}; font-size: 11px; font-weight: bold; border: none;"
+        )
+        root.addWidget(lbl)
+        self._name = QLineEdit(name)
+        self._name.setPlaceholderText("e.g. Call Spread, Put Side, Bull Butterfly …")
+        root.addWidget(self._name)
+
+        # Legs checklist
+        lbl = QLabel("Include these legs")
+        lbl.setStyleSheet(
+            f"color: {T.LABEL}; font-size: 11px; font-weight: bold; "
+            f"border: none; margin-top: 8px;"
+        )
+        root.addWidget(lbl)
+
+        self._boxes = []
+        for leg in all_legs:
+            cb = QCheckBox(self._leg_label(leg))
+            cb.setChecked(leg.symbol in selected)
+            cb.setStyleSheet(
+                f"QCheckBox {{ color: {T.TEXT}; font-size: 12px; border: none; }}"
+                f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
+                f"border: 1px solid {T.BORDER}; background: {T.BG_ALT}; }}"
+                f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; "
+                f"border-color: {T.ACCENT}; }}"
+            )
+            cb.leg_symbol = leg.symbol
+            self._boxes.append(cb)
+            root.addWidget(cb)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    @staticmethod
+    def _leg_label(leg):
+        parts = [leg.direction_label]
+        if leg.is_option and leg.strike:
+            parts.append(f"{leg.type_label} {leg.strike:g}")
+        else:
+            parts.append(leg.type_label)
+        if leg.expires_at:
+            parts.append(leg.expires_at.strftime("%b %d %Y"))
+        parts.append(f"×{leg.quantity:g}")
+        return "  ·  ".join(parts)
+
+    def result_name(self):
+        return self._name.text().strip()
+
+    def result_legs(self):
+        return [cb.leg_symbol for cb in self._boxes if cb.isChecked()]
