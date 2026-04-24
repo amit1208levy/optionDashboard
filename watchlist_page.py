@@ -653,15 +653,34 @@ class PositionSizerDialog(QDialog):
         )
         lay.addWidget(l)
 
-    def _cap_per_contract(self, cp_dollars, delta_frac, dte, idx):
+    # Strategy labels for each combo index (human-readable names for UI)
+    _STRAT_LABELS = {
+        0: ("strangle",     "strangles"),   # Short Strangle/Straddle
+        1: ("spread",       "spreads"),     # Iron Condor/Spread
+        2: ("contract",     "contracts"),   # Naked Put/Call
+        3: ("contract",     "contracts"),   # Long Option
+        4: ("share",        "shares"),      # Stock/ETF (uses 1 share unit)
+    }
+
+    def _cap_per_unit(self, cp_dollars, delta_frac, dte, idx):
+        """Return the buying power required for ONE trade unit.
+        Unit varies by strategy: one strangle / one spread / one contract /
+        one long option / one share."""
         mult = float(self.mult_spin.value()) or 100
-        S = self.price
-        if idx == 4: return S * mult
-        if idx == 3: return cp_dollars
+        S    = self.price
+        # Stock: one share costs S.  Ignore mult (user often leaves it at 100).
+        if idx == 4:
+            return S
+        # Long option debit: the premium paid IS the max risk.
+        if idx == 3:
+            return cp_dollars
         notional  = S * mult
         otm_disc  = (0.5 - delta_frac) * notional * 0.06
+        # Reg-T naked: 20% of notional (rough) minus a small OTM discount
+        # plus the premium received (adds to cash required).
         naked_cap = notional * 0.20 - otm_disc + cp_dollars
         if idx == 1:
+            # Defined-risk spread: width × multiplier (max loss per spread)
             width = max((0.5 - delta_frac) * S * 0.20, S * 0.02)
             return width * mult
         return max(naked_cap, cp_dollars * 1.5)
@@ -689,18 +708,20 @@ class PositionSizerDialog(QDialog):
         self.cp_total_lbl.setText(f"= ${prem_per:,.2f} / contract")
         sides      = 2 if idx == 0 else 1
         cp_dollars = prem_per * sides
-        cap_per    = max(self._cap_per_contract(cp_dollars, delta_frac, dte, idx), 1.0)
+        cap_per    = max(self._cap_per_unit(cp_dollars, delta_frac, dte, idx), 1.0)
         max_cap    = self.nlv * pct / 100.0
-        contracts  = max(int(max_cap / cap_per), 0)
-        total_cap  = contracts * cap_per
-        total_prem = contracts * cp_dollars
+        units      = max(int(max_cap / cap_per), 0)
+        total_cap  = units * cap_per
+        total_prem = units * cp_dollars
         pct_used   = total_cap / self.nlv * 100 if self.nlv else 0
         remaining  = self.nlv - total_cap
-        theta_est  = total_prem / (dte * 1.7) if dte > 0 and contracts > 0 else 0
+        theta_est  = total_prem / (dte * 1.7) if dte > 0 and units > 0 else 0
         pop = ((1 - delta_frac) * 100 if idx in (0, 2) else
                delta_frac * 100       if idx == 3 else None)
-        c_label = "contract" if contracts == 1 else "contracts"
-        self.contracts_lbl.setText(f"{contracts} {c_label}")
+
+        unit_s, unit_p = self._STRAT_LABELS.get(idx, ("contract", "contracts"))
+        unit_lbl       = unit_s if units == 1 else unit_p
+        self.contracts_lbl.setText(f"{units} {unit_lbl}")
         if total_prem > 0:
             self.total_prem_lbl.setText(f"${total_prem:,.0f}")
             self.total_prem_lbl.setStyleSheet(
@@ -709,8 +730,12 @@ class PositionSizerDialog(QDialog):
             )
         else:
             self.total_prem_lbl.setText("—")
+
+        # "Buying power per X" — X changes with strategy, so the label is
+        # clearer than the generic "per contract"
         self.capital_lbl.setText(
-            f"Capital per contract: ${cap_per:,.0f}   ·   Total BP: ${total_cap:,.0f}"
+            f"Buying power per {unit_s}: ${cap_per:,.0f}   ·   "
+            f"Total BP: ${total_cap:,.0f}"
         )
         self.bp_lbl.setText(
             f"{pct_used:.1f}% of NLV used   ·   Remaining BP: ${remaining:,.0f}"
