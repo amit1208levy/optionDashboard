@@ -2047,7 +2047,30 @@ class _AddLegDialog(QDialog):
     def __init__(self, candidates, owner_by_sym, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add Legs")
-        self.setMinimumWidth(520)
+        # Size the dialog to the longest row so detail lines don't clip.
+        longest = 0
+        for p in candidates:
+            bits = []
+            if p.root: bits.append(p.root)
+            if p.is_option and p.strike:
+                bits.append(f"{p.type_label} {p.strike:g}")
+            else:
+                bits.append(p.type_label)
+            bits.append(f"×{p.quantity:g}")
+            head_len = len("  ·  ".join(bits))
+
+            dbits = []
+            if p.expires_at: dbits.append(p.expires_at.strftime("%b %d %Y"))
+            if p.dte is not None: dbits.append(f"{p.dte}d")
+            dbits.append(f"Mark ${p.mark_price:,.2f}")
+            owner = owner_by_sym.get(p.symbol)
+            if owner:
+                dbits.append(f"(in '{owner}' — will be moved)")
+            detail_len = len("  ·  ".join(dbits))
+            longest = max(longest, head_len, detail_len)
+
+        # ~7 px per char + fixed chrome (checkbox / badge / pnl / margins / scrollbar)
+        self.resize(max(620, longest * 7 + 220), 560)
         self.setStyleSheet(T.BASE_STYLE)
 
         root = QVBoxLayout(self)
