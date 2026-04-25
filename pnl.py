@@ -15,8 +15,8 @@ is naturally net-of-fees.  Adding fees back gives the gross figure.
 
 "Net Cash Flow" includes:
   • External deposits / withdrawals / wires / ACH / transfers / rollovers
-  • Daily Mark-to-Market settlements on futures (broker tracks this
-    separately from P&L on their UI)
+  • Anything else flagged as Money Movement that isn't itself P&L (futures
+    Mark-to-Market and cash-settled option expiries ARE P&L and stay in).
 """
 from __future__ import annotations
 
@@ -31,29 +31,20 @@ UA   = "options-dashboard/1.0"
 # TastyTrade datetime format expected by /net-liq/history
 _TT_DATE_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
-# Sub-types of "Money Movement" whose name alone tells us it's external
-# cash flow (should be subtracted from NetLiq delta so it doesn't inflate P&L).
-# Mark to Market is TastyTrade's daily futures cash settlement — also belongs
-# outside of P&L per their UI convention.
-_EXPLICIT_EXTERNAL_SUBTYPES = (
-    "deposit", "withdrawal", "withdraw", "wire", "ach",
-    "rollover", "mark to market",
+# Money-Movement sub-types that ARE legitimate P&L (KEEP inside the figure).
+# Everything else under "Money Movement" is treated as external cash flow
+# and subtracted from the NetLiq delta — this is the conservative default
+# (any Deposit/Withdrawal/Transfer/Wire/ACH/Rollover/Journal/MTM/etc. is
+# excluded from P&L regardless of description).
+_PNL_KEEP_SUBTYPES = (
+    "dividend",          # Dividend, Special Dividend, Foreign Dividend
+    "credit interest",   # interest TT pays on cash balance
+    "debit interest",    # margin interest charged
+    "subscription fee",  # platform subscription (small recurring cost)
+    "balance adjustment",# broker-side corrections (typically tiny)
+    "mark to market",    # daily futures cash settlement = realized futures P&L
+    "cash settlement",   # option/index cash-settled expiry = realized P&L
 )
-
-# Ambiguous "Transfer" sub-types need the description to classify:
-#   • Internal (between two TastyTrade accounts)  → leave in P&L
-#   • External (to an outside bank)                → subtract from P&L
-import re as _re
-_TT_ACCT_RE = _re.compile(r"\b[0-9][A-Z]{2}\d{5}\b", _re.IGNORECASE)
-# "Journal" is how TastyTrade labels ALL between-account transfers in the
-# description, but they still count those as cash flow for per-account P/L —
-# so it's NOT a reliable "skip from P&L" marker.  Same for "account transfer".
-# Only genuinely-neutral movements (margin sweeps, internal margin shuffles
-# that don't touch cash-available) count as truly internal.
-_INTERNAL_HINTS = ("sweep", "margin adjustment", "margin transfer",
-                   "inter-account margin")
-_EXTERNAL_HINTS = ("bank", "ach", "wire", "external", "check",
-                   "to bank", "from bank")
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -80,40 +71,18 @@ def _is_external_money_movement(t: dict) -> bool:
     Return True if this Money-Movement transaction is external cash flow
     (should be subtracted from the NetLiq-delta when computing P/L YTD).
 
-    Explicit sub-types (Deposit, Withdrawal, Wire, ACH, MTM) are always
-    external.  "Transfer" is ambiguous — a Transfer between two TastyTrade
-    accounts is internal and should NOT be treated as cash flow, while a
-    Transfer to an outside bank should be.  We look at the description
-    field to decide:
-       • mentions a TastyTrade account number or "internal" → internal
-       • mentions bank / ACH / wire / external             → external
-       • otherwise default to INTERNAL (safer — matches TT's own UI where
-         ambiguous transfers stay inside P&L).
+    Default = TRUE: any cash IN or OUT of the account (deposit, withdrawal,
+    transfer, wire, ACH, rollover, journal, mark-to-market, etc.) is treated
+    as external and excluded from P&L, regardless of sub-type wording or
+    description.  Only sub-types in _PNL_KEEP_SUBTYPES (dividends, interest,
+    subscription fee, balance adjustment) stay inside P&L.
     """
     if (t.get("transaction-type") or "").lower() != "money movement":
         return False
-    sub  = (t.get("transaction-sub-type") or "").lower()
-    desc = (t.get("description") or "").lower()
-
-    # Explicit external sub-types — always count
-    if any(kw in sub for kw in _EXPLICIT_EXTERNAL_SUBTYPES):
-        return True
-
-    # Ambiguous "transfer" → inspect description for explicit "internal"
-    # hints, otherwise treat as external cash flow.
-    if "transfer" in sub:
-        # TastyTrade's own P/L calculation treats every transfer (even
-        # between two of a user's own accounts) as a cash deposit/withdrawal
-        # on each account individually.  So we only consider a transfer
-        # "internal" (skip from P&L) when the description is UNAMBIGUOUSLY
-        # one — e.g. "journal entry", "sweep", "margin transfer".  Merely
-        # mentioning another account number is not enough: TT shows the
-        # source/dest account in every transfer description.
-        if any(kw in desc for kw in _INTERNAL_HINTS):
-            return False
-        return True
-
-    return False
+    sub = (t.get("transaction-sub-type") or "").lower()
+    if any(kw in sub for kw in _PNL_KEEP_SUBTYPES):
+        return False
+    return True
 
 
 def _signed_value(t: dict) -> float:

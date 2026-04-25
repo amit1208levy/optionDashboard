@@ -1041,6 +1041,44 @@ class StrategyDetailPage(QWidget):
 
     # ── Exit Plan ────────────────────────────────────────────────────────────
 
+    def _current_spot(self):
+        """
+        Best-effort current price of the underlying for this strategy.
+        Tries: option leg's underlying_price → stock leg's mark → live API quote.
+        Returns float or None.
+        """
+        legs = self.strategy.legs
+        for l in legs:
+            if l.is_option and l.underlying_price and l.underlying_price > 0:
+                return float(l.underlying_price)
+        for l in legs:
+            if not l.is_option and l.mark_price and l.mark_price > 0:
+                return float(l.mark_price)
+        root = self.strategy.root or ""
+        if not root:
+            return None
+        try:
+            is_fut = any(l.is_future for l in legs) or root.startswith("/")
+            sym = root if not is_fut or root.startswith("/") else f"/{root}"
+            kwargs = {"futures": [sym]} if is_fut else {"equities": [sym]}
+            q = api.get_market_data(self.portfolio.token, **kwargs).get(sym, {})
+            for k in ("mark", "last"):
+                try:
+                    v = float(q.get(k))
+                    if v > 0:
+                        return v
+                except (TypeError, ValueError):
+                    pass
+            try:
+                b = float(q.get("bid")); a = float(q.get("ask"))
+                if b > 0 and a > 0:
+                    return (b + a) / 2.0
+            except (TypeError, ValueError):
+                pass
+        except Exception:
+            pass
+        return None
+
     def _build_exit_plan_card(self):
         """Editable exit-plan card: profit target, stop loss, DTE, price bounds."""
         frame, lay = self._section_frame("Exit Plan")
@@ -1050,9 +1088,7 @@ class StrategyDetailPage(QWidget):
 
         credit = self.strategy.credit_debit
         ref    = abs(credit) if credit else None
-        underlying = next(
-            (l.underlying_price for l in self.strategy.legs if l.underlying_price), None
-        )
+        underlying = self._current_spot()
 
         # ── Field builder helper ────────────────────────────────────────────
         def _row(label, ep_key, default_val, suffix, decimals, tooltip,
@@ -1165,13 +1201,120 @@ class StrategyDetailPage(QWidget):
             dte = self.strategy.dte
             return f"→  now {dte}d" if dte is not None else ""
 
-        def below_ctx(v):
-            if not v or not underlying: return ""
-            return f"→  now {underlying:.4f}"
+        # ── Spot-price row with %-offset slider ─────────────────────────────
+        # Decimals/step adapt to magnitude so the spin steps feel natural.
+        if underlying is None:
+            decimals_u = 2
+            step_u = 0.01
+        elif underlying >= 1000:
+            decimals_u = 1; step_u = 1.0
+        elif underlying >= 100:
+            decimals_u = 2; step_u = 0.1
+        elif underlying >= 10:
+            decimals_u = 2; step_u = 0.05
+        elif underlying >= 1:
+            decimals_u = 3; step_u = 0.01
+        else:
+            decimals_u = 4; step_u = 0.0001
 
-        def above_ctx(v):
-            if not v or not underlying: return ""
-            return f"→  now {underlying:.4f}"
+        def _spot_row(label, ep_key, tooltip, cond_type, is_below):
+            hl = QHBoxLayout(); hl.setSpacing(10)
+
+            lbl = QLabel(label.upper())
+            lbl.setFixedWidth(110)
+            lbl.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
+                f"letter-spacing: 0.5px; border: none;"
+            )
+            hl.addWidget(lbl)
+
+            spin = QDoubleSpinBox()
+            spin.setDecimals(decimals_u)
+            spin.setMinimum(0.0)
+            spin.setMaximum(999999.0)
+            spin.setSingleStep(step_u)
+            saved = ep.get(ep_key)
+            initial = float(saved) if saved else float(underlying or 0)
+            spin.setValue(initial)
+            spin.setToolTip(tooltip)
+            spin.setFixedWidth(100)
+            spin.setStyleSheet(
+                f"QDoubleSpinBox {{ background: {T.BG_ALT}; color: {T.TEXT}; "
+                f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 3px 6px; "
+                f"font-size: 13px; }}"
+                f"QDoubleSpinBox:focus {{ border-color: {T.ACCENT}; }}"
+            )
+            hl.addWidget(spin)
+
+            sld = QSlider(Qt.Orientation.Horizontal)
+            sld.setMinimum(0)
+            sld.setMaximum(50)   # 0-50% offset from current spot
+            sld.setFixedWidth(140)
+            sld.setEnabled(bool(underlying))
+            if underlying:
+                diff_pct = abs((initial - underlying) / underlying * 100.0) if initial else 0
+                sld.setValue(int(min(50, round(diff_pct))))
+            hl.addWidget(sld)
+
+            ctx_lbl = QLabel("")
+            ctx_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 11px; border: none;")
+            hl.addWidget(ctx_lbl)
+
+            hl.addStretch()
+
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color: {T.MUTED}; font-size: 14px; border: none;")
+            hl.addWidget(dot)
+
+            sign = -1 if is_below else 1
+
+            def _refresh_status():
+                v = spin.value()
+                if underlying:
+                    pct = (v / underlying - 1.0) * 100.0
+                    arrow = "↓" if is_below else "↑"
+                    ctx_lbl.setText(f"{arrow} {abs(pct):.1f}% from {underlying:.{decimals_u}f}")
+                else:
+                    ctx_lbl.setText("")
+                tmp_ep = dict(ep); tmp_ep[ep_key] = v if v > 0 else None
+                tmp_conds = {c["type"]: c for c in check_exit_conditions(self.strategy, tmp_ep)}
+                c = tmp_conds.get(cond_type)
+                if c is None or v == 0:
+                    dot.setText("●"); dot.setStyleSheet(f"color: {T.MUTED}; font-size: 14px; border: none;")
+                elif c["severity"] == "hit":
+                    dot.setText("⚡"); dot.setStyleSheet(f"color: {T.RED}; font-size: 14px; border: none;")
+                elif c["severity"] == "near":
+                    dot.setText("●"); dot.setStyleSheet(f"color: {T.YELLOW}; font-size: 14px; border: none;")
+                else:
+                    dot.setText("●"); dot.setStyleSheet(f"color: {T.GREEN}; font-size: 14px; border: none;")
+
+            def _slider_moved(pct_int):
+                if not underlying: return
+                target = underlying * (1.0 + sign * pct_int / 100.0)
+                if target < 0: target = 0
+                spin.blockSignals(True)
+                spin.setValue(target)
+                spin.blockSignals(False)
+                _refresh_status()
+
+            def _spin_changed():
+                if not underlying:
+                    _refresh_status()
+                    return
+                pct = (spin.value() / underlying - 1.0) * 100.0
+                slider_val = int(min(50, max(0, abs(round(pct)))))
+                sld.blockSignals(True)
+                sld.setValue(slider_val)
+                sld.blockSignals(False)
+                _refresh_status()
+
+            sld.valueChanged.connect(_slider_moved)
+            spin.valueChanged.connect(lambda _v: _spin_changed())
+            spin.editingFinished.connect(lambda: self._save_exit_field(ep_key, spin.value()))
+            sld.sliderReleased.connect(lambda: self._save_exit_field(ep_key, spin.value()))
+
+            _refresh_status()
+            return hl
 
         # ── Two-column grid ─────────────────────────────────────────────────
         left  = QVBoxLayout(); left.setSpacing(10)
@@ -1193,18 +1336,22 @@ class StrategyDetailPage(QWidget):
             dte_ctx, "dte",
         ))
 
-        right.addLayout(_row(
-            "Stop Below", "underlying_below", underlying or 0, "(underlying)",
-            4, "Stop out if underlying price falls to or below this level",
-            below_ctx, "below",
+        right.addLayout(_spot_row(
+            "Stop Below", "underlying_below",
+            "Stop out if underlying price falls to or below this level",
+            "below", is_below=True,
         ))
-        right.addLayout(_row(
-            "Stop Above", "underlying_above", underlying or 0, "(underlying)",
-            4, "Stop out if underlying price rises to or above this level",
-            above_ctx, "above",
+        right.addLayout(_spot_row(
+            "Stop Above", "underlying_above",
+            "Stop out if underlying price rises to or above this level",
+            "above", is_below=False,
         ))
         if underlying is not None:
-            spot_lbl = QLabel(f"Current underlying:  {underlying:.4f}")
+            spot_lbl = QLabel(f"Current underlying:  {underlying:.{decimals_u}f}")
+            spot_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none; margin-top: 4px;")
+            right.addWidget(spot_lbl)
+        else:
+            spot_lbl = QLabel("Current underlying:  —  (slider disabled until quote available)")
             spot_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none; margin-top: 4px;")
             right.addWidget(spot_lbl)
         right.addStretch()
