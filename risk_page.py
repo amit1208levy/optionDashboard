@@ -32,10 +32,21 @@ def _f(v):
         return None
 
 
-# Color palette for strategy segments (cycles if more strategies than entries)
+# Color palette for strategy segments — cohesive cool/violet tonal palette
+# anchored on the app's purple accent, with blue/teal/indigo siblings and a
+# single warm pop (rose) for contrast.  Avoids the saturated orange/lime/cyan
+# that clashed with the rest of the dashboard's slate-purple look.
 _PALETTE = [
-    T.PURPLE, T.TEAL, T.BLUE, T.GREEN, T.YELLOW,
-    "#f97316", "#ec4899", "#06b6d4", "#84cc16", "#a78bfa",
+    T.ACCENT,    # #a78bfa — violet-400 (matches header / buttons)
+    T.TEAL,      # #2dd4bf — teal-400
+    "#818cf8",   # indigo-400
+    T.BLUE,      # #60a5fa — blue-400
+    T.YELLOW,    # #fbbf24 — amber-400 (warm pop)
+    "#5eead4",   # teal-300 (lighter sibling)
+    "#38bdf8",   # sky-400
+    "#c4b5fd",   # violet-300 (lighter purple)
+    T.GREEN,     # #4ade80 — green-400
+    "#f472b6",   # pink-400 (second warm pop)
 ]
 
 def _style_ax(ax, xlabel: str = "", ylabel: str = ""):
