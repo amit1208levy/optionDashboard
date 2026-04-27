@@ -14,12 +14,12 @@ import theme as T
 
 _BASE_LEG_COLUMNS = [
     ("",          24),   # drag-handle placeholder (no header text)
-    ("Ticker",    68),   # underlying root + C/P type
+    ("Qty",       72),   # signed contracts (+long / −short), large + colored
+    ("Ticker",    78),   # underlying root + C/P type
     ("Strike",    72),
     ("Exp",       82),
     ("P&L",       90),
     ("Day",       80),   # day P&L (mark − prior close)
-    ("Qty",       52),
     ("Premium",   90),   # credit received (short) / debit paid (long) at open
     ("Extrinsic", 76),   # current time-value of the option
 ]
@@ -188,22 +188,42 @@ class LegRow(QFrame):
         h.addWidget(handle)
 
         # ── Data cells ────────────────────────────────────────────────────
-        type_color = (T.GREEN if leg.call_put == "C"
-                      else T.RED if leg.call_put == "P"
-                      else T.MUTED)
+        # Color by trade direction: BUY (long) = green, SELL (short) = red.
+        side_color = T.GREEN if leg.is_long else T.RED
         prem_color = (T.GREEN if leg.credit_debit > 0
                       else T.RED if leg.credit_debit < 0
                       else T.MUTED)
-        side_tag   = " S" if not leg.is_long else " L"
 
         day  = _day_pnl_leg(leg)
         ext  = _extrinsic_value(leg)
-        ticker_text = f"{leg.root or '—'}{side_tag}"
+
+        # Signed quantity: +N (bought) or −N (sold).  Use unicode minus for
+        # cleaner-looking negative numbers.
+        qty_signed = leg.sign * leg.quantity
+        if abs(qty_signed - round(qty_signed)) < 1e-9:
+            qty_text = f"{int(qty_signed):+d}".replace("-", "−")
+        else:
+            qty_text = f"{qty_signed:+g}".replace("-", "−")
+
+        # Ticker shows root + C/P (option type stays visible since the row
+        # color now communicates direction instead).
+        type_letter = leg.call_put or ""
+        ticker_text = f"{leg.root or '—'}" + (f" {type_letter}" if type_letter else "")
+
+        # ── Big signed-qty cell (first, prominent) ────────────────────────
+        qty_lbl = QLabel(qty_text)
+        qty_lbl.setFixedWidth(72)
+        qty_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        qty_lbl.setStyleSheet(
+            f"color: {side_color}; background: transparent; border: none; "
+            f"font-size: 18px; font-weight: 800; padding-left: 4px;"
+        )
+        h.addWidget(qty_lbl)
 
         # (text, color, weight, width)
         base_cells = [
             (ticker_text,
-             type_color,                        700, 68),
+             side_color,                        700, 78),
             (f"${leg.strike:g}" if leg.strike else "—",
              T.TEXT,                            600, 72),
             (leg.expires_at.strftime("%b %d %y") if leg.expires_at else "—",
@@ -212,10 +232,8 @@ class LegRow(QFrame):
              pnl_color(leg.pnl),                700, 90),
             (money(day, signed=True) if day is not None else "—",
              pnl_color(day) if day is not None else T.MUTED, 600, 80),
-            (f"{leg.quantity:g}",
-             T.TEXT,                            500, 52),
             (money(leg.credit_debit, signed=True),
-             prem_color,                        600, 84),
+             prem_color,                        600, 90),
             (f"${ext:.3f}" if ext > 0 else "—",
              T.TEXT_DIM,                        500, 76),
         ]

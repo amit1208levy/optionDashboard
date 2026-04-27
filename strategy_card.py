@@ -353,19 +353,26 @@ class StrategyCard(QFrame):
         cl.setContentsMargins(14, 10, 14, 12)
         cl.setSpacing(6)
 
-        # ── Top line: L/S badge · type · strike · expiry ──────────────────
+        # ── Top line: signed-qty badge · type · strike · expiry ───────────
         top = QHBoxLayout()
         top.setSpacing(10)
 
-        dir_color = T.GREEN if leg.is_long else T.RED
-        dir_badge = QLabel(leg.direction_label[0])     # "L" / "S"
-        dir_badge.setFixedSize(22, 22)
-        dir_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        dir_badge.setStyleSheet(
-            f"color: white; background: {dir_color}; "
-            f"border-radius: 5px; font-size: 11px; font-weight: bold;"
+        # Buy = green, Sell = red.  Signed quantity is the most prominent
+        # element — replaces the old separate L/S badge + ×N chip.
+        side_color = T.GREEN if leg.is_long else T.RED
+        qty_signed = leg.sign * leg.quantity
+        if abs(qty_signed - round(qty_signed)) < 1e-9:
+            qty_text = f"{int(qty_signed):+d}".replace("-", "−")
+        else:
+            qty_text = f"{qty_signed:+g}".replace("-", "−")
+        qty_lbl = QLabel(qty_text)
+        qty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        qty_lbl.setStyleSheet(
+            f"color: {side_color}; background: transparent; "
+            f"border: none; font-size: 19px; font-weight: 800; "
+            f"min-width: 44px; padding-right: 4px;"
         )
-        top.addWidget(dir_badge)
+        top.addWidget(qty_lbl)
 
         # "Put 450" / "Call 5800" / "Shares" / "Future"
         if leg.is_option and leg.strike:
@@ -374,18 +381,10 @@ class StrategyCard(QFrame):
             headline = leg.type_label
         name_lbl = QLabel(headline)
         name_lbl.setStyleSheet(
-            f"color: {T.TEXT}; font-size: 14px; font-weight: bold; "
+            f"color: {side_color}; font-size: 14px; font-weight: bold; "
             f"border: none; background: transparent;"
         )
         top.addWidget(name_lbl)
-
-        # Qty chip
-        qty_lbl = QLabel(f"×{leg.quantity:g}")
-        qty_lbl.setStyleSheet(
-            f"color: {T.MUTED}; background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
-            f"border-radius: 4px; padding: 1px 6px; font-size: 11px; font-weight: bold;"
-        )
-        top.addWidget(qty_lbl)
 
         # Expiry + DTE + DIT
         if leg.is_option and leg.expires_at:
