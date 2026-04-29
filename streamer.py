@@ -21,8 +21,6 @@ QuoteStreamer is a QThread that runs its own asyncio event loop.
 All GUI interaction happens exclusively via Qt signals (price_update,
 status_changed) which Qt automatically marshals to the main thread.
 """
-from __future__ import annotations
-
 import asyncio
 import json
 import re
@@ -58,67 +56,32 @@ def _f(v):
         return None
 
 
-def get_streamer_token(access_token: str, session_token: str | None = None):
+def get_streamer_token(access_token: str):
     """
-    Fetch DXLink token + WS URL.
-
-    TastyTrade has two streaming-token endpoints:
-
-    * ``/quote-streamer-tokens`` — the legacy one.  Available to ANY
-      authenticated session token.  Returns a live-data DXLink token
-      with ~24 h expiry.
-    * ``/api-quote-tokens`` — the newer one.  Gated behind a separate
-      "quote streamer" entitlement that personal accounts don't have by
-      default (returns HTTP 403
-      ``quote_streamer.api_access_entitlement_not_granted`` even with
-      a valid session token).
-
-    We try the legacy endpoint first because it works for everyone, then
-    fall back to the new one if the user happens to have the entitlement.
-
-    Authentication: a TastyTrade *session* token (from POST /sessions)
-    is required — OAuth Bearer auth does not work on either endpoint.
-
+    Fetch DXLink token + WS URL from /api-quote-tokens.
     Returns (token_str, url_str) on success, (None, err_msg) on failure.
     """
-    # Build auth header: session-token (raw) preferred, OAuth Bearer fallback.
-    if session_token:
-        auth_header = session_token   # no "Bearer " prefix for session auth
-    else:
-        auth_header = f"Bearer {access_token}"
-
-    headers = {
-        "Authorization":  auth_header,
-        "Content-Type":   "application/json",
-        "User-Agent":     UA,
-    }
-
-    last_err = "unknown"
-    for path in ("/quote-streamer-tokens", "/api-quote-tokens"):
-        try:
-            r = requests.get(f"{BASE}{path}", headers=headers, timeout=10)
-        except Exception as e:
-            last_err = str(e)
-            continue
+    try:
+        r = requests.get(
+            f"{BASE}/api-quote-tokens",
+            headers={
+                "Authorization":  f"Bearer {access_token}",
+                "Content-Type":   "application/json",
+                "User-Agent":     UA,
+            },
+            timeout=10,
+        )
         if r.status_code != 200:
-            last_err = f"HTTP {r.status_code} on {path}"
-            continue
-        try:
-            data = r.json().get("data", {}) or {}
-        except ValueError:
-            last_err = "non-JSON response"
-            continue
+            return None, f"HTTP {r.status_code}"
+        data  = r.json().get("data", {})
         token = data.get("token") or ""
-        # Older endpoint returns 'dxlink-url' OR 'websocket-url'; newer one
-        # returns 'dxlink-url'.  The DXLink WebSocket lives at the dxlink-url.
-        url = (data.get("dxlink-url")
-               or "wss://tasty-live-ws.dxfeed.com/realtime")
+        url   = (data.get("dxlink-url")
+                 or "wss://tasty-openapi-ws.dxfeed.com/realtime")
         if not token:
-            last_err = f"empty token in {path} response"
-            continue
+            return None, "Empty streamer token from API"
         return token, url
-
-    return None, last_err
+    except Exception as e:
+        return None, str(e)
 
 
 # ── streamer ─────────────────────────────────────────────────────────────────
@@ -143,13 +106,9 @@ class QuoteStreamer(QThread):
     price_update   = pyqtSignal(dict)
     status_changed = pyqtSignal(str)
 
-    def __init__(self, access_token: str, parent=None,
-                 session_token: str | None = None):
+    def __init__(self, access_token: str, parent=None):
         super().__init__(parent)
         self._access_token = access_token
-        # Optional TastyTrade session token — preferred over OAuth Bearer
-        # for /api-quote-tokens because OAuth lacks the streaming scope.
-        self._session_token = session_token
         self._symbols: set = set()
         self._lock         = threading.Lock()
         self._loop         = None   # asyncio loop (set inside run())
@@ -218,12 +177,9 @@ class QuoteStreamer(QThread):
         self.status_changed.emit("connecting")
         self._schema = {}
 
-        # Fetch token via blocking HTTP (run in thread pool so we don't block the loop).
-        # Pass session_token when available so we use the auth path that has the
-        # streaming entitlement; the access_token (OAuth) is only a fallback.
+        # Fetch token via blocking HTTP (run in thread pool so we don't block the loop)
         token, url = await self._loop.run_in_executor(
-            None,
-            lambda: get_streamer_token(self._access_token, self._session_token),
+            None, get_streamer_token, self._access_token
         )
         if not token:
             self.status_changed.emit(f"error:{url}")

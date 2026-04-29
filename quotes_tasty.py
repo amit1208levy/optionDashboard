@@ -34,21 +34,13 @@ class TastyQuotesProvider(QuotesProvider):
     Parameters
     ----------
     token_getter
-        Zero-arg callable returning the current TastyTrade OAuth access
-        token.  Used for REST market-data calls.
-    session_token_getter
-        Optional zero-arg callable returning a TastyTrade *session* token
-        (from POST /sessions).  Session tokens carry the streaming
-        entitlement that OAuth tokens lack — so they're preferred for
-        the DXLink streamer.  When None or returning falsy, the streamer
-        falls back to the OAuth Bearer path (which currently 403s on
-        /api-quote-tokens, dropping us to REST polling).
+        Zero-arg callable returning the current TastyTrade access token.
+        Using a getter (rather than a stored token) means token rotations
+        from the auth layer are picked up automatically.
     """
 
-    def __init__(self, token_getter: Callable[[], str],
-                 session_token_getter: Optional[Callable[[], Optional[str]]] = None):
-        self._get_token         = token_getter
-        self._get_session_token = session_token_getter
+    def __init__(self, token_getter: Callable[[], str]):
+        self._get_token = token_getter
 
     # ── REST snapshot ───────────────────────────────────────────────────────
 
@@ -85,14 +77,7 @@ class TastyQuotesProvider(QuotesProvider):
             on_status("error:no token")
             return None
 
-        sess = ""
-        if self._get_session_token is not None:
-            try:
-                sess = self._get_session_token() or ""
-            except Exception:
-                sess = ""
-
-        s = _streamer_mod.QuoteStreamer(token, session_token=sess or None)
+        s = _streamer_mod.QuoteStreamer(token)
         # Qt's auto-connection type makes these queued when the receiver is
         # a QObject method bound to the GUI thread, and direct otherwise —
         # both cases work for our consumers.
