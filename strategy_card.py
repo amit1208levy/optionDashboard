@@ -62,23 +62,33 @@ def pnl_color(v):
 # ── Strategy card ───────────────────────────────────────────────────────────
 
 class StrategyCard(QFrame):
-    clicked = pyqtSignal(object)   # strategy
+    clicked        = pyqtSignal(object)   # strategy
+    hide_requested = pyqtSignal(object)   # strategy — user clicked hide
 
-    def __init__(self, strategy, parent=None, metrics=None):
+    def __init__(self, strategy, parent=None, metrics=None, hidden=False):
         super().__init__(parent)
         self.strategy = strategy
         self.metrics = metrics or {}
+        self.is_hidden = bool(hidden)
         self._pnl_val_lbl = None   # QLabel — set by _stat() when is_pnl=True
         self._pnl_pct_lbl = None   # QLabel for pct sub-label
         self._expanded  = False
         self._body      = None     # expandable legs container (built lazily)
         self._chevron   = None
         self.setObjectName("card")
-        self.setStyleSheet(
-            f"QFrame#card {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
-            f"border-radius: 14px; }}"
-            f"QFrame#card:hover {{ border-color: {T.PURPLE}; }}"
-        )
+        if self.is_hidden:
+            # Dim look so users can tell "show hidden" mode is on at a glance.
+            self.setStyleSheet(
+                f"QFrame#card {{ background: {T.BG_ALT}; border: 1px dashed {T.BORDER}; "
+                f"border-radius: 14px; }}"
+                f"QFrame#card:hover {{ border-color: {T.PURPLE}; }}"
+            )
+        else:
+            self.setStyleSheet(
+                f"QFrame#card {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
+                f"border-radius: 14px; }}"
+                f"QFrame#card:hover {{ border-color: {T.PURPLE}; }}"
+            )
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         # Outer vertical layout: header row on top, expandable legs below
@@ -150,6 +160,7 @@ class StrategyCard(QFrame):
             "DTE",
             str(strategy.dte) if strategy.dte is not None else "—",
             T.TEXT,
+            width=68,
         ))
 
         pop = probability_of_profit(strategy)
@@ -158,7 +169,26 @@ class StrategyCard(QFrame):
         else:
             pop_text = f"{pop:.0f}%"
             pop_c = T.GREEN if pop >= 60 else (T.YELLOW if pop >= 40 else T.RED)
-        h.addWidget(self._stat("POP", pop_text, pop_c))
+        h.addWidget(self._stat("POP", pop_text, pop_c, width=68))
+
+        # Net Δ and Θ in dollar units (Strategy._agg multiplies by contract mult)
+        nd = strategy.net_delta
+        if nd is None:
+            d_text, d_c = "—", T.MUTED
+        else:
+            d_text = f"{nd:+,.0f}" if abs(nd) >= 100 else f"{nd:+.1f}"
+            d_text = d_text.replace("-", "−")
+            d_c = pnl_color(nd)
+        h.addWidget(self._stat("Δ", d_text, d_c, width=82))
+
+        nt = strategy.net_theta
+        if nt is None:
+            t_text, t_c = "—", T.MUTED
+        else:
+            t_text = f"{nt:+,.0f}" if abs(nt) >= 100 else f"{nt:+.1f}"
+            t_text = t_text.replace("-", "−")
+            t_c = pnl_color(nt)
+        h.addWidget(self._stat("Θ", t_text, t_c, width=82))
 
         # Day P&L: sum over legs of sign × qty × mult × (mark − close_price)
         day_pnl = sum(
@@ -171,7 +201,7 @@ class StrategyCard(QFrame):
         else:
             day_text = money(day_pnl, signed=True)
             day_c = pnl_color(day_pnl)
-        h.addWidget(self._stat("Day P&L", day_text, day_c))
+        h.addWidget(self._stat("Day P&L", day_text, day_c, width=100))
 
         h.addWidget(self._stat(
             "Open P&L",
@@ -179,7 +209,19 @@ class StrategyCard(QFrame):
             pnl_color(strategy.pnl),
             sub=pct(strategy.pnl_pct),
             is_pnl=True,
+            width=110,
         ))
+
+        # Cache values for the parent's sort logic — exposes computed numbers
+        # without re-deriving them in app.py.
+        self._sort_values = {
+            "dte":   float(strategy.dte) if strategy.dte is not None else None,
+            "pop":   float(pop) if pop is not None else None,
+            "delta": float(nd) if nd is not None else None,
+            "theta": float(nt) if nt is not None else None,
+            "day":   float(day_pnl) if day_pnl else 0.0,
+            "pnl":   float(strategy.pnl) if strategy.pnl is not None else 0.0,
+        }
 
         self._chevron = QLabel("›")
         self._chevron.setStyleSheet(
@@ -187,6 +229,27 @@ class StrategyCard(QFrame):
             f"background: transparent; border: none;"
         )
         h.addWidget(self._chevron)
+
+        # ── Hide / unhide button ──────────────────────────────────────────
+        # Tiny ✕ button at the far right; click toggles this strategy's
+        # hidden state.  QPushButton consumes the click so card.clicked
+        # doesn't also fire.
+        hide_btn = QPushButton("↺" if self.is_hidden else "✕")
+        hide_btn.setFixedSize(20, 20)
+        hide_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        hide_btn.setToolTip(
+            "Show this strategy again" if self.is_hidden
+            else "Hide this strategy from the list"
+        )
+        hide_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: 1px solid transparent; border-radius: 10px; "
+            f"font-size: 12px; font-weight: bold; padding: 0; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT if self.is_hidden else T.RED}; "
+            f"border-color: {T.BORDER}; background: {T.BG_ALT}; }}"
+        )
+        hide_btn.clicked.connect(lambda: self.hide_requested.emit(self.strategy))
+        h.addWidget(hide_btn)
 
         # ── Expandable legs body (hidden until user clicks) ───────────────
         self._outer_lay = outer
@@ -212,10 +275,10 @@ class StrategyCard(QFrame):
             )
         return l
 
-    def _stat(self, label, value, color, sub=None, is_pnl=False):
+    def _stat(self, label, value, color, sub=None, is_pnl=False, width=110):
         w = QFrame()
         w.setStyleSheet("background: transparent; border: none;")
-        w.setFixedWidth(110)
+        w.setFixedWidth(width)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(2)

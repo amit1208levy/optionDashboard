@@ -21,7 +21,7 @@ from version import VERSION
 from models import (
     Position, StrategyInstance, unassigned_positions, group_unassigned,
     build_snapshot, detect_closures, portfolio_greeks, repair_history_pnl,
-    repair_pnl_missing_multiplier, check_exit_conditions,
+    repair_pnl_missing_multiplier, check_exit_conditions, probability_of_profit,
 )
 from strategy_card import StrategyCard, pnl_color, money, fmt_num
 from strategies_page import ConfigurePage
@@ -540,8 +540,34 @@ class PortfolioScreen(QWidget):
             self.greek_tiles[key] = tile
             self.greeks_row.addWidget(tile["frame"])
 
-        self.my_header  = self._section_header("My Strategies")
-        self.body.addWidget(self.my_header)
+        # Sort + hidden state — persisted in user settings.
+        self._my_sort_col       = self._settings.get("my_sort_col") or None
+        self._my_sort_asc       = bool(self._settings.get("my_sort_asc", False))
+        self._show_hidden_strats= bool(self._settings.get("show_hidden_strats", False))
+
+        # Section header row: title on the left, "show hidden (N)" on the right
+        my_hdr_row = QHBoxLayout()
+        my_hdr_row.setContentsMargins(0, 0, 0, 0)
+        my_hdr_row.setSpacing(8)
+        self.my_header = self._section_header("My Strategies")
+        my_hdr_row.addWidget(self.my_header)
+        my_hdr_row.addStretch()
+        self.hidden_toggle = QPushButton("")
+        self.hidden_toggle.setProperty("ghost", True)
+        self.hidden_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.hidden_toggle.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: none; padding: 4px 8px; font-size: 11px; font-weight: 600; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT}; }}"
+        )
+        self.hidden_toggle.clicked.connect(self._on_toggle_hidden)
+        self.hidden_toggle.setVisible(False)
+        my_hdr_row.addWidget(self.hidden_toggle)
+        self.body.addLayout(my_hdr_row)
+
+        # Sortable column header bar (aligned with each card's right-side stats).
+        self.body.addWidget(self._build_my_sort_bar())
+
         self.my_container = QVBoxLayout()
         self.my_container.setSpacing(10)
         self.body.addLayout(self.my_container)
@@ -947,6 +973,126 @@ class PortfolioScreen(QWidget):
             f"border: none; background: transparent; padding: 8px 2px 4px 2px;"
         )
         return l
+
+    # ── My Strategies: sortable header + hidden toggle ──────────────────────
+
+    # (column label, sort key, fixed width, default ascending direction)
+    # Widths/spacing match the per-card stats in StrategyCard so the headers
+    # line up over the values they sort.
+    _MY_SORT_COLS = [
+        ("DTE",      "dte",   68,  True),
+        ("POP",      "pop",   68,  False),
+        ("Δ",        "delta", 82,  False),
+        ("Θ",        "theta", 82,  False),
+        ("DAY P&L",  "day",   100, False),
+        ("OPEN P&L", "pnl",   110, False),
+    ]
+
+    def _build_my_sort_bar(self):
+        bar = QFrame()
+        bar.setStyleSheet("background: transparent; border: none;")
+        h = QHBoxLayout(bar)
+        # Match per-card horizontal padding (22, 16, 22, 16) and inner spacing (16).
+        h.setContentsMargins(22, 0, 22, 4)
+        h.setSpacing(16)
+        h.addStretch()                 # consume the name+badges area on the left
+
+        self._my_sort_lbls: dict = {}  # {key: (label, base_text, default_asc)}
+        for label, key, width, asc_default in self._MY_SORT_COLS:
+            lbl = QLabel(label)
+            lbl.setFixedWidth(width)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            lbl.setToolTip(
+                f"Sort by {label}  ·  click again to reverse  ·  third click clears"
+            )
+            lbl.mousePressEvent = (
+                lambda _e, k=key, a=asc_default: self._on_my_sort_click(k, a)
+            )
+            self._my_sort_lbls[key] = (lbl, label, asc_default)
+            h.addWidget(lbl)
+        # Trailing space matching chevron(22) + hide button(20) + spacing.
+        h.addSpacing(22 + 20 + 16)
+        self._update_my_sort_headers()
+        return bar
+
+    def _update_my_sort_headers(self):
+        for key, (lbl, base, _ad) in (self._my_sort_lbls or {}).items():
+            if key == self._my_sort_col:
+                arrow = " ▲" if self._my_sort_asc else " ▼"
+                lbl.setText(base + arrow)
+                lbl.setStyleSheet(
+                    f"color: {T.ACCENT}; font-size: 10px; font-weight: bold; "
+                    f"letter-spacing: 0.6px; border: none; "
+                    f"background: {T.CARD_ALT}; border-radius: 3px; padding: 1px 3px;"
+                )
+            else:
+                lbl.setText(base)
+                lbl.setStyleSheet(
+                    f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
+                    f"letter-spacing: 0.6px; border: none;"
+                )
+
+    def _on_my_sort_click(self, col_key: str, default_asc: bool):
+        if self._my_sort_col == col_key:
+            if self._my_sort_asc == default_asc:
+                self._my_sort_asc = not self._my_sort_asc
+            else:
+                self._my_sort_col = None
+                self._my_sort_asc = False
+        else:
+            self._my_sort_col = col_key
+            self._my_sort_asc = default_asc
+        # Persist so sort survives restart
+        self._settings["my_sort_col"] = self._my_sort_col
+        self._settings["my_sort_asc"] = self._my_sort_asc
+        api.save_settings(self._settings)
+        self._update_my_sort_headers()
+        acct = self.current_account()
+        if acct:
+            self._render(acct)
+
+    def _on_toggle_hidden(self):
+        self._show_hidden_strats = not self._show_hidden_strats
+        self._settings["show_hidden_strats"] = self._show_hidden_strats
+        api.save_settings(self._settings)
+        acct = self.current_account()
+        if acct:
+            self._render(acct)
+
+    def _on_strategy_hide(self, strategy):
+        """Toggle the strategy's hidden flag and re-render the list."""
+        raw = next(
+            (r for r in self.strategies_raw if r.get("id") == getattr(strategy, "id", None)),
+            None,
+        )
+        if raw is None:
+            return
+        raw["hidden"] = not bool(raw.get("hidden"))
+        self.save_strategies()
+        acct = self.current_account()
+        if acct:
+            self._render(acct)
+
+    def _strategy_sort_value(self, inst, col):
+        """Return the comparable scalar for `inst` under sort column `col`."""
+        if col == "dte":
+            return inst.dte
+        if col == "pop":
+            return probability_of_profit(inst)
+        if col == "delta":
+            return inst.net_delta
+        if col == "theta":
+            return inst.net_theta
+        if col == "day":
+            return sum(
+                l.sign * l.quantity * l.multiplier * (l.mark_price - l.close_price)
+                for l in inst.legs
+                if l.close_price and l.close_price > 0 and l.mark_price
+            )
+        if col == "pnl":
+            return inst.pnl
+        return None
 
     def _bal_tile(self, label):
         w = QFrame()
@@ -1430,7 +1576,32 @@ class PortfolioScreen(QWidget):
         )
 
         self._strategy_cards = []
-        if not instances:
+
+        # \u2500\u2500 Filter hidden + apply user's sort \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        hidden_count = sum(1 for i in instances if i._raw.get("hidden"))
+        if self._show_hidden_strats:
+            display_list = list(instances)   # everything, hidden cards dimmed
+        else:
+            display_list = [i for i in instances if not i._raw.get("hidden")]
+
+        if self._my_sort_col:
+            def _sort_key(inst):
+                v = self._strategy_sort_value(inst, self._my_sort_col)
+                # None values always sort to the bottom regardless of direction
+                return (0, v) if v is not None else (1, 0)
+            display_list.sort(key=_sort_key, reverse=not self._my_sort_asc)
+
+        # Update the "Hidden (N) \u2014 show" toggle visibility/text.
+        if hidden_count:
+            self.hidden_toggle.setText(
+                f"\u2298 Hidden ({hidden_count}) \u2014 "
+                + ("hide" if self._show_hidden_strats else "show")
+            )
+            self.hidden_toggle.setVisible(True)
+        else:
+            self.hidden_toggle.setVisible(False)
+
+        if not display_list:
             empty = QLabel('No strategies configured \u2014 click \u201cConfigure Account\u201d in the header.')
             empty.setStyleSheet(
                 f"color: {T.MUTED}; font-size: 13px; padding: 22px; border: 1px dashed "
@@ -1439,9 +1610,13 @@ class PortfolioScreen(QWidget):
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.my_container.addWidget(empty)
         else:
-            for inst in instances:
-                card = StrategyCard(inst, metrics=metrics)
+            for inst in display_list:
+                card = StrategyCard(
+                    inst, metrics=metrics,
+                    hidden=bool(inst._raw.get("hidden")),
+                )
                 card.clicked.connect(self.strategy_clicked.emit)
+                card.hide_requested.connect(self._on_strategy_hide)
                 self.my_container.addWidget(card)
                 self._strategy_cards.append(card)
 
