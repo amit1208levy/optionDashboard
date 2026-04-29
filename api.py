@@ -47,6 +47,7 @@ STRATEGIES_FILE     = os.path.join(_DATA_DIR, ".strategies.json")
 HISTORY_FILE        = os.path.join(_DATA_DIR, ".history.json")
 SNAPSHOTS_FILE      = os.path.join(_DATA_DIR, ".snapshots.json")
 SETTINGS_FILE       = os.path.join(_DATA_DIR, ".settings.json")
+STREAM_CREDS_FILE   = os.path.join(_DATA_DIR, ".stream_creds.json")
 
 
 # ── Credentials ─────────────────────────────────────────────────────────────
@@ -66,6 +67,39 @@ def save_credentials(data):
 def clear_credentials():
     if os.path.exists(CREDENTIALS_FILE):
         os.remove(CREDENTIALS_FILE)
+
+
+# ── Streaming credentials (session-token auth for DXLink) ────────────────────
+# We store the user's TastyTrade login + a long-lived "remember-token" so we
+# can mint a fresh session-token on demand without re-prompting the password
+# or 2FA every time.  The actual password is NEVER stored here.
+
+def load_stream_creds():
+    """Return {"login": str, "remember_token": str} or None if not configured."""
+    if os.path.exists(STREAM_CREDS_FILE):
+        try:
+            with open(STREAM_CREDS_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def save_stream_creds(data: dict):
+    """Persist streaming credentials.  Pass None / {} to clear them."""
+    if not data:
+        clear_stream_creds()
+        return
+    with open(STREAM_CREDS_FILE, "w") as f:
+        json.dump({
+            "login":          data.get("login") or "",
+            "remember_token": data.get("remember_token") or "",
+        }, f, indent=2)
+
+
+def clear_stream_creds():
+    if os.path.exists(STREAM_CREDS_FILE):
+        os.remove(STREAM_CREDS_FILE)
 
 
 # ── Groups: assignments + names ─────────────────────────────────────────────

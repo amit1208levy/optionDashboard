@@ -21,6 +21,8 @@ QuoteStreamer is a QThread that runs its own asyncio event loop.
 All GUI interaction happens exclusively via Qt signals (price_update,
 status_changed) which Qt automatically marshals to the main thread.
 """
+from __future__ import annotations
+
 import asyncio
 import json
 import re
@@ -56,16 +58,30 @@ def _f(v):
         return None
 
 
-def get_streamer_token(access_token: str):
+def get_streamer_token(access_token: str, session_token: str | None = None):
     """
     Fetch DXLink token + WS URL from /api-quote-tokens.
+
+    Authentication
+    --------------
+    The /api-quote-tokens endpoint requires an auth scope that personal
+    OAuth apps don't have (returns HTTP 403 with OAuth Bearer tokens).
+    A TastyTrade *session* token (from POST /sessions) carries the
+    streaming entitlement.  Pass session_token if you have one — that
+    path is preferred.  Falls back to OAuth Bearer auth otherwise.
+
     Returns (token_str, url_str) on success, (None, err_msg) on failure.
     """
+    if session_token:
+        auth_header = session_token   # no "Bearer " prefix for session auth
+    else:
+        auth_header = f"Bearer {access_token}"
+
     try:
         r = requests.get(
             f"{BASE}/api-quote-tokens",
             headers={
-                "Authorization":  f"Bearer {access_token}",
+                "Authorization":  auth_header,
                 "Content-Type":   "application/json",
                 "User-Agent":     UA,
             },
@@ -106,9 +122,13 @@ class QuoteStreamer(QThread):
     price_update   = pyqtSignal(dict)
     status_changed = pyqtSignal(str)
 
-    def __init__(self, access_token: str, parent=None):
+    def __init__(self, access_token: str, parent=None,
+                 session_token: str | None = None):
         super().__init__(parent)
         self._access_token = access_token
+        # Optional TastyTrade session token — preferred over OAuth Bearer
+        # for /api-quote-tokens because OAuth lacks the streaming scope.
+        self._session_token = session_token
         self._symbols: set = set()
         self._lock         = threading.Lock()
         self._loop         = None   # asyncio loop (set inside run())
@@ -177,9 +197,12 @@ class QuoteStreamer(QThread):
         self.status_changed.emit("connecting")
         self._schema = {}
 
-        # Fetch token via blocking HTTP (run in thread pool so we don't block the loop)
+        # Fetch token via blocking HTTP (run in thread pool so we don't block the loop).
+        # Pass session_token when available so we use the auth path that has the
+        # streaming entitlement; the access_token (OAuth) is only a fallback.
         token, url = await self._loop.run_in_executor(
-            None, get_streamer_token, self._access_token
+            None,
+            lambda: get_streamer_token(self._access_token, self._session_token),
         )
         if not token:
             self.status_changed.emit(f"error:{url}")

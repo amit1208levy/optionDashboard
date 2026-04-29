@@ -1,4 +1,5 @@
 """Options Dashboard — setup + portfolio + configure screens."""
+from __future__ import annotations
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +18,7 @@ import api
 import updater
 import streamer as _streamer_mod
 import pnl as _pnl_mod
+import tt_session
 from quotes_tasty import TastyQuotesProvider
 from version import VERSION
 from models import (
@@ -485,6 +487,151 @@ class AccountSettingsDialog(QDialog):
         return [key for key in order if self._greek_checks[key].isChecked()]
 
 
+# ── Streaming login dialog ───────────────────────────────────────────────────
+
+class StreamingLoginDialog(QDialog):
+    """
+    Authenticates the user against TastyTrade's session endpoint so the
+    DXLink streamer can mint a quote token (OAuth tokens get HTTP 403 on
+    /api-quote-tokens).  Handles 2FA in-flow: if the first POST returns
+    "otp_required" we reveal the OTP field and try again.
+
+    On accept, ``result_data()`` returns:
+        {"session_token":  str,
+         "remember_token": str | None,
+         "login":          str}
+
+    The password is never stored — only the long-lived remember-token.
+    """
+
+    def __init__(self, initial_login: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Enable Real-Time Streaming")
+        self.setMinimumWidth(420)
+        self.setStyleSheet(f"background: {T.BG}; color: {T.TEXT};")
+
+        self._result: dict = {}
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 20, 22, 20)
+        lay.setSpacing(12)
+
+        title = QLabel("TastyTrade Streaming Login")
+        title.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 15px; font-weight: bold; border: none;"
+        )
+        lay.addWidget(title)
+
+        explainer = QLabel(
+            "Real-time quote streaming requires a TastyTrade session token, "
+            "which is separate from the OAuth token used for everything else. "
+            "Your password is never stored — only a 30-day remember-token "
+            "kept on this machine."
+        )
+        explainer.setWordWrap(True)
+        explainer.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
+        )
+        lay.addWidget(explainer)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._login_edit = QLineEdit(initial_login)
+        self._login_edit.setPlaceholderText("username or email")
+        self._login_edit.setStyleSheet(
+            f"background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 6px; padding: 6px 8px; color: {T.TEXT};"
+        )
+        form.addRow("Login:", self._login_edit)
+
+        self._pwd_edit = QLineEdit()
+        self._pwd_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._pwd_edit.setPlaceholderText("password")
+        self._pwd_edit.setStyleSheet(self._login_edit.styleSheet())
+        form.addRow("Password:", self._pwd_edit)
+
+        # 2FA row — hidden until the API tells us it's needed.
+        self._otp_label = QLabel("2FA code:")
+        self._otp_edit = QLineEdit()
+        self._otp_edit.setPlaceholderText("6-digit code from your authenticator")
+        self._otp_edit.setStyleSheet(self._login_edit.styleSheet())
+        form.addRow(self._otp_label, self._otp_edit)
+        self._otp_label.setVisible(False)
+        self._otp_edit.setVisible(False)
+
+        lay.addLayout(form)
+
+        self._status_lbl = QLabel("")
+        self._status_lbl.setWordWrap(True)
+        self._status_lbl.setStyleSheet(
+            f"color: {T.RED}; font-size: 11px; border: none; background: transparent;"
+        )
+        lay.addWidget(self._status_lbl)
+
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        btn_box.button(QDialogButtonBox.StandardButton.Ok).setText("Sign in")
+        btn_box.accepted.connect(self._on_submit)
+        btn_box.rejected.connect(self.reject)
+        lay.addWidget(btn_box)
+
+    def _on_submit(self):
+        login_email = self._login_edit.text().strip()
+        password    = self._pwd_edit.text()
+        otp         = self._otp_edit.text().strip() or None
+        if not login_email or not password:
+            self._status_lbl.setText("Login and password are required.")
+            return
+
+        self._status_lbl.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
+        )
+        self._status_lbl.setText("Signing in…")
+        QApplication.processEvents()
+
+        try:
+            res = tt_session.login(login_email, password, otp=otp, remember_me=True)
+        except Exception as e:
+            self._status_lbl.setStyleSheet(
+                f"color: {T.RED}; font-size: 11px; border: none; background: transparent;"
+            )
+            self._status_lbl.setText(f"Network error: {e}")
+            return
+
+        err = res.get("error")
+        if err == "otp_required":
+            self._otp_label.setVisible(True)
+            self._otp_edit.setVisible(True)
+            self._otp_edit.setFocus()
+            self._status_lbl.setStyleSheet(
+                f"color: {T.YELLOW}; font-size: 11px; border: none; background: transparent;"
+            )
+            self._status_lbl.setText("2FA required — enter the 6-digit code.")
+            return
+
+        if err:
+            self._status_lbl.setStyleSheet(
+                f"color: {T.RED}; font-size: 11px; border: none; background: transparent;"
+            )
+            # Keep the message short — the API tends to be verbose
+            self._status_lbl.setText(f"Login failed: {err}")
+            return
+
+        # Success
+        self._result = {
+            "session_token":  res.get("session_token") or "",
+            "remember_token": res.get("remember_token") or "",
+            "login":          login_email,
+        }
+        self.accept()
+
+    def result_data(self) -> dict:
+        return dict(self._result)
+
+
 # ── Portfolio screen ─────────────────────────────────────────────────────────
 
 class PortfolioScreen(QWidget):
@@ -505,11 +652,21 @@ class PortfolioScreen(QWidget):
         super().__init__()
         self.creds      = creds
         self.token      = token
+        # Streaming session token (POST /sessions auth path).  None until
+        # the user logs in via the Streaming Login dialog or a stored
+        # remember-token successfully refreshes one.  Required to bypass
+        # the OAuth /api-quote-tokens 403 that breaks the DXLink streamer.
+        self._stream_session_token: str | None = None
+        # Best-effort: refresh on startup if remember-token is on disk.
+        self._try_refresh_stream_session()
         # Quotes provider — token_getter lambda lets the provider always see
         # the freshest token after a rotation (see _on_data_loaded below).
         # All live quotes for the portfolio, watchlist, risk, and strategy
         # detail pages flow through this single instance.
-        self.quotes     = TastyQuotesProvider(token_getter=lambda: self.token)
+        self.quotes     = TastyQuotesProvider(
+            token_getter=lambda: self.token,
+            session_token_getter=lambda: self._stream_session_token,
+        )
         self._worker    = None
         self._accounts  = []
         self._alerted   = {}   # {(strategy_id, condition_type): severity} — prevents repeat alerts
@@ -775,6 +932,14 @@ class PortfolioScreen(QWidget):
 
     def _toggle_live(self, on):
         if on:
+            # Streaming requires a TastyTrade session token (OAuth Bearer
+            # gets 403 on /api-quote-tokens).  Prompt for one if we don't
+            # already have one cached.  User can decline — they just stay
+            # on REST polling.
+            if not self._stream_session_token and not getattr(self, "_ws_unavailable", False):
+                if not self._prompt_streaming_login():
+                    # User cancelled — still allow REST live polling
+                    self._ws_unavailable = True
             # Show "Connecting…" (or "Live" if we've learned WS isn't available)
             mode = "rest" if getattr(self, "_ws_unavailable", False) else "connecting"
             self._style_live_btn(True, streaming=False, mode=mode)
@@ -995,6 +1160,51 @@ class PortfolioScreen(QWidget):
         )
         lay.addWidget(lbl); lay.addWidget(val)
         return {"frame": f, "value": val}
+
+    # ── Streaming session-token management ──────────────────────────────────
+
+    def _try_refresh_stream_session(self):
+        """
+        Attempt to mint a fresh DXLink-eligible session token using the
+        stored login + remember-token.  Silent no-op if no stored creds
+        or refresh fails — the streamer will then fall back to its OAuth
+        Bearer path (which currently 403s, dropping us to REST polling).
+        """
+        creds = api.load_stream_creds() or {}
+        login_email = creds.get("login") or ""
+        remember    = creds.get("remember_token") or ""
+        if not login_email or not remember:
+            return
+        try:
+            res = tt_session.refresh_with_remember(login_email, remember)
+        except Exception:
+            return
+        if res.get("session_token"):
+            self._stream_session_token = res["session_token"]
+            new_remember = res.get("remember_token")
+            if new_remember and new_remember != remember:
+                api.save_stream_creds({"login": login_email,
+                                       "remember_token": new_remember})
+
+    def _prompt_streaming_login(self):
+        """
+        Open the Streaming Login dialog so the user can authenticate via
+        login + password (and optional 2FA) and receive a session token
+        with streaming entitlement.  Returns True on success.
+        """
+        dlg = StreamingLoginDialog(initial_login=self.creds.get("login")
+                                   if self.creds else "", parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        result = dlg.result_data()
+        if not result.get("session_token"):
+            return False
+        self._stream_session_token = result["session_token"]
+        api.save_stream_creds({
+            "login":          result.get("login") or "",
+            "remember_token": result.get("remember_token") or "",
+        })
+        return True
 
     def _section_header(self, text):
         l = QLabel(text.upper())
