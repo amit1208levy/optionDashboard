@@ -60,44 +60,65 @@ def _f(v):
 
 def get_streamer_token(access_token: str, session_token: str | None = None):
     """
-    Fetch DXLink token + WS URL from /api-quote-tokens.
+    Fetch DXLink token + WS URL.
 
-    Authentication
-    --------------
-    The /api-quote-tokens endpoint requires an auth scope that personal
-    OAuth apps don't have (returns HTTP 403 with OAuth Bearer tokens).
-    A TastyTrade *session* token (from POST /sessions) carries the
-    streaming entitlement.  Pass session_token if you have one — that
-    path is preferred.  Falls back to OAuth Bearer auth otherwise.
+    TastyTrade has two streaming-token endpoints:
+
+    * ``/quote-streamer-tokens`` — the legacy one.  Available to ANY
+      authenticated session token.  Returns a live-data DXLink token
+      with ~24 h expiry.
+    * ``/api-quote-tokens`` — the newer one.  Gated behind a separate
+      "quote streamer" entitlement that personal accounts don't have by
+      default (returns HTTP 403
+      ``quote_streamer.api_access_entitlement_not_granted`` even with
+      a valid session token).
+
+    We try the legacy endpoint first because it works for everyone, then
+    fall back to the new one if the user happens to have the entitlement.
+
+    Authentication: a TastyTrade *session* token (from POST /sessions)
+    is required — OAuth Bearer auth does not work on either endpoint.
 
     Returns (token_str, url_str) on success, (None, err_msg) on failure.
     """
+    # Build auth header: session-token (raw) preferred, OAuth Bearer fallback.
     if session_token:
         auth_header = session_token   # no "Bearer " prefix for session auth
     else:
         auth_header = f"Bearer {access_token}"
 
-    try:
-        r = requests.get(
-            f"{BASE}/api-quote-tokens",
-            headers={
-                "Authorization":  auth_header,
-                "Content-Type":   "application/json",
-                "User-Agent":     UA,
-            },
-            timeout=10,
-        )
+    headers = {
+        "Authorization":  auth_header,
+        "Content-Type":   "application/json",
+        "User-Agent":     UA,
+    }
+
+    last_err = "unknown"
+    for path in ("/quote-streamer-tokens", "/api-quote-tokens"):
+        try:
+            r = requests.get(f"{BASE}{path}", headers=headers, timeout=10)
+        except Exception as e:
+            last_err = str(e)
+            continue
         if r.status_code != 200:
-            return None, f"HTTP {r.status_code}"
-        data  = r.json().get("data", {})
+            last_err = f"HTTP {r.status_code} on {path}"
+            continue
+        try:
+            data = r.json().get("data", {}) or {}
+        except ValueError:
+            last_err = "non-JSON response"
+            continue
         token = data.get("token") or ""
-        url   = (data.get("dxlink-url")
-                 or "wss://tasty-openapi-ws.dxfeed.com/realtime")
+        # Older endpoint returns 'dxlink-url' OR 'websocket-url'; newer one
+        # returns 'dxlink-url'.  The DXLink WebSocket lives at the dxlink-url.
+        url = (data.get("dxlink-url")
+               or "wss://tasty-live-ws.dxfeed.com/realtime")
         if not token:
-            return None, "Empty streamer token from API"
+            last_err = f"empty token in {path} response"
+            continue
         return token, url
-    except Exception as e:
-        return None, str(e)
+
+    return None, last_err
 
 
 # ── streamer ─────────────────────────────────────────────────────────────────
