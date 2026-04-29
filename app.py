@@ -491,42 +491,41 @@ class AccountSettingsDialog(QDialog):
 
 class StreamingLoginDialog(QDialog):
     """
-    Authenticates the user against TastyTrade's session endpoint so the
-    DXLink streamer can mint a quote token (OAuth tokens get HTTP 403 on
-    /api-quote-tokens).  Handles 2FA in-flow: if the first POST returns
-    "otp_required" we reveal the OTP field and try again.
+    Two ways to obtain a TastyTrade session token for the DXLink streamer:
+
+    1. **Paste a session token** copied from the browser's DevTools.  This
+       avoids the user typing their password into the dashboard at all.
+       Tokens last ~24 h, so they re-paste once a day.
+    2. **Sign in with login + password** (with optional 2FA).  Returns a
+       30-day remember-token so re-prompts are rare.
 
     On accept, ``result_data()`` returns:
         {"session_token":  str,
          "remember_token": str | None,
-         "login":          str}
-
-    The password is never stored — only the long-lived remember-token.
+         "login":          str | None}
     """
 
     def __init__(self, initial_login: str = "", parent=None):
         super().__init__(parent)
         self.setWindowTitle("Enable Real-Time Streaming")
-        self.setMinimumWidth(420)
+        self.setMinimumWidth(480)
         self.setStyleSheet(f"background: {T.BG}; color: {T.TEXT};")
 
         self._result: dict = {}
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(22, 20, 22, 20)
-        lay.setSpacing(12)
+        lay.setSpacing(14)
 
-        title = QLabel("TastyTrade Streaming Login")
+        title = QLabel("TastyTrade Streaming Auth")
         title.setStyleSheet(
             f"color: {T.ACCENT}; font-size: 15px; font-weight: bold; border: none;"
         )
         lay.addWidget(title)
 
         explainer = QLabel(
-            "Real-time quote streaming requires a TastyTrade session token, "
-            "which is separate from the OAuth token used for everything else. "
-            "Your password is never stored — only a 30-day remember-token "
-            "kept on this machine."
+            "Real-time quote streaming needs a TastyTrade session token. "
+            "Choose either method below."
         )
         explainer.setWordWrap(True)
         explainer.setStyleSheet(
@@ -534,71 +533,167 @@ class StreamingLoginDialog(QDialog):
         )
         lay.addWidget(explainer)
 
+        # ── Method 1: Paste session token ─────────────────────────────────
+        paste_box = QFrame()
+        paste_box.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 8px; }}"
+        )
+        pl = QVBoxLayout(paste_box)
+        pl.setContentsMargins(14, 12, 14, 12)
+        pl.setSpacing(6)
+
+        m1_title = QLabel("① Paste a session token (no password needed)")
+        m1_title.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 12px; font-weight: bold; border: none;"
+        )
+        pl.addWidget(m1_title)
+
+        how_to = QLabel(
+            "Log into <a style='color:#a78bfa;' href='https://my.tastytrade.com'>"
+            "my.tastytrade.com</a> in your browser → press ⌥⌘I → Network tab → "
+            "filter <b>api.tastyworks.com</b> → click any request → copy the "
+            "<b>Authorization</b> header value → paste it below."
+        )
+        how_to.setOpenExternalLinks(True)
+        how_to.setWordWrap(True)
+        how_to.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 10px; border: none; background: transparent;"
+        )
+        pl.addWidget(how_to)
+
+        self._paste_edit = QLineEdit()
+        self._paste_edit.setPlaceholderText("Paste the Authorization header value here…")
+        self._paste_edit.setStyleSheet(
+            f"background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 6px; padding: 6px 8px; color: {T.TEXT};"
+        )
+        pl.addWidget(self._paste_edit)
+
+        paste_btn = QPushButton("Use pasted token")
+        paste_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        paste_btn.clicked.connect(self._on_paste_submit)
+        pl.addWidget(paste_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+        lay.addWidget(paste_box)
+
+        # ── Method 2: Login with password ─────────────────────────────────
+        login_box = QFrame()
+        login_box.setStyleSheet(
+            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 8px; }}"
+        )
+        ll = QVBoxLayout(login_box)
+        ll.setContentsMargins(14, 12, 14, 12)
+        ll.setSpacing(6)
+
+        m2_title = QLabel("② Or sign in with password (saves a 30-day token)")
+        m2_title.setStyleSheet(
+            f"color: {T.TEXT}; font-size: 12px; font-weight: bold; border: none;"
+        )
+        ll.addWidget(m2_title)
+
         form = QFormLayout()
-        form.setSpacing(8)
+        form.setSpacing(6)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
         self._login_edit = QLineEdit(initial_login)
         self._login_edit.setPlaceholderText("username or email")
-        self._login_edit.setStyleSheet(
-            f"background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
-            f"border-radius: 6px; padding: 6px 8px; color: {T.TEXT};"
-        )
+        self._login_edit.setStyleSheet(self._paste_edit.styleSheet())
         form.addRow("Login:", self._login_edit)
 
         self._pwd_edit = QLineEdit()
         self._pwd_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self._pwd_edit.setPlaceholderText("password")
-        self._pwd_edit.setStyleSheet(self._login_edit.styleSheet())
+        self._pwd_edit.setStyleSheet(self._paste_edit.styleSheet())
         form.addRow("Password:", self._pwd_edit)
 
-        # 2FA row — hidden until the API tells us it's needed.
         self._otp_label = QLabel("2FA code:")
         self._otp_edit = QLineEdit()
         self._otp_edit.setPlaceholderText("6-digit code from your authenticator")
-        self._otp_edit.setStyleSheet(self._login_edit.styleSheet())
+        self._otp_edit.setStyleSheet(self._paste_edit.styleSheet())
         form.addRow(self._otp_label, self._otp_edit)
         self._otp_label.setVisible(False)
         self._otp_edit.setVisible(False)
 
-        lay.addLayout(form)
+        ll.addLayout(form)
 
+        login_btn = QPushButton("Sign in with password")
+        login_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        login_btn.clicked.connect(self._on_password_submit)
+        ll.addWidget(login_btn, alignment=Qt.AlignmentFlag.AlignRight)
+
+        lay.addWidget(login_box)
+
+        # ── Status / Cancel ───────────────────────────────────────────────
         self._status_lbl = QLabel("")
         self._status_lbl.setWordWrap(True)
         self._status_lbl.setStyleSheet(
-            f"color: {T.RED}; font-size: 11px; border: none; background: transparent;"
+            f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
         )
         lay.addWidget(self._status_lbl)
 
-        btn_box = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        cancel = QPushButton("Cancel")
+        cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        cancel.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 6px 14px; }}"
+            f"QPushButton:hover {{ color: {T.TEXT}; border-color: {T.BORDER_H}; }}"
         )
-        btn_box.button(QDialogButtonBox.StandardButton.Ok).setText("Sign in")
-        btn_box.accepted.connect(self._on_submit)
-        btn_box.rejected.connect(self.reject)
-        lay.addWidget(btn_box)
+        cancel.clicked.connect(self.reject)
+        lay.addWidget(cancel, alignment=Qt.AlignmentFlag.AlignRight)
 
-    def _on_submit(self):
+    # ── Method 1 handler: paste token ───────────────────────────────────────
+    def _on_paste_submit(self):
+        token = self._paste_edit.text().strip()
+        if not token:
+            self._set_status("Paste the Authorization header value first.", T.RED)
+            return
+        # Strip "Bearer " prefix if user copied that too
+        if token.lower().startswith("bearer "):
+            token = token[7:].strip()
+        if len(token) < 20:
+            self._set_status("That doesn't look like a valid session token.", T.RED)
+            return
+        self._set_status("Verifying token…", T.MUTED)
+        QApplication.processEvents()
+        # Validate by trying to fetch a streamer token — proves the session
+        # token works without us having to call /sessions/validate (which has
+        # its own quirks).
+        try:
+            from streamer import get_streamer_token
+            t, url_or_err = get_streamer_token(access_token="", session_token=token)
+        except Exception as e:
+            self._set_status(f"Network error: {e}", T.RED)
+            return
+        if not t:
+            self._set_status(f"Token didn't work: {url_or_err}", T.RED)
+            return
+        # Success.  Pasted browser tokens have no associated remember-token
+        # (the user has to re-paste when this one expires in ~24h).
+        self._result = {
+            "session_token":  token,
+            "remember_token": "",
+            "login":          "",
+        }
+        self.accept()
+
+    # ── Method 2 handler: login with password ──────────────────────────────
+    def _on_password_submit(self):
         login_email = self._login_edit.text().strip()
         password    = self._pwd_edit.text()
         otp         = self._otp_edit.text().strip() or None
         if not login_email or not password:
-            self._status_lbl.setText("Login and password are required.")
+            self._set_status("Login and password are required.", T.RED)
             return
 
-        self._status_lbl.setStyleSheet(
-            f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
-        )
-        self._status_lbl.setText("Signing in…")
+        self._set_status("Signing in…", T.MUTED)
         QApplication.processEvents()
 
         try:
             res = tt_session.login(login_email, password, otp=otp, remember_me=True)
         except Exception as e:
-            self._status_lbl.setStyleSheet(
-                f"color: {T.RED}; font-size: 11px; border: none; background: transparent;"
-            )
-            self._status_lbl.setText(f"Network error: {e}")
+            self._set_status(f"Network error: {e}", T.RED)
             return
 
         err = res.get("error")
@@ -606,27 +701,25 @@ class StreamingLoginDialog(QDialog):
             self._otp_label.setVisible(True)
             self._otp_edit.setVisible(True)
             self._otp_edit.setFocus()
-            self._status_lbl.setStyleSheet(
-                f"color: {T.YELLOW}; font-size: 11px; border: none; background: transparent;"
-            )
-            self._status_lbl.setText("2FA required — enter the 6-digit code.")
+            self._set_status("2FA required — enter the 6-digit code.", T.YELLOW)
             return
 
         if err:
-            self._status_lbl.setStyleSheet(
-                f"color: {T.RED}; font-size: 11px; border: none; background: transparent;"
-            )
-            # Keep the message short — the API tends to be verbose
-            self._status_lbl.setText(f"Login failed: {err}")
+            self._set_status(f"Login failed: {err}", T.RED)
             return
 
-        # Success
         self._result = {
             "session_token":  res.get("session_token") or "",
             "remember_token": res.get("remember_token") or "",
             "login":          login_email,
         }
         self.accept()
+
+    def _set_status(self, text: str, color: str):
+        self._status_lbl.setStyleSheet(
+            f"color: {color}; font-size: 11px; border: none; background: transparent;"
+        )
+        self._status_lbl.setText(text)
 
     def result_data(self) -> dict:
         return dict(self._result)
