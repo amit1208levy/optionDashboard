@@ -1079,7 +1079,11 @@ class StrategyDetailPage(QWidget):
             is_fut = any(l.is_future for l in legs) or root.startswith("/")
             sym = root if not is_fut or root.startswith("/") else f"/{root}"
             kwargs = {"futures": [sym]} if is_fut else {"equities": [sym]}
-            q = api.get_market_data(self.portfolio.token, **kwargs).get(sym, {})
+            quotes_provider = getattr(self.portfolio, "quotes", None)
+            if quotes_provider is not None:
+                q = quotes_provider.get_quotes(**kwargs).get(sym, {})
+            else:
+                q = api.get_market_data(self.portfolio.token, **kwargs).get(sym, {})
             for k in ("mark", "last"):
                 try:
                     v = float(q.get(k))

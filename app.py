@@ -17,6 +17,7 @@ import api
 import updater
 import streamer as _streamer_mod
 import pnl as _pnl_mod
+from quotes_tasty import TastyQuotesProvider
 from version import VERSION
 from models import (
     Position, StrategyInstance, unassigned_positions, group_unassigned,
@@ -60,10 +61,13 @@ class PortfolioWorker(QThread):
     _YTD_TTL_SECONDS = 3600
 
     def __init__(self, token, creds=None, ytd_cache=None, year_start_cache=None,
-                 pnl_cache=None):
+                 pnl_cache=None, quotes=None):
         super().__init__()
         self.token      = token
         self.creds      = creds
+        # Quotes provider — when None we fall back to direct api.get_market_data
+        # (so this class still works in legacy contexts without the provider).
+        self.quotes     = quotes
         # ytd_cache is a mutable dict shared with PortfolioScreen so it
         # survives across worker instances (i.e. across live-mode refreshes).
         self._ytd_cache        = ytd_cache        if ytd_cache        is not None else {}
@@ -173,12 +177,28 @@ class PortfolioWorker(QThread):
                          if p.root and not (p.underlying or "").startswith("/")}
             metric_syms = list(eq_roots) + [f"/{r}" for r in fut_roots]
 
+            # Live quotes go through the QuotesProvider abstraction so we can
+            # swap vendors (Schwab, etc.) without touching the worker.  Falls
+            # back to a direct TastyTrade fetch if no provider was passed in
+            # (legacy / testing path).
+            def _quotes_call():
+                if self.quotes is not None:
+                    return self.quotes.get_quotes(
+                        equity_options=eq_opts,
+                        future_options=fu_opts,
+                        equities=equities,
+                        futures=futures,
+                    )
+                return api.get_market_data(
+                    self.token,
+                    equity_options=eq_opts,
+                    future_options=fu_opts,
+                    equities=equities,
+                    futures=futures,
+                )
+
             with ThreadPoolExecutor(max_workers=2) as ex:
-                f_quotes  = ex.submit(api.get_market_data, self.token,
-                                      equity_options=eq_opts,
-                                      future_options=fu_opts,
-                                      equities=equities,
-                                      futures=futures)
+                f_quotes  = ex.submit(_quotes_call)
                 f_metrics = ex.submit(api.get_market_metrics, self.token, metric_syms)
                 quotes  = f_quotes.result()
                 metrics = f_metrics.result()
@@ -485,11 +505,16 @@ class PortfolioScreen(QWidget):
         super().__init__()
         self.creds      = creds
         self.token      = token
+        # Quotes provider — token_getter lambda lets the provider always see
+        # the freshest token after a rotation (see _on_data_loaded below).
+        # All live quotes for the portfolio, watchlist, risk, and strategy
+        # detail pages flow through this single instance.
+        self.quotes     = TastyQuotesProvider(token_getter=lambda: self.token)
         self._worker    = None
         self._accounts  = []
         self._alerted   = {}   # {(strategy_id, condition_type): severity} — prevents repeat alerts
         self._ytd_cache = {}   # {account_number: {fetched_at, transactions}} — shared across workers
-        self._streamer        = None   # QuoteStreamer (live mode only)
+        self._streamer        = None   # Opaque StreamHandle from QuotesProvider (live mode only)
         self._strategy_cards  = []     # [StrategyCard] — current My Strategies cards
         self._ua_cards        = []     # [StrategyCard] — current Unassigned cards
         self._year_start_cache = {}    # {acct_num: jan1_net_liq} — fetched once per session
@@ -763,41 +788,46 @@ class PortfolioScreen(QWidget):
             self._style_live_btn(False)
 
     def _start_streamer(self):
-        """Create and start the DXLink quote streamer."""
-        # Skip entirely if we've already determined the OAuth app has no
-        # streaming permission — avoids spamming 403 retries on every Live
+        """Open a streaming-quotes connection via the active QuotesProvider."""
+        # Skip entirely if we've already determined streaming isn't available
+        # for this OAuth app — avoids spamming 403 retries on every Live
         # toggle.  User stays on REST 15s polling.
         if getattr(self, "_ws_unavailable", False):
             self._style_live_btn(True, mode="rest")
             return
-        self._stop_streamer()   # stop any previous instance
-        s = _streamer_mod.QuoteStreamer(self.token, parent=self)
-        s.price_update.connect(self._on_price_update)
-        s.status_changed.connect(self._on_streamer_status)
-        self._streamer = s
-        s.start()
-        # Subscribe immediately if we already have positions
-        self._update_streamer_symbols()
+        self._stop_streamer()   # tear down any previous instance
+        symbols = self._all_position_symbols()
+        # The provider returns an opaque handle; we keep it under the same
+        # `_streamer` attribute name so existing call sites (live mode UI
+        # etc.) still work.
+        self._streamer = self.quotes.start_stream(
+            symbols,
+            self._on_price_update,
+            self._on_streamer_status,
+        )
 
     def _stop_streamer(self):
-        """Gracefully stop the streamer (if running)."""
-        if self._streamer:
-            self._streamer.status_changed.disconnect()
-            self._streamer.price_update.disconnect()
-            self._streamer.stop_streaming()
-            if self._streamer.isRunning():
-                self._streamer.wait(3000)
+        """Tear down the active stream (if any)."""
+        if self._streamer is not None:
+            try:
+                self.quotes.stop_stream(self._streamer)
+            except Exception:
+                pass
             self._streamer = None
 
-    def _update_streamer_symbols(self):
-        """Push all position symbols from all accounts to the streamer."""
-        if not self._streamer:
-            return
-        symbols = []
+    def _all_position_symbols(self):
+        """Flatten all open-position symbols across accounts."""
+        out = []
         for acct in self._accounts:
             for p in acct.get("positions", []):
-                symbols.append(p.symbol)
-        self._streamer.set_symbols(symbols)
+                out.append(p.symbol)
+        return out
+
+    def _update_streamer_symbols(self):
+        """Push the latest position-symbol list to the streamer."""
+        if self._streamer is None:
+            return
+        self.quotes.update_subscription(self._streamer, self._all_position_symbols())
 
     def _on_streamer_status(self, status: str):
         """Handle QuoteStreamer status changes on the GUI thread."""
@@ -1215,7 +1245,8 @@ class PortfolioScreen(QWidget):
         )
 
         self._worker = PortfolioWorker(self.token, self.creds, self._ytd_cache,
-                                       self._year_start_cache, self._pnl_cache)
+                                       self._year_start_cache, self._pnl_cache,
+                                       quotes=self.quotes)
         self._worker.done.connect(self._on_data)
         self._worker.start()
 
@@ -1967,7 +1998,8 @@ class MainWindow(QStackedWidget):
                 nlv = float(acct["balances"].get("net-liquidating-value") or 0)
             except (TypeError, ValueError):
                 pass
-        self.watchlist = WatchlistPage(self.portfolio.token, nlv)
+        self.watchlist = WatchlistPage(self.portfolio.token, nlv,
+                                       quotes=self.portfolio.quotes)
         self.watchlist.back_requested.connect(self._back_from_watchlist)
         self.addWidget(self.watchlist)
         self.setCurrentWidget(self.watchlist)

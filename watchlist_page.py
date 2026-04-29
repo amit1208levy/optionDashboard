@@ -231,10 +231,13 @@ class _SymCompleter(QCompleter):
 class _FetchWorker(QThread):
     done = pyqtSignal(dict, dict)   # metrics, quotes
 
-    def __init__(self, token, tickers, parent=None):
+    def __init__(self, token, tickers, parent=None, quotes=None):
         super().__init__(parent)
         self.token   = token
         self.tickers = tickers
+        # Optional QuotesProvider — used for live equity/futures quotes when
+        # supplied; falls back to direct api.get_market_data otherwise.
+        self.quotes  = quotes
 
     def run(self):
         if not self.tickers:
@@ -253,14 +256,26 @@ class _FetchWorker(QThread):
         equity_tickers  = [t for t in self.tickers if t not in futures_tickers]
         roots = [t.lstrip("/") for t in futures_tickers]
 
+        # Live equity/futures quotes go through the QuotesProvider (so we can
+        # swap data vendors without changing this worker).  Market metrics
+        # stay on TastyTrade — they're slow-changing daily values.
+        def _fetch_eq_q():
+            if self.quotes is not None:
+                return self.quotes.get_quotes(equities=equity_tickers)
+            return api.get_market_data(self.token, equities=equity_tickers)
+
+        def _fetch_fut_q(syms):
+            if self.quotes is not None:
+                return self.quotes.get_quotes(futures=syms)
+            return api.get_market_data(self.token, futures=syms)
+
         # ── Fire ALL independent API calls in parallel ──────────────────────
         # Old path ran these sequentially (~1.2s total).  In parallel the
         # whole fetch is bounded by the slowest single call (~250ms).
         with ThreadPoolExecutor(max_workers=5) as ex:
             f_eq_m  = ex.submit(api.get_market_metrics, self.token, equity_tickers) \
                       if equity_tickers else None
-            f_eq_q  = ex.submit(api.get_market_data, self.token, equities=equity_tickers) \
-                      if equity_tickers else None
+            f_eq_q  = ex.submit(_fetch_eq_q) if equity_tickers else None
             f_fut_m = ex.submit(api.get_market_metrics, self.token,
                                 [f"/{r}" for r in roots]) if roots else None
             # Futures quotes need active-contract resolution first; submit that
@@ -288,7 +303,7 @@ class _FetchWorker(QThread):
                     fut_syms.append(contract)
                     sym_to_root[contract] = root
                 # This one runs in the main thread since we needed root_map
-                fut_quotes = api.get_market_data(self.token, futures=fut_syms)
+                fut_quotes = _fetch_fut_q(fut_syms)
                 for sym, q in fut_quotes.items():
                     root = sym_to_root.get(sym) or sym_to_root.get("/" + sym.lstrip("/"))
                     if root:
@@ -306,7 +321,7 @@ class _FetchWorker(QThread):
                 fut_syms.append(contract)
                 sym_to_root[contract] = root
             if fut_syms:
-                fut_quotes = api.get_market_data(self.token, futures=fut_syms)
+                fut_quotes = _fetch_fut_q(fut_syms)
                 for sym, q in fut_quotes.items():
                     root = sym_to_root.get(sym) or sym_to_root.get("/" + sym.lstrip("/"))
                     if root and root in missing:
@@ -322,13 +337,16 @@ class _PremiumFetchWorker(QThread):
     return the mark price + the actual delta/DTE that matched."""
     done = pyqtSignal(dict)   # {"premium": float, "delta": float, "dte": int, "strike": float, "error": str}
 
-    def __init__(self, token, ticker, target_dte, target_delta_pct, direction="call"):
+    def __init__(self, token, ticker, target_dte, target_delta_pct, direction="call",
+                 quotes=None):
         super().__init__()
         self.token          = token
         self.ticker         = ticker
         self.target_dte     = target_dte
         self.target_delta   = target_delta_pct / 100.0   # slider is 20 → 0.20
         self.direction      = direction    # "call" or "put"
+        # Optional QuotesProvider — uses TastyTrade directly if not supplied.
+        self.quotes         = quotes
 
     def run(self):
         from datetime import date
@@ -369,7 +387,10 @@ class _PremiumFetchWorker(QThread):
                         sym_to_strike[sym] = 0.0
 
             # Fetch market data (mark + delta) for all these option symbols
-            quotes = api.get_market_data(self.token, equity_options=syms)
+            if self.quotes is not None:
+                quotes = self.quotes.get_quotes(equity_options=syms)
+            else:
+                quotes = api.get_market_data(self.token, equity_options=syms)
 
             # Find the strike whose |delta| is closest to our target
             best_sym, best_gap = None, 99.0
@@ -410,10 +431,11 @@ class _PremiumFetchWorker(QThread):
 
 
 class PositionSizerDialog(QDialog):
-    def __init__(self, ticker, price, nlv, parent=None, token=None):
+    def __init__(self, ticker, price, nlv, parent=None, token=None, quotes=None):
         super().__init__(parent)
         self.ticker = ticker
         self.token  = token
+        self.quotes = quotes   # forwarded to _PremiumFetchWorker
         self._fetch_worker = None
         self.setWindowTitle(f"Position Sizer — {ticker}")
         self.setMinimumWidth(460)
@@ -621,6 +643,7 @@ class PositionSizerDialog(QDialog):
             target_dte=self.dte_slider.value(),
             target_delta_pct=self.delta_slider.value(),
             direction=direction,
+            quotes=self.quotes,
         )
         self._fetch_worker.done.connect(self._on_premium_fetched)
         self._fetch_worker.start()
@@ -1069,10 +1092,13 @@ class WatchlistPage(QWidget):
 
     # ── Init ──────────────────────────────────────────────────────────────────
 
-    def __init__(self, token, nlv, parent=None):
+    def __init__(self, token, nlv, parent=None, quotes=None):
         super().__init__(parent)
         self.token   = token
         self.nlv     = nlv
+        # QuotesProvider — used for live equity/futures/option quotes.  When
+        # None, falls back to direct api.get_market_data calls (legacy).
+        self.quotes  = quotes
         self._rows   = {}    # ticker -> _TickerRow
         self._worker = None
         self._last_metrics: dict = {}
@@ -1557,7 +1583,8 @@ class WatchlistPage(QWidget):
 
         self.refresh_btn.setEnabled(False)
         self.refresh_btn.setText("Loading…")
-        self._worker = _FetchWorker(self.token, list(self._tickers), self)
+        self._worker = _FetchWorker(self.token, list(self._tickers), self,
+                                    quotes=self.quotes)
         self._worker.done.connect(self._on_fetch_done_and_cache)
         self._worker.start()
 
@@ -1653,5 +1680,6 @@ class WatchlistPage(QWidget):
             idx += 1
 
     def _open_sizer(self, ticker, price, nlv):
-        dlg = PositionSizerDialog(ticker, price, nlv, self, token=self.token)
+        dlg = PositionSizerDialog(ticker, price, nlv, self,
+                                  token=self.token, quotes=self.quotes)
         dlg.exec()

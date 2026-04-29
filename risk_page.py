@@ -69,10 +69,12 @@ class _PriceWorker(QThread):
     """Fetch SPY and VIX current prices in the background."""
     done = pyqtSignal(float, float)   # spy_price, vix_price
 
-    def __init__(self, token, positions):
+    def __init__(self, token, positions, quotes=None):
         super().__init__()
         self._token     = token
         self._positions = list(positions)
+        # Optional QuotesProvider — falls back to direct TastyTrade if None.
+        self._quotes    = quotes
 
     def run(self):
         spy = vix = None
@@ -84,7 +86,10 @@ class _PriceWorker(QThread):
                 break
 
         try:
-            quotes = api.get_market_data(self._token, equities=["SPY", "VIX"])
+            if self._quotes is not None:
+                quotes = self._quotes.get_quotes(equities=["SPY", "VIX"])
+            else:
+                quotes = api.get_market_data(self._token, equities=["SPY", "VIX"])
 
             if spy is None:
                 q = quotes.get("SPY", {})
@@ -562,7 +567,10 @@ class RiskPage(QWidget):
             self.body.addStretch()
 
             # Kick off background price fetch; render charts when done
-            self._worker = _PriceWorker(self.portfolio.token, positions)
+            self._worker = _PriceWorker(
+                self.portfolio.token, positions,
+                quotes=getattr(self.portfolio, "quotes", None),
+            )
             self._worker.done.connect(
                 lambda s, v: self._on_prices(s, v, net_liq, bwd, bwg, net_vega)
             )
