@@ -62,13 +62,18 @@ class PortfolioWorker(QThread):
     _YTD_TTL_SECONDS = 3600
 
     def __init__(self, token, creds=None, ytd_cache=None, year_start_cache=None,
-                 pnl_cache=None, quotes=None):
+                 pnl_cache=None, quotes=None, ibkr_provider=None,
+                 ibkr_data_source_only=True):
         super().__init__()
         self.token      = token
         self.creds      = creds
         # Quotes provider — when None we fall back to direct api.get_market_data
         # (so this class still works in legacy contexts without the provider).
         self.quotes     = quotes
+        # IBKR account provider — when set AND data_source_only is False,
+        # the worker appends an IBKR account entry to the results.
+        self._ibkr_provider         = ibkr_provider
+        self._ibkr_data_source_only = ibkr_data_source_only
         # ytd_cache is a mutable dict shared with PortfolioScreen so it
         # survives across worker instances (i.e. across live-mode refreshes).
         self._ytd_cache        = ytd_cache        if ytd_cache        is not None else {}
@@ -229,11 +234,55 @@ class PortfolioWorker(QThread):
                 accounts_raw = [a for a in api.list_accounts(self.token)
                                 if a.get("account-number")]
 
-                # Fetch all accounts concurrently
-                with ThreadPoolExecutor(max_workers=max(len(accounts_raw), 1)) as ex:
-                    results = list(ex.map(self._fetch_one, accounts_raw))
+                # Fetch TastyTrade accounts + (optionally) IBKR account in parallel.
+                workers = max(len(accounts_raw), 1)
+                if self._ibkr_provider and not self._ibkr_data_source_only:
+                    workers += 1
+
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    tt_futures = [ex.submit(self._fetch_one, a) for a in accounts_raw]
+                    ibkr_fut = None
+                    if self._ibkr_provider and not self._ibkr_data_source_only:
+                        from ibkr_account import fetch_ibkr_account
+                        ibkr_fut = ex.submit(fetch_ibkr_account, self._ibkr_provider)
+                    results = [f.result() for f in tt_futures]
 
                 accounts = [r for r in results if r is not None]
+
+                # Append IBKR account at the end of the list if available.
+                if ibkr_fut is not None:
+                    try:
+                        ibkr_acct = ibkr_fut.result()
+                        if ibkr_acct:
+                            # Refresh Greeks via the live quotes provider so the
+                            # IBKR account's position cards show full Greek rows.
+                            positions = ibkr_acct.get("positions", [])
+                            if positions and self.quotes is not None:
+                                eq_opts = [p.symbol for p in positions
+                                           if p.is_option and not p.is_future]
+                                fu_opts = [p.symbol for p in positions
+                                           if p.is_option and p.is_future]
+                                equities = [p.symbol for p in positions
+                                            if not p.is_option and not p.is_future]
+                                futures  = [p.symbol for p in positions
+                                            if not p.is_option and p.is_future]
+                                try:
+                                    quotes = self.quotes.get_quotes(
+                                        equity_options=eq_opts,
+                                        future_options=fu_opts,
+                                        equities=equities,
+                                        futures=futures,
+                                    )
+                                    for p in positions:
+                                        q = quotes.get(p.symbol)
+                                        if q:
+                                            p.attach_quote(q)
+                                except Exception as qe:
+                                    print(f"[ibkr_account] quote refresh: {qe}", flush=True)
+                            accounts.append(ibkr_acct)
+                    except Exception as e:
+                        print(f"[ibkr_account] fetch failed: {e}", flush=True)
+
                 self.done.emit({"accounts": accounts, "error": "", "new_token": new_token})
                 return
 
@@ -492,15 +541,28 @@ class AccountSettingsDialog(QDialog):
         ibkr_enable_cb = QCheckBox("Use IBKR Gateway for live quotes (auto-detected)")
         # Checked by default; only unchecked when the user explicitly opts out.
         ibkr_enable_cb.setChecked(ibkr_cfg.get("enabled") is not False)
-        ibkr_enable_cb.setStyleSheet(
+        _cb_style = (
             f"QCheckBox {{ color: {T.TEXT}; font-size: 13px; border: none; }}"
             f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
             f"border: 1px solid {T.BORDER}; background: {T.BG_ALT}; }}"
             f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; "
             f"border-color: {T.ACCENT}; }}"
         )
+        ibkr_enable_cb.setStyleSheet(_cb_style)
         self._ibkr_widgets["enabled"] = ibkr_enable_cb
         root.addWidget(ibkr_enable_cb)
+
+        data_only_cb = QCheckBox("Data source only (don't show IBKR as an account)")
+        data_only_cb.setChecked(bool(ibkr_cfg.get("data_source_only")))
+        data_only_cb.setStyleSheet(_cb_style)
+        data_only_cb.setToolTip(
+            "When unchecked (default): IBKR Gateway appears as a second account\n"
+            "in the account list — you can view its positions, Greeks, and P&L.\n\n"
+            "When checked: Gateway is used only to supply live quotes / Greeks to\n"
+            "your TastyTrade positions; no IBKR account row is shown."
+        )
+        self._ibkr_widgets["data_source_only"] = data_only_cb
+        root.addWidget(data_only_cb)
 
         ibkr_form = QFormLayout()
         ibkr_form.setSpacing(8)
@@ -566,11 +628,12 @@ class AccountSettingsDialog(QDialog):
                 return default
         raw_port = self._ibkr_widgets["port"].text().strip()
         return {
-            "enabled":   self._ibkr_widgets["enabled"].isChecked(),
-            "host":      self._ibkr_widgets["host"].text().strip() or "127.0.0.1",
+            "enabled":          self._ibkr_widgets["enabled"].isChecked(),
+            "data_source_only": self._ibkr_widgets["data_source_only"].isChecked(),
+            "host":             self._ibkr_widgets["host"].text().strip() or "127.0.0.1",
             # None → auto-detect across standard ports; explicit int → pin that port.
-            "port":      int(raw_port) if raw_port else None,
-            "client_id": _int("client_id", 42),
+            "port":             int(raw_port) if raw_port else None,
+            "client_id":        _int("client_id", 42),
         }
 
 
@@ -960,6 +1023,20 @@ class PortfolioScreen(QWidget):
         print(f"[ibkr] auto-detected: {kind} — quotes will use IBKR push, "
               f"TastyTrade as fallback", flush=True)
         return HybridQuotesProvider(primary=ibkr_provider, fallback=tasty_provider)
+
+    # ── IBKR account-data helpers ─────────────────────────────────────────────
+
+    def _ibkr_provider(self):
+        """Return the IBKRQuotesProvider if active, else None."""
+        if isinstance(self.quotes, HybridQuotesProvider):
+            return self.quotes._primary
+        return None
+
+    def _ibkr_data_source_only(self) -> bool:
+        """True when the user wants IBKR as a data source only (no account row)."""
+        return bool(
+            (api.load_settings() or {}).get("ibkr", {}).get("data_source_only", False)
+        )
 
     def _toggle_live(self, on):
         if on:
@@ -1434,7 +1511,9 @@ class PortfolioScreen(QWidget):
 
         self._worker = PortfolioWorker(self.token, self.creds, self._ytd_cache,
                                        self._year_start_cache, self._pnl_cache,
-                                       quotes=self.quotes)
+                                       quotes=self.quotes,
+                                       ibkr_provider=self._ibkr_provider(),
+                                       ibkr_data_source_only=self._ibkr_data_source_only())
         self._worker.done.connect(self._on_data)
         self._worker.start()
 

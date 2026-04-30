@@ -225,6 +225,43 @@ class IBKRQuotesProvider(QuotesProvider):
     def is_connected(self) -> bool:
         return bool(self._ib and self._ib.isConnected())
 
+    # ── Account data (portfolio + summary) ────────────────────────────────
+
+    def get_portfolio(self) -> list:
+        """Return list of ib_insync.PortfolioItem for the connected account."""
+        return self._submit(self._async_portfolio(), timeout=10.0) or []
+
+    async def _async_portfolio(self) -> list:
+        if not await self._ensure_connected():
+            return []
+        try:
+            return list(self._ib.portfolio())
+        except Exception as e:
+            print(f"[ibkr] portfolio(): {e}", flush=True)
+            return []
+
+    def get_account_summary(self) -> dict:
+        """Return {tag: value_str} for the primary account from accountSummary."""
+        return self._submit(self._async_account_summary(), timeout=10.0) or {}
+
+    async def _async_account_summary(self) -> dict:
+        if not await self._ensure_connected():
+            return {}
+        try:
+            rows = await self._ib.accountSummaryAsync()
+            # Keep USD values only (BASE is a synthetic multi-currency total;
+            # USD is what we want for single-currency accounts).
+            out = {}
+            for r in rows:
+                if r.currency in ("USD", "BASE", ""):
+                    # Prefer USD over BASE if both exist.
+                    if r.tag not in out or r.currency == "USD":
+                        out[r.tag] = r.value
+            return out
+        except Exception as e:
+            print(f"[ibkr] accountSummary(): {e}", flush=True)
+            return {}
+
     def disconnect(self):
         async def _dc():
             try:
