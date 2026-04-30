@@ -10,8 +10,8 @@ from models import payoff_range, strategy_extremes
 
 class PayoffChart(FigureCanvasQTAgg):
     def __init__(self, strategy, parent=None, height=2.0):
-        fig = Figure(figsize=(5, height), tight_layout=True,
-                     facecolor=T.CARD)
+        fig = Figure(figsize=(5, height), facecolor=T.CARD)
+        fig.subplots_adjust(left=0.13, right=0.97, top=0.95, bottom=0.22)
         super().__init__(fig)
         self.setParent(parent)
         self.setStyleSheet(f"background: {T.CARD};")
@@ -108,6 +108,16 @@ class PayoffChart(FigureCanvasQTAgg):
         sign = "+" if sy >= 0 else "−"
         self._annot.xy = (sx, sy)
         self._annot.set_text(f"Price: ${sx:,.2f}\nP&L: {sign}${abs(sy):,.2f}")
+        # Flip annotation to stay inside axes near edges.
+        xl, xr = self._ax.get_xlim()
+        yl, yu = self._ax.get_ylim()
+        x_off = -10 if sx > (xl + xr) / 2 else 10
+        y_off = -12 if sy > (yl + yu) / 2 else 12
+        ha    = "right" if x_off < 0 else "left"
+        va    = "top"   if y_off < 0 else "bottom"
+        self._annot.set_position((x_off, y_off))
+        self._annot.set_ha(ha)
+        self._annot.set_va(va)
         self._annot.set_visible(True)
         self.draw_idle()
 

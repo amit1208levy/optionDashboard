@@ -210,7 +210,8 @@ def _make_canvas(width_px=500, height_px=300) -> FigureCanvasQTAgg:
     """Return an MPL canvas sized to the given pixel dimensions."""
     dpi = 96
     fig = Figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi,
-                 facecolor=T.CARD, tight_layout=True)
+                 facecolor=T.CARD)
+    fig.subplots_adjust(left=0.12, right=0.97, top=0.93, bottom=0.18)
     canvas = FigureCanvasQTAgg(fig)
     canvas.setStyleSheet(f"background: {T.CARD};")
     canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -383,15 +384,13 @@ class _ScenarioChart(QFrame):
         self._cursor_dot.set_data([sx], [sy])
         self._cursor_dot.set_visible(True)
 
-        # Flip the tooltip to the left side when we're close to the right
-        # edge so it doesn't render beyond the axes (and jitter back/forth).
-        mid_x = (xl + xr) / 2
-        if sx > mid_x:
-            self._annot.set_position((-80, 12))
-            self._annot.set_ha("left")
-        else:
-            self._annot.set_position((10, 12))
-            self._annot.set_ha("left")
+        # Flip annotation to stay inside axes near edges.
+        yl, yu = self._ax.get_ylim()
+        x_off = -10 if sx > (xl + xr) / 2 else 10
+        y_off = -12 if sy > (yl + yu) / 2 else 12
+        self._annot.set_position((x_off, y_off))
+        self._annot.set_ha("right" if x_off < 0 else "left")
+        self._annot.set_va("top"   if y_off < 0 else "bottom")
 
         self._annot.xy = (sx, sy)
         # Delta vs. the current underlying price (the anchor dashed line)

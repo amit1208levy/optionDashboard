@@ -24,7 +24,8 @@ def _parse_date(iso):
 
 class HistoryChart(FigureCanvasQTAgg):
     def __init__(self, entries, parent=None, height=3.0):
-        fig = Figure(figsize=(6, height), tight_layout=True, facecolor=T.CARD)
+        fig = Figure(figsize=(6, height), facecolor=T.CARD)
+        fig.subplots_adjust(left=0.13, right=0.97, top=0.95, bottom=0.15)
         super().__init__(fig)
         self.setParent(parent)
         self.setStyleSheet(f"background: {T.CARD};")
@@ -121,5 +122,14 @@ class HistoryChart(FigureCanvasQTAgg):
         self._annot.set_text(
             f"{sx.strftime('%b %d, %Y')}\nCumulative: {sign}${abs(sy):,.2f}"
         )
+        # Flip annotation to stay inside axes near edges.
+        xl, xr = self._ax.get_xlim()
+        yl, yu = self._ax.get_ylim()
+        x_num = mdates.date2num(sx)
+        x_off = -10 if x_num > (xl + xr) / 2 else 10
+        y_off = -12 if sy > (yl + yu) / 2 else 12
+        self._annot.set_position((x_off, y_off))
+        self._annot.set_ha("right" if x_off < 0 else "left")
+        self._annot.set_va("top"   if y_off < 0 else "bottom")
         self._annot.set_visible(True)
         self.draw_idle()
