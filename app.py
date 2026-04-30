@@ -750,7 +750,8 @@ class PortfolioScreen(QWidget):
         self.body.addLayout(my_hdr_row)
 
         # Sortable column header bar (aligned with each card's right-side stats).
-        self.body.addWidget(self._build_my_sort_bar())
+        self._my_sort_bar_widget = self._build_my_sort_bar()
+        self.body.addWidget(self._my_sort_bar_widget)
 
         self.my_container = QVBoxLayout()
         self.my_container.setSpacing(10)
@@ -863,6 +864,18 @@ class PortfolioScreen(QWidget):
         self.live_btn.toggled.connect(self._toggle_live)
         self._style_live_btn(False)
         hl.addWidget(self.live_btn)
+
+        # IBKR connection pill — hidden until we confirm Gateway is live.
+        self.ibkr_pill = QLabel()
+        self.ibkr_pill.setFixedHeight(32)
+        self.ibkr_pill.setVisible(False)
+        self.ibkr_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ibkr_pill.setStyleSheet(
+            f"color: {T.GREEN}; font-size: 11px; font-weight: bold; "
+            f"border: 1px solid {T.GREEN}; border-radius: 6px; "
+            f"padding: 0 10px; background: transparent;"
+        )
+        hl.addWidget(self.ibkr_pill)
 
         self._live_timer = QTimer(self)
         self._live_timer.setInterval(15000)
@@ -1037,6 +1050,20 @@ class PortfolioScreen(QWidget):
         return bool(
             (api.load_settings() or {}).get("ibkr", {}).get("data_source_only", False)
         )
+
+    def _update_ibkr_pill(self):
+        """Refresh the IBKR status pill in the header."""
+        prov = self._ibkr_provider()
+        if prov is None or not prov.is_connected():
+            self.ibkr_pill.setVisible(False)
+            return
+        # Connected — show which mode (live vs paper).
+        from ibkr_account import IBKR_ACCOUNT_NUMBER
+        port = getattr(prov, "_port", None)
+        mode = {4001: "Gateway Live", 4002: "Gateway Paper",
+                7496: "TWS Live",     7497: "TWS Paper"}.get(port, "IBKR")
+        self.ibkr_pill.setText(f"● {mode}")
+        self.ibkr_pill.setVisible(True)
 
     def _toggle_live(self, on):
         if on:
@@ -1553,6 +1580,9 @@ class PortfolioScreen(QWidget):
         self.status_lbl.setText("")
         self._accounts = result.get("accounts", [])
 
+        # Refresh IBKR pill now that we know the connection state.
+        self._update_ibkr_pill()
+
         # Detect closures + update snapshots for every account
         self._process_snapshots()
         self._check_exit_alerts()
@@ -1710,6 +1740,13 @@ class PortfolioScreen(QWidget):
             self._render(acct)
 
     def _render(self, acct):
+        is_ibkr = acct.get("source") == "ibkr"
+        # Rename section headers to match the account type.
+        self.ua_header.setText(("POSITIONS" if is_ibkr else "UNASSIGNED LEGS"))
+        self.my_header.setVisible(not is_ibkr)
+        self._my_sort_bar_widget.setVisible(not is_ibkr)
+        self.greeks_header.setVisible(True)
+
         bal = acct.get("balances", {})
         for key, widget in self.bal_cards.items():
             raw = bal.get(key)
@@ -1900,7 +1937,11 @@ class PortfolioScreen(QWidget):
             self.hidden_toggle.setVisible(False)
 
         if not display_list:
-            empty = QLabel('No strategies configured \u2014 click \u201cConfigure Account\u201d in the header.')
+            if acct.get("source") == "ibkr":
+                empty_txt = "Strategies are not used for IBKR accounts \u2014 positions appear below."
+            else:
+                empty_txt = 'No strategies configured \u2014 click "Configure Account" in the header.'
+            empty = QLabel(empty_txt)
             empty.setStyleSheet(
                 f"color: {T.MUTED}; font-size: 13px; padding: 22px; border: 1px dashed "
                 f"{T.BORDER}; border-radius: 10px; background: {T.CARD};"
@@ -1920,7 +1961,16 @@ class PortfolioScreen(QWidget):
 
         self._ua_cards = []
         if not unassigned:
-            empty = QLabel("All legs are assigned to strategies.")
+            is_ibkr = acct.get("source") == "ibkr"
+            if is_ibkr:
+                prov = self._ibkr_provider()
+                if prov and prov.is_connected():
+                    ua_empty_txt = "● Gateway connected — no open positions in this account."
+                else:
+                    ua_empty_txt = "○ Gateway not connected — start IBKR Gateway to see positions."
+            else:
+                ua_empty_txt = "All legs are assigned to strategies."
+            empty = QLabel(ua_empty_txt)
             empty.setStyleSheet(
                 f"color: {T.MUTED}; font-size: 12px; padding: 16px; border: 1px dashed "
                 f"{T.BORDER}; border-radius: 10px; background: {T.CARD};"
