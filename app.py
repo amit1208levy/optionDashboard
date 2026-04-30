@@ -865,18 +865,6 @@ class PortfolioScreen(QWidget):
         self._style_live_btn(False)
         hl.addWidget(self.live_btn)
 
-        # IBKR connection pill — hidden until we confirm Gateway is live.
-        self.ibkr_pill = QLabel()
-        self.ibkr_pill.setFixedHeight(32)
-        self.ibkr_pill.setVisible(False)
-        self.ibkr_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.ibkr_pill.setStyleSheet(
-            f"color: {T.GREEN}; font-size: 11px; font-weight: bold; "
-            f"border: 1px solid {T.GREEN}; border-radius: 6px; "
-            f"padding: 0 10px; background: transparent;"
-        )
-        hl.addWidget(self.ibkr_pill)
-
         self._live_timer = QTimer(self)
         self._live_timer.setInterval(15000)
         self._live_timer.timeout.connect(self._load_data)
@@ -937,13 +925,28 @@ class PortfolioScreen(QWidget):
                 f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
             )
         else:
-            self.live_btn.setText("○  Live")
-            self.live_btn.setStyleSheet(
-                f"QPushButton {{ background: transparent; color: {T.MUTED}; "
-                f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 0 10px; "
-                f"font-size: 11px; }}"
-                f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
-            )
+            # Check if IBKR is connected — if so show "● Gateway" instead of "○ Live".
+            prov = self._ibkr_provider() if hasattr(self, "quotes") else None
+            ibkr_on = prov is not None and prov.is_connected()
+            if ibkr_on:
+                port  = getattr(prov, "_port", None)
+                label = {4001: "Gateway",    4002: "Gateway (paper)",
+                         7496: "TWS",        7497: "TWS (paper)"}.get(port, "IBKR")
+                self.live_btn.setText(f"●  {label}")
+                self.live_btn.setStyleSheet(
+                    f"QPushButton {{ background: transparent; color: {T.GREEN}; "
+                    f"border: 1px solid {T.GREEN}; border-radius: 6px; padding: 0 10px; "
+                    f"font-size: 11px; font-weight: bold; }}"
+                    f"QPushButton:hover {{ background: {T.GREEN_D}; color: white; }}"
+                )
+            else:
+                self.live_btn.setText("○  Live")
+                self.live_btn.setStyleSheet(
+                    f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+                    f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 0 10px; "
+                    f"font-size: 11px; }}"
+                    f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+                )
 
     # ── Quotes provider construction ────────────────────────────────────────
 
@@ -1052,18 +1055,27 @@ class PortfolioScreen(QWidget):
         )
 
     def _update_ibkr_pill(self):
-        """Refresh the IBKR status pill in the header."""
+        """
+        When IBKR Gateway is connected, update the Live button to show it.
+        The button still toggles TastyTrade streaming; IBKR push is always on.
+        """
         prov = self._ibkr_provider()
         if prov is None or not prov.is_connected():
-            self.ibkr_pill.setVisible(False)
+            # IBKR not connected — leave the Live button as-is.
             return
-        # Connected — show which mode (live vs paper).
-        from ibkr_account import IBKR_ACCOUNT_NUMBER
         port = getattr(prov, "_port", None)
-        mode = {4001: "Gateway Live", 4002: "Gateway Paper",
-                7496: "TWS Live",     7497: "TWS Paper"}.get(port, "IBKR")
-        self.ibkr_pill.setText(f"● {mode}")
-        self.ibkr_pill.setVisible(True)
+        label = {4001: "Gateway",      4002: "Gateway (paper)",
+                 7496: "TWS",          7497: "TWS (paper)"}.get(port, "IBKR")
+        # Only update the label when the button is in its idle (off) state so we
+        # don't clobber "● Streaming" / "⟳ Connecting" while streaming is active.
+        if not self.live_btn.isChecked():
+            self.live_btn.setText(f"●  {label}")
+            self.live_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.GREEN}; "
+                f"border: 1px solid {T.GREEN}; border-radius: 6px; padding: 0 10px; "
+                f"font-size: 11px; font-weight: bold; }}"
+                f"QPushButton:hover {{ background: {T.GREEN_D}; color: white; }}"
+            )
 
     def _toggle_live(self, on):
         if on:

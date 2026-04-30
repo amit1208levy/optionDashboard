@@ -235,6 +235,14 @@ class IBKRQuotesProvider(QuotesProvider):
         if not await self._ensure_connected():
             return []
         try:
+            # reqAccountUpdatesAsync subscribes and waits for the broker to
+            # send the initial accountDownloadEnd — after which portfolio() is
+            # fully populated.  Without this the cache is empty on the first
+            # call because the push hasn't arrived yet.
+            accts = self._ib.managedAccounts()
+            acct_code = accts[0] if accts else ""
+            await self._ib.reqAccountUpdatesAsync(subscribe=True,
+                                                   acctCode=acct_code)
             return list(self._ib.portfolio())
         except Exception as e:
             print(f"[ibkr] portfolio(): {e}", flush=True)
