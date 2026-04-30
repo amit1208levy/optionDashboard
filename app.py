@@ -18,6 +18,7 @@ import updater
 import streamer as _streamer_mod
 import pnl as _pnl_mod
 from quotes_tasty import TastyQuotesProvider
+from quotes_hybrid import HybridQuotesProvider
 from version import VERSION
 from models import (
     Position, StrategyInstance, unassigned_positions, group_unassigned,
@@ -389,9 +390,11 @@ class AccountSettingsDialog(QDialog):
         self.setMinimumWidth(500)
         self._fields = {}
         self._greek_checks = {}
+        self._ibkr_widgets: dict = {}
         # Strip any legacy "iv" entries that may have been saved by older versions
         enabled_greeks = [k for k in settings.get("leg_greeks", ["delta", "theta"])
                           if k != "iv"]
+        ibkr_cfg = settings.get("ibkr") or {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 22, 24, 22)
@@ -463,7 +466,74 @@ class AccountSettingsDialog(QDialog):
         checks_row.addStretch()
         root.addLayout(checks_row)
 
+        # ── Divider ──────────────────────────────────────────────────────────
+        div2 = QFrame()
+        div2.setFrameShape(QFrame.Shape.HLine)
+        div2.setStyleSheet(f"color: {T.BORDER};")
+        root.addWidget(div2)
+
+        # ── IBKR Gateway settings ────────────────────────────────────────────
+        ibkr_title = QLabel("IBKR Gateway (live quotes)")
+        ibkr_title.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 15px; font-weight: bold; border: none;"
+        )
+        root.addWidget(ibkr_title)
+
+        ibkr_hint = QLabel(
+            "When enabled, all live quotes / Greeks come from your local "
+            "IBKR Gateway (real-time push). TastyTrade is used as a fallback "
+            "for any symbols Gateway doesn't cover (e.g. futures options) "
+            "and for everything that isn't a quote (positions, history, etc.)."
+        )
+        ibkr_hint.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
+        ibkr_hint.setWordWrap(True)
+        root.addWidget(ibkr_hint)
+
+        ibkr_enable_cb = QCheckBox("Use IBKR Gateway for live quotes")
+        ibkr_enable_cb.setChecked(bool(ibkr_cfg.get("enabled")))
+        ibkr_enable_cb.setStyleSheet(
+            f"QCheckBox {{ color: {T.TEXT}; font-size: 13px; border: none; }}"
+            f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
+            f"border: 1px solid {T.BORDER}; background: {T.BG_ALT}; }}"
+            f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; "
+            f"border-color: {T.ACCENT}; }}"
+        )
+        self._ibkr_widgets["enabled"] = ibkr_enable_cb
+        root.addWidget(ibkr_enable_cb)
+
+        ibkr_form = QFormLayout()
+        ibkr_form.setSpacing(8)
+
+        host_edit = QLineEdit(str(ibkr_cfg.get("host") or "127.0.0.1"))
+        host_edit.setStyleSheet(
+            f"background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 6px; padding: 6px 8px; color: {T.TEXT};"
+        )
+        self._ibkr_widgets["host"] = host_edit
+        ibkr_form.addRow("Host:", host_edit)
+
+        port_edit = QLineEdit(str(ibkr_cfg.get("port") or 4001))
+        port_edit.setStyleSheet(host_edit.styleSheet())
+        port_edit.setToolTip("Gateway live = 4001, Gateway paper = 4002, "
+                             "TWS live = 7496, TWS paper = 7497")
+        self._ibkr_widgets["port"] = port_edit
+        ibkr_form.addRow("Port:", port_edit)
+
+        cid_edit = QLineEdit(str(ibkr_cfg.get("client_id") or 42))
+        cid_edit.setStyleSheet(host_edit.styleSheet())
+        cid_edit.setToolTip("Any unused integer; only matters when multiple "
+                            "API clients connect to the same Gateway.")
+        self._ibkr_widgets["client_id"] = cid_edit
+        ibkr_form.addRow("Client ID:", cid_edit)
+
+        root.addLayout(ibkr_form)
+
         # ── Buttons ──────────────────────────────────────────────────────────
+        notice = QLabel("Changes to IBKR settings take effect on next app launch.")
+        notice.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
+        notice.setWordWrap(True)
+        root.addWidget(notice)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -483,6 +553,20 @@ class AccountSettingsDialog(QDialog):
         """Return list of enabled Greek column keys in canonical order."""
         order = [key for key, _ in self.LEG_GREEK_OPTIONS]
         return [key for key in order if self._greek_checks[key].isChecked()]
+
+    def result_ibkr_settings(self) -> dict:
+        """Return the user's IBKR Gateway settings as a JSON-serializable dict."""
+        def _int(field, default):
+            try:
+                return int(self._ibkr_widgets[field].text().strip())
+            except (ValueError, AttributeError):
+                return default
+        return {
+            "enabled":   self._ibkr_widgets["enabled"].isChecked(),
+            "host":      self._ibkr_widgets["host"].text().strip() or "127.0.0.1",
+            "port":      _int("port", 4001),
+            "client_id": _int("client_id", 42),
+        }
 
 
 # ── Portfolio screen ─────────────────────────────────────────────────────────
@@ -505,11 +589,18 @@ class PortfolioScreen(QWidget):
         super().__init__()
         self.creds      = creds
         self.token      = token
-        # Quotes provider — token_getter lambda lets the provider always see
-        # the freshest token after a rotation (see _on_data_loaded below).
-        # All live quotes for the portfolio, watchlist, risk, and strategy
-        # detail pages flow through this single instance.
-        self.quotes     = TastyQuotesProvider(token_getter=lambda: self.token)
+        # Quotes provider chain.
+        #   - Tasty adapter is always built (it backs everything that's not
+        #     live quotes — fallback for symbols IBKR can't resolve, and
+        #     standalone if the user hasn't enabled IBKR).
+        #   - IBKR provider is only built if the user has enabled it in
+        #     settings AND Gateway is reachable on the configured port.
+        #     When both, the Hybrid wrapper prefers IBKR for live quotes
+        #     and falls back to Tasty for misses.
+        # token_getter lambda lets the Tasty side always see the freshest
+        # OAuth token after a rotation.
+        tasty_provider = TastyQuotesProvider(token_getter=lambda: self.token)
+        self.quotes    = self._build_quotes_provider(tasty_provider)
         self._worker    = None
         self._accounts  = []
         self._alerted   = {}   # {(strategy_id, condition_type): severity} — prevents repeat alerts
@@ -772,6 +863,58 @@ class PortfolioScreen(QWidget):
                 f"font-size: 11px; }}"
                 f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
             )
+
+    # ── Quotes provider construction ────────────────────────────────────────
+
+    def _build_quotes_provider(self, tasty_provider):
+        """
+        Build the live-quote provider chain based on user settings.
+
+        Returns either:
+          - the Tasty provider directly (IBKR disabled or unreachable), or
+          - a HybridQuotesProvider(IBKR, Tasty) when IBKR Gateway is enabled
+            in settings AND its TCP port answers within 1 s.
+
+        Errors importing ib_insync or starting the provider are treated as
+        "stay on Tasty" — the user can install / launch Gateway later and
+        toggle IBKR on; the change takes effect on next app start.
+        """
+        settings = api.load_settings() or {}
+        ibkr_cfg = settings.get("ibkr") or {}
+        if not ibkr_cfg.get("enabled"):
+            return tasty_provider
+
+        host       = ibkr_cfg.get("host") or "127.0.0.1"
+        port       = int(ibkr_cfg.get("port") or 4001)
+        client_id  = int(ibkr_cfg.get("client_id") or 42)
+        market_typ = int(ibkr_cfg.get("market_data_type") or 1)
+
+        # Quick TCP reachability probe so the GUI doesn't block 5 s if
+        # Gateway isn't running.
+        import socket
+        try:
+            with socket.create_connection((host, port), timeout=1.0):
+                pass
+        except (OSError, socket.timeout):
+            print(f"[ibkr] Gateway not reachable at {host}:{port} — "
+                  f"using TastyTrade for live quotes", flush=True)
+            return tasty_provider
+
+        try:
+            from quotes_ibkr import IBKRQuotesProvider
+            ibkr_provider = IBKRQuotesProvider(
+                host=host, port=port, client_id=client_id,
+                market_data_type=market_typ,
+            )
+        except Exception as e:
+            print(f"[ibkr] failed to start provider: {e} — falling back to "
+                  f"TastyTrade only", flush=True)
+            return tasty_provider
+
+        print(f"[ibkr] enabled — Gateway at {host}:{port}, "
+              f"client_id={client_id}, market_data_type={market_typ}",
+              flush=True)
+        return HybridQuotesProvider(primary=ibkr_provider, fallback=tasty_provider)
 
     def _toggle_live(self, on):
         if on:
@@ -1896,8 +2039,21 @@ class PortfolioScreen(QWidget):
             self._account_names = dlg.result_names()
             api.save_account_names(self._account_names)
             self._settings["leg_greeks"] = dlg.result_leg_greeks()
+            old_ibkr = self._settings.get("ibkr") or {}
+            new_ibkr = dlg.result_ibkr_settings()
+            self._settings["ibkr"] = new_ibkr
             api.save_settings(self._settings)
             self._refresh_account_combo()
+            # IBKR provider is wired at PortfolioScreen.__init__ time, so a
+            # change requires a relaunch to take effect.  Tell the user
+            # rather than silently doing nothing on the next refresh.
+            if old_ibkr != new_ibkr:
+                QMessageBox.information(
+                    self, "IBKR settings updated",
+                    "The new IBKR Gateway settings will take effect the next "
+                    "time the app launches.\n\n"
+                    "Quit and relaunch to start using IBKR for live quotes.",
+                )
 
     def stop_workers(self):
         """Gracefully stop all background threads before this widget is deleted.
