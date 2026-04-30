@@ -480,17 +480,18 @@ class AccountSettingsDialog(QDialog):
         root.addWidget(ibkr_title)
 
         ibkr_hint = QLabel(
-            "When enabled, all live quotes / Greeks come from your local "
-            "IBKR Gateway (real-time push). TastyTrade is used as a fallback "
-            "for any symbols Gateway doesn't cover (e.g. futures options) "
-            "and for everything that isn't a quote (positions, history, etc.)."
+            "Gateway is auto-detected on startup — no configuration needed. "
+            "If Gateway is running on this machine, it is used automatically "
+            "for real-time quotes / Greeks. TastyTrade fills in any symbols "
+            "Gateway doesn't cover and handles all non-quote data."
         )
         ibkr_hint.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
         ibkr_hint.setWordWrap(True)
         root.addWidget(ibkr_hint)
 
-        ibkr_enable_cb = QCheckBox("Use IBKR Gateway for live quotes")
-        ibkr_enable_cb.setChecked(bool(ibkr_cfg.get("enabled")))
+        ibkr_enable_cb = QCheckBox("Use IBKR Gateway for live quotes (auto-detected)")
+        # Checked by default; only unchecked when the user explicitly opts out.
+        ibkr_enable_cb.setChecked(ibkr_cfg.get("enabled") is not False)
         ibkr_enable_cb.setStyleSheet(
             f"QCheckBox {{ color: {T.TEXT}; font-size: 13px; border: none; }}"
             f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
@@ -512,9 +513,11 @@ class AccountSettingsDialog(QDialog):
         self._ibkr_widgets["host"] = host_edit
         ibkr_form.addRow("Host:", host_edit)
 
-        port_edit = QLineEdit(str(ibkr_cfg.get("port") or 4001))
+        port_edit = QLineEdit(str(ibkr_cfg.get("port") or ""))
+        port_edit.setPlaceholderText("auto (4001 → 4002 → 7496 → 7497)")
         port_edit.setStyleSheet(host_edit.styleSheet())
-        port_edit.setToolTip("Gateway live = 4001, Gateway paper = 4002, "
+        port_edit.setToolTip("Leave blank to auto-detect. Or pin a specific port: "
+                             "Gateway live = 4001, Gateway paper = 4002, "
                              "TWS live = 7496, TWS paper = 7497")
         self._ibkr_widgets["port"] = port_edit
         ibkr_form.addRow("Port:", port_edit)
@@ -561,10 +564,12 @@ class AccountSettingsDialog(QDialog):
                 return int(self._ibkr_widgets[field].text().strip())
             except (ValueError, AttributeError):
                 return default
+        raw_port = self._ibkr_widgets["port"].text().strip()
         return {
             "enabled":   self._ibkr_widgets["enabled"].isChecked(),
             "host":      self._ibkr_widgets["host"].text().strip() or "127.0.0.1",
-            "port":      _int("port", 4001),
+            # None → auto-detect across standard ports; explicit int → pin that port.
+            "port":      int(raw_port) if raw_port else None,
             "client_id": _int("client_id", 42),
         }
 
@@ -868,52 +873,92 @@ class PortfolioScreen(QWidget):
 
     def _build_quotes_provider(self, tasty_provider):
         """
-        Build the live-quote provider chain based on user settings.
+        Auto-detect IBKR Gateway / TWS and route live quotes through it.
 
-        Returns either:
-          - the Tasty provider directly (IBKR disabled or unreachable), or
-          - a HybridQuotesProvider(IBKR, Tasty) when IBKR Gateway is enabled
-            in settings AND its TCP port answers within 1 s.
+        Behavior is zero-config:
+          1. Settings explicitly opt out  (ibkr.enabled == False)
+                → return Tasty only.
+          2. Settings name a specific port (ibkr.port set)
+                → probe that port first.
+          3. Otherwise probe the four standard ports:
+             4001 (Gateway live) → 4002 (Gateway paper)
+             → 7496 (TWS live)   → 7497 (TWS paper)
+          4. First port that answers within 200 ms wins; we connect
+             through that port.
+          5. Any failure (no Gateway running, ib_insync not installed,
+             auth error, …) is silent — the dashboard keeps working
+             on TastyTrade alone.
 
-        Errors importing ib_insync or starting the provider are treated as
-        "stay on Tasty" — the user can install / launch Gateway later and
-        toggle IBKR on; the change takes effect on next app start.
+        The whole probe budget is bounded to ~1 s so launch isn't
+        slowed for users without IBKR.
         """
         settings = api.load_settings() or {}
         ibkr_cfg = settings.get("ibkr") or {}
-        if not ibkr_cfg.get("enabled"):
+
+        # Explicit opt-out — only path that disables IBKR entirely.
+        if ibkr_cfg.get("enabled") is False:
             return tasty_provider
 
         host       = ibkr_cfg.get("host") or "127.0.0.1"
-        port       = int(ibkr_cfg.get("port") or 4001)
         client_id  = int(ibkr_cfg.get("client_id") or 42)
         market_typ = int(ibkr_cfg.get("market_data_type") or 1)
 
-        # Quick TCP reachability probe so the GUI doesn't block 5 s if
-        # Gateway isn't running.
+        # Build probe list — user-specified port (if any) first, then the
+        # four IBKR defaults in order of how common they are.
+        custom_port = ibkr_cfg.get("port")
+        DEFAULT_PORTS = [4001, 4002, 7496, 7497]
+        seen = set()
+        candidate_ports: list[int] = []
+        for p in [custom_port, *DEFAULT_PORTS]:
+            try:
+                p = int(p) if p else None
+            except (TypeError, ValueError):
+                p = None
+            if p and p not in seen:
+                candidate_ports.append(p)
+                seen.add(p)
+
+        # 200 ms TCP probe per port — fast no-op for users without IBKR.
         import socket
-        try:
-            with socket.create_connection((host, port), timeout=1.0):
-                pass
-        except (OSError, socket.timeout):
-            print(f"[ibkr] Gateway not reachable at {host}:{port} — "
-                  f"using TastyTrade for live quotes", flush=True)
+        detected_port: int | None = None
+        for port in candidate_ports:
+            try:
+                with socket.create_connection((host, port), timeout=0.2):
+                    detected_port = port
+                    break
+            except (OSError, socket.timeout):
+                continue
+
+        if detected_port is None:
+            # Silent — most users won't have Gateway running.  Logging at
+            # DEBUG-equivalent so it isn't noise on stderr.
             return tasty_provider
 
+        # Lazy import so users without ib_insync installed don't crash
+        # at app startup — they just stay on TastyTrade.
         try:
             from quotes_ibkr import IBKRQuotesProvider
-            ibkr_provider = IBKRQuotesProvider(
-                host=host, port=port, client_id=client_id,
-                market_data_type=market_typ,
-            )
-        except Exception as e:
-            print(f"[ibkr] failed to start provider: {e} — falling back to "
-                  f"TastyTrade only", flush=True)
+        except ImportError:
+            print("[ibkr] Gateway is running but ib_insync isn't installed. "
+                  "Install with: pip3 install ib_insync", flush=True)
             return tasty_provider
 
-        print(f"[ibkr] enabled — Gateway at {host}:{port}, "
-              f"client_id={client_id}, market_data_type={market_typ}",
-              flush=True)
+        try:
+            ibkr_provider = IBKRQuotesProvider(
+                host=host, port=detected_port,
+                client_id=client_id, market_data_type=market_typ,
+            )
+        except Exception as e:
+            print(f"[ibkr] auto-detect found Gateway on port {detected_port} "
+                  f"but couldn't connect: {e} — using TastyTrade", flush=True)
+            return tasty_provider
+
+        # One concise success log so users can verify which feed is live.
+        kind = {4001: "Gateway (live)", 4002: "Gateway (paper)",
+                7496: "TWS (live)",     7497: "TWS (paper)"}.get(detected_port,
+                                                                 f"port {detected_port}")
+        print(f"[ibkr] auto-detected: {kind} — quotes will use IBKR push, "
+              f"TastyTrade as fallback", flush=True)
         return HybridQuotesProvider(primary=ibkr_provider, fallback=tasty_provider)
 
     def _toggle_live(self, on):
