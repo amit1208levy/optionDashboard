@@ -1052,8 +1052,22 @@ def _parse_any_iso(s):
 def strategy_performance(strategy_id, history, capital_req=None):
     """
     Aggregate closed-leg stats for a strategy.
-    Returns dict with total_pnl, avg_weekly, avg_monthly, yearly, closed_legs,
-    avg_dit, win_rate.
+
+    Key design decisions
+    --------------------
+    Win rate — trade-level, not leg-level.
+      Legs sharing the same (open date, close date) are one round-trip
+      trade.  A PCS where the short wins and the long hedge expires
+      worthless = ONE winning trade, not 50 % win-rate.
+
+    Pace (weekly / monthly / yearly) — DIT-based, not wall-clock.
+      We divide total P&L by the *total days-in-trade* across all closed
+      trades, then scale up.  This avoids the trap of "one trade closed
+      yesterday → $17 k/yr" when the trade actually took 100 days to earn
+      $690.  The correct answer is $690 ÷ 100 × 365 = $2,518/yr.
+
+    Returns dict with total_pnl, avg_weekly, avg_monthly, yearly,
+    closed_legs, closed_trades, avg_dit, win_rate.
     """
     entries = [h for h in (history or []) if h.get("strategy_id") == strategy_id]
     if not entries:
@@ -1061,42 +1075,109 @@ def strategy_performance(strategy_id, history, capital_req=None):
 
     total_pnl = sum(h.get("pnl", 0.0) or 0.0 for h in entries)
 
-    dits = []
+    # ── Trade-level grouping ───────────────────────────────────────────────
+    # Legs that share the same (open date, close date) pair belong to the
+    # same round-trip trade.
+    trade_groups: dict = {}
     for h in entries:
         op = _parse_any_iso(h.get("opened_at"))
         cl = _parse_any_iso(h.get("closed_at"))
-        if op and cl:
-            dits.append(max(0, (cl.date() - op.date()).days))
-    avg_dit = (sum(dits) / len(dits)) if dits else None
+        op_key = op.date().isoformat() if op else "?"
+        cl_key = cl.date().isoformat() if cl else "?"
+        trade_groups.setdefault((op_key, cl_key), []).append(h)
 
-    wins = sum(1 for h in entries if (h.get("pnl") or 0) > 0)
-    win_rate = (wins / len(entries) * 100.0)
+    trades = list(trade_groups.values())
 
-    # Span from first close to now
-    closes = [_parse_any_iso(h.get("closed_at")) for h in entries]
-    closes = [c for c in closes if c]
-    span_days = None
-    if closes:
-        span_days = max(1, (datetime.now(timezone.utc).date() - min(closes).date()).days)
+    # Win rate
+    wins = sum(
+        1 for t in trades
+        if sum(h.get("pnl", 0) or 0 for h in t) > 0
+    )
+    win_rate = wins / len(trades) * 100.0 if trades else 0.0
 
-    avg_weekly  = (total_pnl / span_days * 7)  if span_days else None
-    avg_monthly = (total_pnl / span_days * 30) if span_days else None
-    yearly      = (total_pnl / span_days * 365) if span_days else None
+    # Per-trade DIT = max leg-DIT within the group (e.g. for a spread both
+    # legs close together, so they have the same DIT; for uneven closes we
+    # use the longest hold to represent the trade's lifespan).
+    trade_dits = []
+    for trade_legs in trades:
+        leg_dits = []
+        for h in trade_legs:
+            op = _parse_any_iso(h.get("opened_at"))
+            cl = _parse_any_iso(h.get("closed_at"))
+            if op and cl:
+                leg_dits.append(max(0, (cl.date() - op.date()).days))
+        if leg_dits:
+            trade_dits.append(max(leg_dits))
+
+    avg_dit       = (sum(trade_dits) / len(trade_dits)) if trade_dits else None
+    total_dit     = sum(trade_dits) if trade_dits else None
+
+    # Pace: P&L per actual day-in-trade, scaled up.
+    # Using total DIT means a $690 trade held 100 days → $2,518/yr, not $17k.
+    if total_dit and total_dit > 0:
+        avg_weekly  = total_pnl / total_dit * 7
+        avg_monthly = total_pnl / total_dit * 30
+        yearly      = total_pnl / total_dit * 365
+    else:
+        avg_weekly = avg_monthly = yearly = None
 
     capital_pct = None
     if capital_req and avg_weekly is not None:
         capital_pct = avg_weekly / capital_req * 100.0
 
     return {
-        "total_pnl":   total_pnl,
-        "avg_weekly":  avg_weekly,
-        "avg_monthly": avg_monthly,
-        "yearly":      yearly,
-        "closed_legs": len(entries),
-        "avg_dit":     avg_dit,
-        "win_rate":    win_rate,
-        "weekly_pct":  capital_pct,
+        "total_pnl":     total_pnl,
+        "avg_weekly":    avg_weekly,
+        "avg_monthly":   avg_monthly,
+        "yearly":        yearly,
+        "closed_legs":   len(entries),
+        "closed_trades": len(trades),
+        "avg_dit":       avg_dit,
+        "win_rate":      win_rate,
+        "weekly_pct":    capital_pct,
     }
+
+
+def template_ytd_pnl_map(history, instances):
+    """
+    Aggregate realized P&L year-to-date for each template.
+
+    Walks every history (closed-leg) entry, looks up which strategy instance
+    it belongs to, then which template that instance was created from, and
+    sums P&L by template_key — but only for legs whose `closed_at` falls in
+    the current calendar year.
+
+    Returns:
+        { template_key: float }   # only templates with at least one YTD leg
+
+    Templates with no closed legs this year are absent from the map; the
+    caller can default to None when displaying ("—").
+    """
+    from datetime import date
+    year = date.today().year
+
+    # strategy_id → template_key (only assigned strategies have a template)
+    sid_to_template = {
+        inst.id: inst.template_key
+        for inst in (instances or [])
+        if getattr(inst, "template_key", None)
+    }
+    if not sid_to_template:
+        return {}
+
+    out: dict = {}
+    for h in (history or []):
+        sid = h.get("strategy_id")
+        if not sid:
+            continue
+        tkey = sid_to_template.get(sid)
+        if not tkey:
+            continue
+        cl = _parse_any_iso(h.get("closed_at"))
+        if not cl or cl.year != year:
+            continue
+        out[tkey] = out.get(tkey, 0.0) + (h.get("pnl", 0.0) or 0.0)
+    return out
 
 
 # ── Portfolio-level analytics ───────────────────────────────────────────────

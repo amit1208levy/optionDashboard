@@ -1,87 +1,84 @@
-"""Git-based updater — check GitHub for new commits, pull, relaunch."""
+"""
+Self-updating logic for OptionsDashboard.
+
+For the bundled .app (what users run):
+  • check_latest()   — asks GitHub Releases API for the newest version tag,
+                       compares it to the VERSION baked into the bundle.
+  • self_install()   — downloads the new .app.zip, swaps bundles, relaunches.
+
+For developers running from source (git checkout):
+  • check_latest()   — falls through to the old git-fetch path.
+  • pull()           — git pull --ff-only.
+"""
 import os
 import subprocess
 import sys
 
 import requests
 
+from version import VERSION
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 
-# For .app bundles we can't run `git fetch` inside the sealed bundle, so
-# instead we ask GitHub's HTTP API for the latest commit SHA on main.
-# No auth needed for public repos.
 _REPO_API = "https://api.github.com/repos/amit1208levy/optionDashboard"
 
+# The .zip uploaded to every GitHub Release as an asset.
+# Matches what build.sh creates under dist/OptionsDashboard.zip.
+_APP_ZIP_URL = (
+    "https://github.com/amit1208levy/optionDashboard/releases/latest/"
+    "download/OptionsDashboard.zip"
+)
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _is_frozen_bundle() -> bool:
-    """Running inside a PyInstaller .app bundle (not a live git checkout)?"""
     return getattr(sys, "frozen", False) or "Contents/Resources" in HERE
 
 
-def _bundled_sha_file():
-    """Path to the baked-in SHA stamp created at build time."""
-    return os.path.join(HERE, "_build_sha.txt")
-
-
-def _local_sha_for_bundle():
-    """Return the git SHA that was current at the time the .app was built."""
-    path = _bundled_sha_file()
-    if not os.path.exists(path):
-        return ""
+def _parse_version(v: str):
+    """Parse 'v1.2.3' or '1.2.3' → (1, 2, 3).  Returns () on failure."""
     try:
-        with open(path) as f:
-            return f.read().strip()[:7]
-    except Exception:
-        return ""
+        return tuple(int(x) for x in v.lstrip("v").split("."))
+    except (ValueError, AttributeError):
+        return ()
 
 
-def _remote_sha_via_http():
-    """HTTP-based remote HEAD SHA lookup for bundled apps."""
+def _latest_release():
+    """
+    Query GitHub Releases API.
+    Returns (tag: str, notes: str, error: str).
+    tag is empty string on error.
+    """
     try:
-        r = requests.get(f"{_REPO_API}/commits/main",
-                         timeout=10,
-                         headers={"Accept": "application/vnd.github+json"})
+        r = requests.get(
+            f"{_REPO_API}/releases/latest",
+            timeout=10,
+            headers={"Accept": "application/vnd.github+json"},
+        )
+        if r.status_code == 404:
+            return "", "", "No releases published yet."
         if r.status_code != 200:
-            return None, f"HTTP {r.status_code}"
+            return "", "", f"GitHub API HTTP {r.status_code}"
         data = r.json()
-        return (data.get("sha") or "")[:7], ""
-    except requests.exceptions.RequestException as e:
-        return None, str(e)
+        tag   = (data.get("tag_name") or "").lstrip("v")
+        notes = (data.get("body") or "").strip()
+        return tag, notes, ""
+    except requests.exceptions.RequestException as exc:
+        return "", "", str(exc)
 
 
-def _recent_commits_via_http(since_sha):
-    """Return 'bullet list' of recent commit subjects from GitHub."""
-    try:
-        r = requests.get(f"{_REPO_API}/commits",
-                         params={"per_page": 10},
-                         timeout=10,
-                         headers={"Accept": "application/vnd.github+json"})
-        if r.status_code != 200:
-            return ""
-        out = []
-        for c in r.json():
-            subj = (c.get("commit", {}).get("message") or "").splitlines()[0]
-            sha  = (c.get("sha") or "")[:7]
-            out.append(f"• {subj}")
-            if since_sha and sha == since_sha:
-                break
-        return "\n".join(out) or "(no commit messages)"
-    except Exception:
-        return ""
-
+# ── Git helpers (source-checkout only) ───────────────────────────────────────
 
 def _git(*args, timeout=15):
-    """Run a git command in the repo directory. Returns (ok, stdout, stderr)."""
     try:
         r = subprocess.run(
-            ["git", *args],
-            cwd=HERE,
-            capture_output=True, text=True,
-            timeout=timeout,
+            ["git", *args], cwd=HERE,
+            capture_output=True, text=True, timeout=timeout,
         )
         return r.returncode == 0, r.stdout.strip(), r.stderr.strip()
-    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        return False, "", str(e)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        return False, "", str(exc)
 
 
 def is_git_repo():
@@ -89,73 +86,74 @@ def is_git_repo():
     return ok
 
 
+# ── Public API ────────────────────────────────────────────────────────────────
+
 def check_latest():
     """
-    Returns dict:
+    Returns:
       { "available": bool,
-        "latest": short-sha or "",
-        "local":  short-sha or "",
-        "notes":  recent commit subjects (joined),
-        "error":  str }
+        "latest":    version string (e.g. "1.2.0"),
+        "local":     version string (e.g. "1.1.0"),
+        "notes":     release notes text,
+        "error":     error string or "",
+        "bundle":    True when running as a built .app (signals self_install path) }
     """
-    # Bundled .app path: check GitHub HTTP API instead of git fetch.
+    # ── Bundled .app or non-git environment → version-based check ───────────
     if _is_frozen_bundle() or not is_git_repo():
-        local = _local_sha_for_bundle()
-        remote, err = _remote_sha_via_http()
-        if remote is None:
-            # Can't reach GitHub — silent, don't nag the user.
-            return {"available": False, "latest": "", "local": local,
-                    "notes": "", "error": err or ""}
-        if not local or local == remote:
-            return {"available": False, "latest": remote, "local": local,
-                    "notes": "", "error": ""}
-        # Update available — but bundled users can't self-update.  Surface
-        # that clearly so they know they need a replacement .app.
+        local = VERSION
+        latest, notes, err = _latest_release()
+
+        if err or not latest:
+            return {"available": False, "latest": latest, "local": local,
+                    "notes": "", "error": err, "bundle": True}
+
+        local_t  = _parse_version(local)
+        latest_t = _parse_version(latest)
+
+        if not latest_t or not local_t or latest_t <= local_t:
+            return {"available": False, "latest": latest, "local": local,
+                    "notes": "", "error": "", "bundle": True}
+
         return {
             "available": True,
-            "latest":    remote,
+            "latest":    latest,
             "local":     local,
-            "notes":     _recent_commits_via_http(local) +
-                         "\n\n⚠  Download the latest OptionsDashboard.app "
-                         "and replace the one in /Applications.",
+            "notes":     notes or "(no release notes)",
             "error":     "",
             "bundle":    True,
         }
 
-    # Allow up to 45 s on slow connections; retry once before giving up.
+    # ── Source checkout → git-based check ───────────────────────────────────
     ok, _, err = _git("fetch", "--quiet", "origin", timeout=45)
     if not ok:
         ok, _, err = _git("fetch", "--quiet", "origin", timeout=45)
     if not ok:
         return {"available": False, "latest": "", "local": "", "notes": "",
-                "error": f"Fetch failed: {err or 'network error'}"}
+                "error": f"Fetch failed: {err or 'network error'}", "bundle": False}
 
-    ok, local, _   = _git("rev-parse", "--short", "HEAD")
+    ok,  local, _  = _git("rev-parse", "--short", "HEAD")
     ok2, remote, _ = _git("rev-parse", "--short", "@{u}")
     if not ok or not ok2:
         return {"available": False, "latest": "", "local": local, "notes": "",
-                "error": "Could not read git refs."}
+                "error": "Could not read git refs.", "bundle": False}
 
     if local == remote:
         return {"available": False, "latest": remote, "local": local,
-                "notes": "", "error": ""}
+                "notes": "", "error": "", "bundle": False}
 
-    # Collect commit subjects between local and remote
-    _, log_out, _ = _git(
-        "log", "--pretty=format:• %s", f"{local}..{remote}"
-    )
-
+    _, log_out, _ = _git("log", "--pretty=format:• %s", f"{local}..{remote}")
     return {
         "available": True,
         "latest":    remote,
         "local":     local,
         "notes":     log_out or "(no commit messages)",
         "error":     "",
+        "bundle":    False,
     }
 
 
 def pull():
-    """Pull the latest main. Returns (ok, message)."""
+    """Pull from git (source-checkout only). Returns (ok, message)."""
     ok, out, err = _git("pull", "--ff-only", "origin", "main", timeout=60)
     if ok:
         return True, out or "Up to date."
@@ -165,32 +163,26 @@ def pull():
 # ── .app self-update (bundled mode) ──────────────────────────────────────────
 
 def _find_app_bundle_path():
-    """Return the absolute path of the running .app bundle, or None."""
     if not _is_frozen_bundle():
         return None
-    exe = sys.executable  # /…/OptionsDashboard.app/Contents/MacOS/OptionsDashboard
+    exe = sys.executable
     app = os.path.dirname(os.path.dirname(os.path.dirname(exe)))
     return app if app.endswith(".app") else None
 
 
-# URL of the .app.zip we upload as a GitHub Release asset.
-# Using /releases/latest/download/<asset> auto-follows the most recent tag.
-_APP_ZIP_URL = (
-    "https://github.com/amit1208levy/optionDashboard/releases/latest/"
-    "download/OptionsDashboard.app.zip"
-)
-
-
 def self_install():
     """
-    Download the latest .app.zip from GitHub Releases, unpack it, and replace
-    the running bundle.  The replace+relaunch is delegated to a detached
-    shell script so we can cleanly exit this process while it swaps the app.
+    Download the latest OptionsDashboard.zip from GitHub Releases,
+    unpack it, replace the running .app bundle, and relaunch.
 
-    Returns (ok, message).  On success the current process exits before
-    returning.
+    The actual swap is done by a short detached bash script that waits
+    for this process to exit before touching the bundle — so we never
+    delete our own binary out from under ourselves.
+
+    Returns (ok: bool, message: str).
+    On success this process will exit shortly after returning True.
     """
-    import tempfile, urllib.request, zipfile, subprocess
+    import tempfile, urllib.request, zipfile
 
     app_path = _find_app_bundle_path()
     if not app_path:
@@ -202,20 +194,20 @@ def self_install():
     # 1. Download
     try:
         urllib.request.urlretrieve(_APP_ZIP_URL, zip_path)
-    except Exception as e:
-        return False, f"Download failed: {e}"
+    except Exception as exc:
+        return False, f"Download failed: {exc}"
 
     # 2. Unpack
     extract_dir = os.path.join(tmpdir, "extracted")
     try:
         with zipfile.ZipFile(zip_path) as z:
             z.extractall(extract_dir)
-    except Exception as e:
-        return False, f"Could not unzip download: {e}"
+    except Exception as exc:
+        return False, f"Could not unzip download: {exc}"
 
+    # 3. Locate the .app inside the extracted folder
     new_app = os.path.join(extract_dir, "OptionsDashboard.app")
     if not os.path.isdir(new_app):
-        # Some zips nest the .app inside another folder
         for entry in os.listdir(extract_dir):
             cand = os.path.join(extract_dir, entry, "OptionsDashboard.app")
             if os.path.isdir(cand):
@@ -224,9 +216,7 @@ def self_install():
     if not os.path.isdir(new_app):
         return False, "Downloaded zip didn't contain OptionsDashboard.app."
 
-    # 3. Write a detached bash script that waits for us to exit, replaces the
-    #    bundle, and relaunches.  Running this inside the app itself would
-    #    delete our own binary out from under us.
+    # 4. Write a detached swap-and-relaunch script
     script_path = os.path.join(tmpdir, "replace.sh")
     our_pid     = os.getpid()
     with open(script_path, "w") as f:
@@ -240,18 +230,19 @@ sleep 0.5
 rm -rf {app_path!r}
 mv {new_app!r} {app_path!r} || cp -R {new_app!r} {app_path!r}
 
-# Clear macOS quarantine attribute so Gatekeeper doesn't block launch
-xattr -cr {app_path!r} 2>/dev/null
+# Remove quarantine attribute so Gatekeeper doesn't block relaunch
+xattr -dr com.apple.quarantine {app_path!r} 2>/dev/null
 
+# Relaunch
 open {app_path!r}
 
-# Clean up temp dir
+# Tidy up
 rm -rf {tmpdir!r}
 """
         )
     os.chmod(script_path, 0o755)
 
-    # 4. Launch the replace script detached, then return — caller will exit.
+    # 5. Launch the swap script detached — caller will then sys.exit(0)
     subprocess.Popen(
         ["/bin/bash", script_path],
         start_new_session=True,
@@ -259,4 +250,4 @@ rm -rf {tmpdir!r}
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    return True, "Downloaded — app will relaunch in a moment."
+    return True, "Downloading complete — app will relaunch in a moment."

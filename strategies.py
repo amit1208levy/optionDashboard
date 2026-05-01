@@ -467,6 +467,83 @@ TEMPLATES: List[Template] = [
         metrics=["max_profit", "break_even", "pop", "capital_req",
                  "delta", "theta", "vega", "iv", "dte"],
     ),
+
+    # ── Weekly income templates ───────────────────────────────────────────────
+    # These are structurally identical to their non-weekly counterparts but are
+    # named/described for the 0–7 DTE rapid-decay income style.  Win rate and
+    # pace are always computed at the *trade* level (all legs together).
+
+    Template(
+        key="pcs_weekly",
+        name="PCS Weekly",
+        category="Income",
+        outlook="Neutral-to-Bullish",
+        risk="Defined",
+        description=(
+            "Weekly put credit spread. Sell a slightly OTM put and buy a lower-strike "
+            "put for protection, same expiry (0–7 DTE). Both legs close together; "
+            "win/loss is judged at the trade level."
+        ),
+        setup="Short Put (higher K) + Long Put (lower K) — short-dated, high IVR",
+        max_profit="Net credit received",
+        max_loss="Spread width − credit",
+        capital_note="Capital ≈ spread width − credit. Typically $0.50–$5 wide on liquid underlyings.",
+        ideal_when="High IVR (>50), neutral-to-bullish outlook, 0–7 DTE, liquid underlying.",
+        legs=[
+            LegSpec("Long Put (low K)",   "long",  "P", strike_rank=1),
+            LegSpec("Short Put (high K)", "short", "P", strike_rank=2),
+        ],
+        metrics=["max_profit", "max_loss", "break_even", "pop", "capital_req",
+                 "delta", "theta", "iv", "dte", "dit"],
+    ),
+    Template(
+        key="ccs_weekly",
+        name="CCS Weekly",
+        category="Income",
+        outlook="Neutral-to-Bearish",
+        risk="Defined",
+        description=(
+            "Weekly call credit spread. Sell a slightly OTM call and buy a higher-strike "
+            "call for protection (same expiry, 0–7 DTE). Mirror of PCS Weekly — "
+            "pairs with a PCS Weekly to form a weekly Iron Condor."
+        ),
+        setup="Short Call (lower K) + Long Call (higher K) — short-dated, high IVR",
+        max_profit="Net credit received",
+        max_loss="Spread width − credit",
+        capital_note="Capital ≈ spread width − credit.",
+        ideal_when="High IVR (>50), neutral-to-bearish outlook, 0–7 DTE, liquid underlying.",
+        legs=[
+            LegSpec("Short Call (low K)", "short", "C", strike_rank=1),
+            LegSpec("Long Call (high K)", "long",  "C", strike_rank=2),
+        ],
+        metrics=["max_profit", "max_loss", "break_even", "pop", "capital_req",
+                 "delta", "theta", "iv", "dte", "dit"],
+    ),
+    Template(
+        key="ics_weekly",
+        name="IC Weekly",
+        category="Income",
+        outlook="Neutral",
+        risk="Defined",
+        description=(
+            "Weekly iron condor — OTM put credit spread + OTM call credit spread, "
+            "same 0–7 DTE expiry. The entire 4-leg structure is one trade; win rate "
+            "and pace reflect all legs closing together."
+        ),
+        setup="Long Put + Short Put + Short Call + Long Call (same expiry, ascending strikes)",
+        max_profit="Net credit",
+        max_loss="Wider wing width − net credit",
+        capital_note="Capital ≈ wider wing − credit (margin on the larger spread).",
+        ideal_when="High IVR, range-bound market, 0–7 DTE, premium-selling environment.",
+        legs=[
+            LegSpec("Long Put (lowest K)",   "long",  "P", strike_rank=1),
+            LegSpec("Short Put",             "short", "P", strike_rank=2),
+            LegSpec("Short Call",            "short", "C", strike_rank=3),
+            LegSpec("Long Call (highest K)", "long",  "C", strike_rank=4),
+        ],
+        metrics=["max_profit", "max_loss", "break_even", "pop", "capital_req",
+                 "delta", "theta", "vega", "iv", "dte", "dit"],
+    ),
 ]
 
 

@@ -1,51 +1,339 @@
 #!/usr/bin/env bash
-# Build macOS .app + .dmg using PyInstaller.
-# Usage: ./build.sh
+# ─────────────────────────────────────────────────────────────────────────────
+# build.sh  —  Build OptionsDashboard.app + zip for distribution
+#
+# Usage:
+#   cd /path/to/dashboard
+#   ./build.sh
+#
+# Output:
+#   dist/OptionsDashboard.app   — the macOS app bundle (double-click to open)
+#   dist/OptionsDashboard.zip   — shareable zip (AirDrop, email, iCloud, etc.)
+# ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE"
 
 APP_NAME="OptionsDashboard"
-VERSION="$(python3 -c 'import version; print(version.VERSION)')"
+VERSION="$(python3 -c 'from version import VERSION; print(VERSION)')"
+APP_PATH="dist/$APP_NAME.app"
+ZIP_PATH="dist/$APP_NAME.zip"
 
-echo "→ Building $APP_NAME v$VERSION"
+echo "═══════════════════════════════════════════════"
+echo "  Building  $APP_NAME  v$VERSION"
+echo "═══════════════════════════════════════════════"
+echo ""
 
-# Clean previous builds
+# ── 1. Find PyInstaller ───────────────────────────────────────────────────────
+PYI=""
+for candidate in \
+    "$(command -v pyinstaller 2>/dev/null)" \
+    "$HOME/Library/Python/3.12/bin/pyinstaller" \
+    "$HOME/Library/Python/3.11/bin/pyinstaller" \
+    "$HOME/Library/Python/3.10/bin/pyinstaller" \
+    "$HOME/Library/Python/3.9/bin/pyinstaller" \
+    "/usr/local/bin/pyinstaller" \
+    "/opt/homebrew/bin/pyinstaller"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+        PYI="$candidate"
+        break
+    fi
+done
+
+if [ -z "$PYI" ]; then
+    echo "✗ PyInstaller not found. Install it first:"
+    echo "     pip3 install pyinstaller --user"
+    exit 1
+fi
+
+echo "→ Using PyInstaller: $PYI ($(\"$PYI\" --version))"
+echo ""
+
+# ── 2. Clean previous builds ──────────────────────────────────────────────────
+echo "→ Cleaning previous build..."
 rm -rf build dist
 
-# Ensure pyinstaller is on PATH (user-install fallback)
-PYI="$(command -v pyinstaller || true)"
-if [ -z "$PYI" ]; then
-  PYI="$HOME/Library/Python/3.9/bin/pyinstaller"
-fi
+# ── 3. Run PyInstaller ────────────────────────────────────────────────────────
+echo "→ Running PyInstaller..."
+"$PYI" OptionsDashboard.spec --noconfirm
 
-"$PYI" \
-  --noconfirm \
-  --windowed \
-  --name "$APP_NAME" \
-  --osx-bundle-identifier "com.amitlevy.optionsdashboard" \
-  app.py
-
-APP_PATH="dist/$APP_NAME.app"
-DMG_PATH="dist/$APP_NAME-$VERSION.dmg"
-
+# ── 4. Verify .app was created ────────────────────────────────────────────────
 if [ ! -d "$APP_PATH" ]; then
-  echo "✗ Build failed — $APP_PATH not found"
-  exit 1
+    echo ""
+    echo "✗ Build failed — $APP_PATH was not created."
+    echo "  Check the output above for errors."
+    exit 1
+fi
+echo ""
+echo "✓ App built:  $APP_PATH"
+APP_SIZE="$(du -sh "$APP_PATH" | cut -f1)"
+echo "  Size: $APP_SIZE"
+
+# ── 4b. Code-sign + notarize (if Developer ID is configured) ─────────────────
+# Notarization eliminates the "damaged" / "unidentified developer" warnings
+# entirely. If the certificate / notary credentials aren't set up, we fall
+# back to ad-hoc signing + the workaround installer.
+NOTARY_PROFILE="${NOTARY_PROFILE:-optdash-notary}"
+NOTARIZED=false
+
+# Find the Developer ID Application certificate (NOT "Apple Development",
+# which is for testing only and can't be used for distribution).
+DEVELOPER_ID="$(security find-identity -v -p codesigning 2>/dev/null \
+    | grep "Developer ID Application" \
+    | head -1 \
+    | sed -E 's/.*"(.+)".*/\1/')"
+
+# Extract the Team ID from the cert name, e.g. "...Application: Name (TEAMID)"
+TEAM_ID="$(echo "$DEVELOPER_ID" | sed -nE 's/.*\(([A-Z0-9]+)\).*/\1/p')"
+
+if [ -n "$DEVELOPER_ID" ]; then
+    echo ""
+    echo "→ Signing with: $DEVELOPER_ID"
+
+    # 1. Sign every Mach-O binary inside the bundle (dylibs, .so files, the
+    #    main exe). PyInstaller's own --deep doesn't catch everything, so we
+    #    do an explicit pass.
+    find "$APP_PATH" \( -name "*.dylib" -o -name "*.so" \) -print0 \
+        | xargs -0 codesign --force --options=runtime --timestamp \
+            --entitlements entitlements.plist \
+            --sign "$DEVELOPER_ID" 2>&1 | grep -v "replacing existing signature" || true
+
+    # 2. Sign all executable Mach-O files (anything with the executable bit
+    #    set that isn't a script).
+    find "$APP_PATH/Contents/MacOS" -type f -perm +111 -print0 \
+        | xargs -0 codesign --force --options=runtime --timestamp \
+            --entitlements entitlements.plist \
+            --sign "$DEVELOPER_ID" 2>&1 | grep -v "replacing existing signature" || true
+
+    # 3. Sign the .app bundle itself
+    codesign --force --options=runtime --timestamp \
+        --entitlements entitlements.plist \
+        --sign "$DEVELOPER_ID" "$APP_PATH"
+
+    # 4. Verify signature is valid + complete
+    if codesign --verify --strict --verbose=2 "$APP_PATH" 2>&1 | grep -q "valid on disk"; then
+        echo "✓ Signature verified"
+    else
+        echo "✗ Signature verification failed — check codesign output above."
+        codesign --verify --strict --verbose=2 "$APP_PATH"
+        exit 1
+    fi
+
+    # 5. Notarize (if keychain profile is configured)
+    if xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" &>/dev/null; then
+        echo ""
+        echo "→ Submitting to Apple notary service (this can take 1-5 minutes)..."
+
+        NOTARY_ZIP="$(mktemp -t optdash-notary).zip"
+        ditto -c -k --keepParent "$APP_PATH" "$NOTARY_ZIP"
+
+        if xcrun notarytool submit "$NOTARY_ZIP" \
+                --keychain-profile "$NOTARY_PROFILE" \
+                --wait 2>&1 | tee /tmp/notary.log | grep -q "status: Accepted"; then
+            rm -f "$NOTARY_ZIP"
+            echo "✓ Notarization accepted"
+
+            # Staple the ticket onto the .app so it works offline
+            xcrun stapler staple "$APP_PATH"
+            echo "✓ Notarization ticket stapled"
+            NOTARIZED=true
+        else
+            rm -f "$NOTARY_ZIP"
+            echo "✗ Notarization failed. Log:"
+            cat /tmp/notary.log
+            echo ""
+            echo "  Get detailed logs with:"
+            SUBMIT_ID="$(grep -oE 'id: [a-f0-9-]+' /tmp/notary.log | head -1 | awk '{print $2}')"
+            if [ -n "$SUBMIT_ID" ]; then
+                echo "    xcrun notarytool log $SUBMIT_ID --keychain-profile $NOTARY_PROFILE"
+            fi
+        fi
+    else
+        echo ""
+        echo "! Notary credentials not stored in keychain — skipping notarization."
+        echo "  Run this once to set them up:"
+        echo "    xcrun notarytool store-credentials $NOTARY_PROFILE \\"
+        echo "        --apple-id YOUR_APPLE_ID \\"
+        echo "        --team-id ${TEAM_ID:-YOUR_TEAM_ID} \\"
+        echo "        --password YOUR_APP_SPECIFIC_PASSWORD"
+    fi
+else
+    echo ""
+    echo "! No 'Developer ID Application' certificate found in keychain."
+    echo "  The app will still build, but recipients will need the workaround installer."
+    echo "  To fix: open Xcode → Settings → Accounts → select your Apple ID →"
+    echo "  Manage Certificates → click '+' → 'Developer ID Application'."
 fi
 
-echo "→ Creating DMG: $DMG_PATH"
-rm -f "$DMG_PATH"
-hdiutil create \
-  -volname "$APP_NAME" \
-  -srcfolder "$APP_PATH" \
-  -ov -format UDZO \
-  "$DMG_PATH"
+# ── 5. Compile one-click installer ───────────────────────────────────────────
+# Only needed when the app ISN'T notarized. A notarized app opens normally.
+if [ "$NOTARIZED" = "true" ]; then
+    echo ""
+    echo "→ Skipping installer (app is notarized — opens normally on any Mac)."
+    INSTALLER_APP=""
+else
 
-echo "✓ Done"
-echo "  App: $APP_PATH"
-echo "  DMG: $DMG_PATH"
-echo
-echo "Next: upload DMG to a GitHub release:"
-echo "  gh release create v$VERSION \"$DMG_PATH\" --title \"v$VERSION\" --notes \"...\""
+echo ""
+echo "→ Compiling one-click installer..."
+
+INSTALLER_SCRIPT="$(mktemp /tmp/installer_XXXXXX.applescript)"
+cat > "$INSTALLER_SCRIPT" << 'APPLESCRIPT'
+on run
+    -- Find OptionsDashboard.app sitting next to this installer
+    set myDir to do shell script "dirname " & quoted form of POSIX path of (path to me)
+    set appSrc  to myDir & "/OptionsDashboard.app"
+    set appDest to "/Applications/OptionsDashboard.app"
+
+    -- Verify the app is there
+    try
+        do shell script "test -d " & quoted form of appSrc
+    on error
+        display dialog "Could not find OptionsDashboard.app." & return & return & ¬
+            "Make sure this installer and OptionsDashboard.app are in the same folder." ¬
+            buttons {"OK"} default button "OK" with icon stop
+        return
+    end try
+
+    -- Welcome prompt
+    set ans to button returned of (display dialog ¬
+        "This will install Options Dashboard on your Mac and open it." & return & return & ¬
+        "Click Install to continue." ¬
+        buttons {"Cancel", "Install"} default button "Install" with icon 1)
+    if ans is "Cancel" then return
+
+    -- Strip quarantine so macOS lets the app run (no password needed)
+    try
+        do shell script "xattr -dr com.apple.quarantine " & quoted form of appSrc
+    end try
+
+    -- Copy to /Applications (ask for password only if needed)
+    try
+        do shell script "cp -Rf " & quoted form of appSrc & " " & quoted form of appDest
+    on error
+        try
+            do shell script "cp -Rf " & quoted form of appSrc & " " & ¬
+                quoted form of appDest with administrator privileges
+        on error errMsg
+            display dialog "Installation failed." & return & errMsg ¬
+                buttons {"OK"} default button "OK" with icon stop
+            return
+        end try
+    end try
+
+    -- Launch
+    do shell script "open " & quoted form of appDest
+
+    display dialog "Options Dashboard is installed and open!" & return & return & ¬
+        "You can move this installer and the zip to the Trash." ¬
+        buttons {"Done"} default button "Done" with icon 1
+end run
+APPLESCRIPT
+
+INSTALLER_APP="dist/Install Options Dashboard.app"
+rm -rf "$INSTALLER_APP"
+osacompile -o "$INSTALLER_APP" "$INSTALLER_SCRIPT"
+rm -f "$INSTALLER_SCRIPT"
+echo "✓ Installer compiled"
+
+fi   # end !NOTARIZED branch
+
+# ── 6. Create distributable zip ───────────────────────────────────────────────
+echo ""
+echo "→ Creating zip for distribution..."
+rm -f "$ZIP_PATH"
+
+if [ "$NOTARIZED" = "true" ]; then
+    # Notarized — clean zip with just the .app. Recipients double-click the
+    # zip, drag the .app to Applications, and it opens normally with no
+    # right-click trick or installer step.
+    ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_PATH"
+else
+    # Not notarized — include the workaround installer that strips the
+    # quarantine flag at install time. Both apps go at the root of the zip.
+    STAGING="$(mktemp -d)"
+    cp -R "$APP_PATH"      "$STAGING/OptionsDashboard.app"
+    cp -R "$INSTALLER_APP" "$STAGING/Install Options Dashboard.app"
+    ditto -c -k --sequesterRsrc "$STAGING" "$ZIP_PATH"
+    rm -rf "$STAGING"
+fi
+
+ZIP_SIZE="$(du -sh "$ZIP_PATH" | cut -f1)"
+echo "✓ Zip created: $ZIP_PATH  ($ZIP_SIZE)"
+
+echo ""
+echo "═══════════════════════════════════════════════"
+echo "  ✓  Done!  v$VERSION"
+echo ""
+echo "  File to share:"
+echo "    $(pwd)/$ZIP_PATH  ($ZIP_SIZE)"
+echo ""
+echo "  Permanent download link:"
+echo "    https://github.com/amit1208levy/optionDashboard/releases/latest/download/OptionsDashboard.zip"
+echo ""
+
+if [ "$NOTARIZED" = "true" ]; then
+    echo "  ✨ Notarized by Apple — opens cleanly on any Mac."
+    echo ""
+    echo "  Recipient instructions:"
+    echo "    1. Click the link → zip downloads"
+    echo "    2. Double-click OptionsDashboard.zip to unzip it"
+    echo "    3. Drag OptionsDashboard.app into Applications"
+    echo "    4. Double-click — it just opens. No warnings, no right-click trick."
+else
+    echo "  Recipient instructions (one-time setup):"
+    echo "    1. Click the link → zip downloads"
+    echo "    2. Double-click OptionsDashboard.zip to unzip it"
+    echo "    3. Double-click 'Install Options Dashboard'"
+    echo "       macOS asks once: right-click → Open → Open"
+    echo "    4. Click Install — app installs itself and opens. Done!"
+fi
+echo "═══════════════════════════════════════════════"
+
+# ── 7. Publish to GitHub Releases (enables in-app auto-update) ───────────────
+echo ""
+echo "→ Publishing v$VERSION to GitHub Releases..."
+
+if command -v gh &>/dev/null; then
+    # Check if this release tag already exists
+    if gh release view "v$VERSION" &>/dev/null 2>&1; then
+        echo ""
+        echo "! Release v$VERSION already exists on GitHub."
+        echo "  If you want to replace it, run:"
+        echo "     gh release delete v$VERSION --yes"
+        echo "  Then re-run ./build.sh"
+        echo ""
+    else
+        gh release create "v$VERSION" \
+            "$ZIP_PATH" \
+            --title "Options Dashboard v$VERSION" \
+            --generate-notes \
+            --repo amit1208levy/optionDashboard
+        echo ""
+        echo "✓ Release v$VERSION published to GitHub."
+        echo "  Users running v<$VERSION will be notified on their next launch"
+        echo "  and can install the update with one click."
+    fi
+else
+    echo ""
+    echo "! GitHub CLI (gh) not found — skipping automatic GitHub release."
+    echo "  The zip was built successfully but users won't see an update prompt"
+    echo "  until it's published."
+    echo ""
+    echo "  Option A — install gh and re-run (recommended):"
+    echo "     brew install gh"
+    echo "     gh auth login"
+    echo "     ./build.sh"
+    echo ""
+    echo "  Option B — publish this build manually now:"
+    echo "     gh release create \"v$VERSION\" \\"
+    echo "         \"$(pwd)/$ZIP_PATH\" \\"
+    echo "         --title \"Options Dashboard v$VERSION\" \\"
+    echo "         --generate-notes \\"
+    echo "         --repo amit1208levy/optionDashboard"
+    echo ""
+    echo "  Option C — via GitHub web UI:"
+    echo "     https://github.com/amit1208levy/optionDashboard/releases/new"
+    echo "     Tag:   v$VERSION"
+    echo "     Asset: $(pwd)/$ZIP_PATH"
+fi

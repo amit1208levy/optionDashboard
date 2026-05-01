@@ -16,7 +16,7 @@ import api
 import strategies as tmpl_mod
 from models import (
     StrategyInstance, unassigned_positions, strategy_performance,
-    transactions_to_closed_lots, merge_history
+    transactions_to_closed_lots, merge_history, template_ytd_pnl_map
 )
 from strategy_card import money, pnl_color
 
@@ -94,9 +94,10 @@ class ActivityImportWorker(QThread):
 class TemplateCard(QFrame):
     use_clicked = pyqtSignal(str)  # template_key
 
-    def __init__(self, tmpl, parent=None):
+    def __init__(self, tmpl, ytd_pnl=None, parent=None):
         super().__init__(parent)
-        self.tmpl = tmpl
+        self.tmpl     = tmpl
+        self.ytd_pnl  = ytd_pnl
         self.setStyleSheet(
             f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
             f"border-radius: 12px; }}"
@@ -116,6 +117,18 @@ class TemplateCard(QFrame):
         )
         top.addWidget(name)
         top.addStretch()
+
+        # YTD P&L chip — only shown when we have realized P&L this year for
+        # this template. Color-coded green / red / muted via pnl_color().
+        if ytd_pnl is not None:
+            ytd_chip = QLabel(f"YTD {money(ytd_pnl, signed=True)}")
+            ytd_chip.setStyleSheet(
+                f"color: {pnl_color(ytd_pnl)}; font-size: 11px; "
+                f"font-weight: bold; border: 1px solid {T.BORDER}; "
+                f"border-radius: 8px; padding: 2px 8px; background: transparent;"
+            )
+            top.addWidget(ytd_chip)
+
         outlook = QLabel(tmpl.outlook)
         outlook.setStyleSheet(
             f"color: {self._outlook_color(tmpl.outlook)}; font-size: 11px; "
@@ -1180,9 +1193,17 @@ class ConfigurePage(QWidget):
         self._clear_layout(self.catalog_grid)
         query = self.search_edit.text() if hasattr(self, "search_edit") else ""
         templates = tmpl_mod.search_templates(query)
+
+        # YTD realized P&L per template, derived from closed-leg history.
+        # Computed once and looked up per card.
+        ytd_map = template_ytd_pnl_map(
+            self.portfolio.history,
+            self.portfolio.current_instances(),
+        )
+
         cols = 2
         for i, t in enumerate(templates):
-            card = TemplateCard(t)
+            card = TemplateCard(t, ytd_pnl=ytd_map.get(t.key))
             card.use_clicked.connect(self._start_new)
             self.catalog_grid.addWidget(card, i // cols, i % cols)
 

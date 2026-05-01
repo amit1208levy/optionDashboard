@@ -10,35 +10,38 @@ import api
 import theme as T
 
 # ── Leg column definitions ───────────────────────────────────────────────────
-# New layout: ⠿ | Ticker | Strike | Exp | P&L | Day | Qty | Open | Extrinsic | Greeks
+# Column order: ⠿ | Qty | Ticker | Exp | DTE | Strike | C/P | P&L | P&L% | Day | Θ$ | DIT | DTE
 
 _BASE_LEG_COLUMNS = [
-    ("",          24),   # drag-handle placeholder (no header text)
-    ("Qty",       72),   # signed contracts (+long / −short), large + colored
-    ("Ticker",    78),   # underlying root + C/P type
-    ("Strike",    72),
-    ("Exp",       82),
-    ("P&L",       90),
-    ("Day",       80),   # day P&L (mark − prior close)
-    ("Premium",   90),   # credit received (short) / debit paid (long) at open
-    ("Extrinsic", 76),   # current time-value of the option
+    ("",       24),   # drag-handle placeholder
+    ("Qty",    50),   # signed qty (+long / −short)
+    ("Ticker", 64),   # underlying root symbol
+    ("Exp",    68),   # expiry "May 14"
+    ("DTE",    44),   # days to expiry
+    ("Strike", 70),   # strike price
+    ("C/P",    32),   # call or put letter
+    ("P&L",    90),   # open P&L $
+    ("P&L%",   68),   # open P&L %
+    ("Day",    82),   # day P&L (mark − prior close)
+    ("Θ$",     66),   # dollar theta
+    ("DIT",    44),   # days in trade
+    ("DTE",    44),   # days to expiry (end)
 ]
 
-# IV removed; only Δ Θ Γ V remain
+# Θ$ is now a fixed column; Δ Γ V remain as optional extras
 _GREEK_COL_DEFS = {
     "delta": ("Δ", 52),
-    "theta": ("Θ", 52),
     "gamma": ("Γ", 52),
     "vega":  ("V", 52),
 }
-_GREEK_ORDER = ["delta", "theta", "gamma", "vega"]
+_GREEK_ORDER = ["delta", "gamma", "vega"]
 
 
 def _active_leg_columns():
     """Return (columns, enabled_greeks) respecting the user's settings."""
     settings = api.load_settings()
-    enabled  = [k for k in settings.get("leg_greeks", ["delta", "theta"])
-                if k in _GREEK_COL_DEFS]   # silently drop 'iv' from old saves
+    enabled  = [k for k in settings.get("leg_greeks", ["delta"])
+                if k in _GREEK_COL_DEFS]   # silently drop 'iv'/'theta' from old saves
     cols = list(_BASE_LEG_COLUMNS)
     for key in _GREEK_ORDER:
         if key in enabled:
@@ -190,12 +193,7 @@ class LegRow(QFrame):
         # ── Data cells ────────────────────────────────────────────────────
         # Color by trade direction: BUY (long) = green, SELL (short) = red.
         side_color = T.GREEN if leg.is_long else T.RED
-        prem_color = (T.GREEN if leg.credit_debit > 0
-                      else T.RED if leg.credit_debit < 0
-                      else T.MUTED)
-
-        day  = _day_pnl_leg(leg)
-        ext  = _extrinsic_value(leg)
+        day = _day_pnl_leg(leg)
 
         # Signed quantity: +N (bought) or −N (sold).  Use unicode minus for
         # cleaner-looking negative numbers.
@@ -205,14 +203,31 @@ class LegRow(QFrame):
         else:
             qty_text = f"{qty_signed:+g}".replace("-", "−")
 
-        # Ticker shows root + C/P (option type stays visible since the row
-        # color now communicates direction instead).
-        type_letter = leg.call_put or ""
-        ticker_text = f"{leg.root or '—'}" + (f" {type_letter}" if type_letter else "")
+        # ── Cell value prep ────────────────────────────────────────────────
+        exp_str    = leg.expires_at.strftime("%b %d") if leg.expires_at else "—"
+        dte_str    = f"{leg.dte}d" if leg.dte is not None else "—"
+        dit_str    = f"{leg.dit}d" if leg.dit is not None else "—"
+        strike_str = f"{leg.strike:g}" if leg.strike else "—"
+        cp_str     = leg.call_put or "—"
+
+        pnl_pct_val = leg.pnl_pct
+        if pnl_pct_val is not None:
+            pnl_pct_str = (f"+{pnl_pct_val:.1f}%" if pnl_pct_val >= 0
+                           else f"−{abs(pnl_pct_val):.1f}%")
+        else:
+            pnl_pct_str = "—"
+
+        from models import _is_future_option, _CONTRACT_MULT
+        theta_mult   = (float(_CONTRACT_MULT.get(leg.root or "", 1))
+                        if _is_future_option(leg.instrument_type) else 100.0)
+        theta_dollar = (leg.theta * leg.quantity * theta_mult * leg.sign
+                        if leg.theta is not None else None)
+        theta_str    = money(theta_dollar, signed=True) if theta_dollar is not None else "—"
+        theta_clr    = pnl_color(theta_dollar) if theta_dollar is not None else T.MUTED
 
         # ── Big signed-qty cell (first, prominent) ────────────────────────
         qty_lbl = QLabel(qty_text)
-        qty_lbl.setFixedWidth(72)
+        qty_lbl.setFixedWidth(50)
         qty_lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         qty_lbl.setStyleSheet(
             f"color: {side_color}; background: transparent; border: none; "
@@ -220,36 +235,53 @@ class LegRow(QFrame):
         )
         h.addWidget(qty_lbl)
 
-        # (text, color, weight, width)
-        base_cells = [
-            (ticker_text,
-             side_color,                        700, 78),
-            (f"${leg.strike:g}" if leg.strike else "—",
-             T.TEXT,                            600, 72),
-            (leg.expires_at.strftime("%b %d %y") if leg.expires_at else "—",
-             T.TEXT_DIM,                        400, 82),
-            (money(leg.pnl, signed=True),
-             pnl_color(leg.pnl),                700, 90),
-            (money(day, signed=True) if day is not None else "—",
-             pnl_color(day) if day is not None else T.MUTED, 600, 80),
-            (money(leg.credit_debit, signed=True),
-             prem_color,                        600, 90),
-            (f"${ext:.3f}" if ext > 0 else "—",
-             T.TEXT_DIM,                        500, 76),
+        # ── Identity columns: Ticker | Exp | DTE | Strike | C/P ─────────────
+        # (text, color, weight, width, font_size)
+        id_cells = [
+            (leg.root or "—", side_color,         800, 64, 12),  # ticker — bold+colored
+            (exp_str,         T.TEXT_DIM,          400, 68, 11),  # expiry — quiet
+            (dte_str,         dte_color(leg.dte),  700, 44, 11),  # DTE — colored
+            (strike_str,      T.TEXT,              800, 70, 13),  # STRIKE — largest
+            (cp_str,          side_color,          800, 32, 13),  # C/P — bold+colored
         ]
-        for text, color, weight, width in base_cells:
+        for text, color, weight, width, fsize in id_cells:
             l = QLabel(text)
             l.setFixedWidth(width)
             l.setStyleSheet(
                 f"color: {color}; background: transparent; border: none; "
-                f"font-size: 12px; font-weight: {weight};"
+                f"font-size: {fsize}px; font-weight: {weight};"
             )
             h.addWidget(l)
 
-        # ── Greek cells ───────────────────────────────────────────────────
+        # Thin vertical rule separating identity from performance
+        sep = QFrame()
+        sep.setFixedWidth(1)
+        sep.setFixedHeight(22)
+        sep.setStyleSheet(f"background: {T.BORDER}; border: none; margin: 0 4px;")
+        h.addWidget(sep)
+
+        # ── Performance columns: P&L | P&L% | Day | Θ$ | DIT | DTE ─────────
+        perf_cells = [
+            (money(leg.pnl, signed=True), pnl_color(leg.pnl),               800, 90, 13),
+            (pnl_pct_str,   pnl_color(pnl_pct_val),                          600, 68, 11),
+            (money(day, signed=True) if day is not None else "—",
+             pnl_color(day) if day is not None else T.MUTED,                  700, 82, 12),
+            (theta_str,     theta_clr,                                        600, 66, 11),
+            (dit_str,       T.TEXT_DIM,                                       400, 44, 10),
+            (dte_str,       dte_color(leg.dte),                               600, 44, 10),
+        ]
+        for text, color, weight, width, fsize in perf_cells:
+            l = QLabel(text)
+            l.setFixedWidth(width)
+            l.setStyleSheet(
+                f"color: {color}; background: transparent; border: none; "
+                f"font-size: {fsize}px; font-weight: {weight};"
+            )
+            h.addWidget(l)
+
+        # ── Greek cells (optional extras) ─────────────────────────────────
         greek_vals = {
             "delta": _fmt_greek(leg.delta),
-            "theta": _fmt_greek(leg.theta),
             "gamma": _fmt_greek(leg.gamma),
             "vega":  _fmt_greek(leg.vega),
         }
@@ -260,7 +292,7 @@ class LegRow(QFrame):
                 l.setFixedWidth(width)
                 l.setStyleSheet(
                     f"color: {T.TEXT_DIM}; background: transparent; border: none; "
-                    f"font-size: 12px; font-weight: 400;"
+                    f"font-size: 11px; font-weight: 500;"
                 )
                 h.addWidget(l)
 
@@ -1522,8 +1554,11 @@ class StrategyDetailPage(QWidget):
         grid = QGridLayout()
         grid.setHorizontalSpacing(18)
         grid.setVerticalSpacing(4)
+        ct = perf.get("closed_trades", perf["closed_legs"])
+        cl = perf["closed_legs"]
+        legs_note = f" ({cl} legs)" if cl != ct else ""
         items = [
-            ("Closed legs", str(perf["closed_legs"])),
+            ("Closed trades", f"{ct}{legs_note}"),
             ("Total P&L",   money(perf["total_pnl"], signed=True)),
             ("Win rate",    f"{perf['win_rate']:.0f}%"),
             ("Avg DIT",     f"{perf['avg_dit']:.0f}d"

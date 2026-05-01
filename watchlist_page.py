@@ -468,7 +468,39 @@ class PositionSizerDialog(QDialog):
         ])
         self.strategy_combo.currentIndexChanged.connect(self._recalc)
         self.strategy_combo.currentIndexChanged.connect(self._auto_fetch_premium)
+        self.strategy_combo.currentIndexChanged.connect(self._update_width_visibility)
         lay.addWidget(self.strategy_combo)
+
+        # ── Spread width — only visible for "Iron Condor / Spread" ───────────
+        self._width_lbl_w = self._lbl_widget(
+            "Spread width  (points/dollars per share — e.g. 5 for a $5-wide spread)"
+        )
+        lay.addWidget(self._width_lbl_w)
+        width_row = QHBoxLayout()
+        self.width_spin = QDoubleSpinBox()
+        self.width_spin.setRange(0.01, 99_999)
+        self.width_spin.setDecimals(2)
+        self.width_spin.setSingleStep(1.0)
+        # Default: 1% of underlying price, rounded to nearest $1, min $1
+        default_width = max(round(price * 0.01), 1.0)
+        self.width_spin.setValue(default_width)
+        self.width_spin.setStyleSheet(
+            f"QDoubleSpinBox {{ background: {T.CARD}; color: {T.TEXT}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 4px 8px; }}"
+        )
+        self.width_spin.valueChanged.connect(self._recalc)
+        width_row.addWidget(self.width_spin)
+        self._width_note = QLabel()
+        self._width_note.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none; margin-left: 8px;"
+        )
+        width_row.addWidget(self._width_note)
+        width_row.addStretch()
+        self._width_row_w = QWidget()
+        self._width_row_w.setLayout(width_row)
+        lay.addWidget(self._width_row_w)
+        # Initially hidden (spread is not the default selection)
+        self._update_width_visibility(self.strategy_combo.currentIndex())
 
         self._lbl(lay, "Max capital allocation  (% of NLV)")
         pct_row = QHBoxLayout()
@@ -669,12 +701,25 @@ class PositionSizerDialog(QDialog):
         lay.addWidget(s)
 
     def _lbl(self, lay, text):
+        l = self._lbl_widget(text)
+        lay.addWidget(l)
+
+    def _lbl_widget(self, text):
+        """Return a styled label widget (without adding it to a layout)."""
         l = QLabel(text)
         l.setStyleSheet(
             f"color: {T.LABEL}; font-size: 11px; font-weight: bold; "
             f"border: none; margin-top: 4px;"
         )
-        lay.addWidget(l)
+        return l
+
+    def _update_width_visibility(self, idx: int):
+        """Show the spread-width row only when 'Iron Condor / Spread' is selected."""
+        is_spread = (idx == 1)
+        self._width_lbl_w.setVisible(is_spread)
+        self._width_row_w.setVisible(is_spread)
+        if is_spread:
+            self._recalc()
 
     # Strategy labels for each combo index (human-readable names for UI)
     _STRAT_LABELS = {
@@ -703,9 +748,14 @@ class PositionSizerDialog(QDialog):
         # plus the premium received (adds to cash required).
         naked_cap = notional * 0.20 - otm_disc + cp_dollars
         if idx == 1:
-            # Defined-risk spread: width × multiplier (max loss per spread)
-            width = max((0.5 - delta_frac) * S * 0.20, S * 0.02)
-            return width * mult
+            # Defined-risk spread: BP = (spread_width − credit_received) × multiplier
+            # This is the actual max loss, exactly what the broker holds as margin.
+            # width_spin is in the same units as the premium (points/$ per share).
+            width_pts  = float(self.width_spin.value())
+            credit_pts = cp_dollars / mult   # credit in points (undo the mult)
+            bp = max(width_pts - credit_pts, 0.0) * mult
+            # Sanity floor: at minimum hold 10% of the credit to avoid division issues.
+            return max(bp, cp_dollars * 0.10)
         return max(naked_cap, cp_dollars * 1.5)
 
     def _recalc(self):
@@ -754,12 +804,23 @@ class PositionSizerDialog(QDialog):
         else:
             self.total_prem_lbl.setText("—")
 
-        # "Buying power per X" — X changes with strategy, so the label is
-        # clearer than the generic "per contract"
-        self.capital_lbl.setText(
-            f"Buying power per {unit_s}: ${cap_per:,.0f}   ·   "
-            f"Total BP: ${total_cap:,.0f}"
-        )
+        # "Buying power per X" — for spreads, show the width-minus-credit breakdown
+        if idx == 1:
+            width_pts  = float(self.width_spin.value())
+            mult_      = float(self.mult_spin.value()) or 100
+            width_dol  = width_pts * mult_
+            self._width_note.setText(
+                f"width ${width_dol:,.0f}  −  credit ${cp * mult_:,.2f}  =  "
+                f"BP ${cap_per:,.0f} / spread"
+            )
+            self.capital_lbl.setText(
+                f"Buying power per spread: ${cap_per:,.0f}   ·   Total BP: ${total_cap:,.0f}"
+            )
+        else:
+            self.capital_lbl.setText(
+                f"Buying power per {unit_s}: ${cap_per:,.0f}   ·   "
+                f"Total BP: ${total_cap:,.0f}"
+            )
         self.bp_lbl.setText(
             f"{pct_used:.1f}% of NLV used   ·   Remaining BP: ${remaining:,.0f}"
         )

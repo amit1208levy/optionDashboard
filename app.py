@@ -637,6 +637,37 @@ class AccountSettingsDialog(QDialog):
         }
 
 
+# ── IBKR late-connect probe ──────────────────────────────────────────────────
+
+class _IBKRProbeWorker(QThread):
+    """
+    Background TCP probe that detects IBKR Gateway *after* app startup.
+
+    The app may have launched before the user started Gateway.  After each
+    data refresh we fire this off-thread so a 200 ms TCP timeout per port
+    doesn't block the GUI.  On success it emits ``found(port)``; when all
+    ports fail it emits ``done()`` so the caller can apply back-off.
+    """
+    found = pyqtSignal(int)   # first live port
+    done  = pyqtSignal()      # all ports unreachable
+
+    def __init__(self, host: str, ports: list):
+        super().__init__()
+        self.host  = host
+        self.ports = ports
+
+    def run(self):
+        import socket
+        for port in self.ports:
+            try:
+                with socket.create_connection((self.host, port), timeout=0.2):
+                    self.found.emit(port)
+                    return
+            except (OSError, socket.timeout):
+                continue
+        self.done.emit()
+
+
 # ── Portfolio screen ─────────────────────────────────────────────────────────
 
 class PortfolioScreen(QWidget):
@@ -679,6 +710,14 @@ class PortfolioScreen(QWidget):
         self._year_start_cache = {}    # {acct_num: jan1_net_liq} — fetched once per session
         self._pnl_cache        = {}    # {acct_num: (timestamp, result)} — 60s TTL
 
+        # Late-connect IBKR probe state.
+        # Every _on_data() call increments _probe_skip_cnt; a probe fires
+        # once it reaches _probe_skips.  On each failed probe we double the
+        # interval (1 → 2 → 4 → 8 refreshes, i.e. 15 s → 2 min max).
+        self._probe_worker   = None
+        self._probe_skips    = 1   # fire on the 1st refresh, then back off
+        self._probe_skip_cnt = 0
+
         self.strategies_all = api.load_strategies()   # {acct_num: [entries]}
         self.history_all    = api.load_history()      # {acct_num: [entries]}
         # One-time fix: history imported before the multiplier fix had P&L stored
@@ -699,15 +738,15 @@ class PortfolioScreen(QWidget):
 
         root.addWidget(self._build_header(creds))
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
         body_w = QWidget()
         body_w.setStyleSheet(f"background: {T.BG};")
         self.body = QVBoxLayout(body_w)
         self.body.setContentsMargins(32, 24, 32, 32)
         self.body.setSpacing(14)
-        scroll.setWidget(body_w)
-        root.addWidget(scroll)
+        self._scroll_area.setWidget(body_w)
+        root.addWidget(self._scroll_area)
 
         self.body.addLayout(self._build_balance_row())
         self.body.addSpacing(4)
@@ -1076,6 +1115,118 @@ class PortfolioScreen(QWidget):
                 f"font-size: 11px; font-weight: bold; }}"
                 f"QPushButton:hover {{ background: {T.GREEN_D}; color: white; }}"
             )
+
+    # ── IBKR late-connect probe ──────────────────────────────────────────────
+
+    def _start_ibkr_probe(self):
+        """
+        Fire a background TCP probe for IBKR Gateway.  Called after each
+        data refresh so the app detects a Gateway that came up *after* launch.
+
+        Guards:
+          • Already connected  → no-op.
+          • Another probe in flight → no-op (never double-queue).
+          • Back-off counter not reached yet → increment and return.
+          • User explicitly disabled IBKR → no-op.
+        """
+        # Already wired up — nothing to do.
+        prov = self._ibkr_provider()
+        if prov is not None and prov.is_connected():
+            return
+        # Probe still running from the previous refresh.
+        if self._probe_worker is not None and self._probe_worker.isRunning():
+            return
+        # Exponential back-off: only probe every _probe_skips refreshes.
+        self._probe_skip_cnt += 1
+        if self._probe_skip_cnt < self._probe_skips:
+            return
+        self._probe_skip_cnt = 0
+
+        settings   = api.load_settings() or {}
+        ibkr_cfg   = settings.get("ibkr") or {}
+        if ibkr_cfg.get("enabled") is False:
+            return   # user explicitly disabled IBKR
+
+        host        = ibkr_cfg.get("host") or "127.0.0.1"
+        custom_port = ibkr_cfg.get("port")
+        DEFAULT_PORTS = [4001, 4002, 7496, 7497]
+        seen: set = set()
+        ports: list = []
+        for p in [custom_port, *DEFAULT_PORTS]:
+            try:
+                p = int(p) if p else None
+            except (TypeError, ValueError):
+                p = None
+            if p and p not in seen:
+                ports.append(p)
+                seen.add(p)
+
+        self._probe_worker = _IBKRProbeWorker(host, ports)
+        self._probe_worker.found.connect(self._on_ibkr_probe_found)
+        self._probe_worker.done.connect(self._on_ibkr_probe_done)
+        self._probe_worker.start()
+
+    def _on_ibkr_probe_found(self, port: int):
+        """
+        Gateway just became reachable on ``port``.  Upgrade the quotes
+        provider from TastyTrade-only to Hybrid (IBKR primary + Tasty
+        fallback) without disturbing any live session in progress.
+        """
+        # Race guard: another path (e.g. settings save) may have wired IBKR already.
+        if self._ibkr_provider() is not None:
+            return
+
+        try:
+            from quotes_ibkr import IBKRQuotesProvider
+        except ImportError:
+            print("[ibkr-probe] Gateway found on port {port} but ib_insync "
+                  "is not installed.  Install with: pip3 install ib_insync",
+                  flush=True)
+            return
+
+        settings   = api.load_settings() or {}
+        ibkr_cfg   = settings.get("ibkr") or {}
+        host       = ibkr_cfg.get("host") or "127.0.0.1"
+        client_id  = int(ibkr_cfg.get("client_id") or 42)
+        mdt        = int(ibkr_cfg.get("market_data_type") or 1)
+
+        try:
+            ibkr_prov = IBKRQuotesProvider(
+                host=host, port=port,
+                client_id=client_id, market_data_type=mdt,
+            )
+        except Exception as exc:
+            print(f"[ibkr-probe] Gateway on port {port} — connect failed: {exc}",
+                  flush=True)
+            return
+
+        # Replace the Tasty-only provider with Hybrid.
+        tasty       = self.quotes
+        self.quotes = HybridQuotesProvider(primary=ibkr_prov, fallback=tasty)
+
+        kind = {4001: "Gateway (live)", 4002: "Gateway (paper)",
+                7496: "TWS (live)",     7497: "TWS (paper)"}.get(port, f"port {port}")
+        print(f"[ibkr-probe] late-connected to {kind} — switching to IBKR quotes",
+              flush=True)
+
+        # Reset back-off so the probe fires promptly on the next cycle.
+        self._probe_skips    = 1
+        self._probe_skip_cnt = 0
+
+        self._update_ibkr_pill()
+        self._update_streamer_symbols()
+        # Trigger an immediate refresh so the next fetch uses IBKR.
+        self._load_data()
+
+    def _on_ibkr_probe_done(self):
+        """
+        All ports failed — Gateway still not up.  Double the back-off
+        interval (1 → 2 → 4 → 8 refreshes) so we slow down probing as
+        time passes, capping at ~2 minutes on the 15 s live timer.
+        """
+        self._probe_skips = min(self._probe_skips * 2, 8)
+
+    # ── Live toggle ──────────────────────────────────────────────────────────
 
     def _toggle_live(self, on):
         if on:
@@ -1595,6 +1746,10 @@ class PortfolioScreen(QWidget):
         # Refresh IBKR pill now that we know the connection state.
         self._update_ibkr_pill()
 
+        # If Gateway isn't connected yet, probe for it in the background so the
+        # app picks it up automatically when the user starts Gateway after launch.
+        self._start_ibkr_probe()
+
         # Detect closures + update snapshots for every account
         self._process_snapshots()
         self._check_exit_alerts()
@@ -1605,7 +1760,68 @@ class PortfolioScreen(QWidget):
         self._refresh_account_combo()
         if self._accounts:
             idx = max(0, self.account_combo.currentIndex())
-            self._render(self._accounts[idx])
+            acct = self._accounts[idx]
+            if self.isVisible():
+                # Portfolio is the active screen — re-render in place while
+                # preserving any expanded cards and the scroll position.
+                self._render_keeping_state(acct)
+            else:
+                # User is on detail / watchlist / risk page — don't disrupt
+                # their view.  Store the fresh data and render when they return.
+                self._pending_acct = acct
+
+    # ── State-preserving render ──────────────────────────────────────────────
+
+    def _render_keeping_state(self, acct):
+        """
+        Re-render the portfolio card list while preserving:
+          • which strategy cards were expanded (showing legs inline)
+          • the vertical scroll position of the main scroll area
+
+        Called on every live-mode refresh so the user's view isn't
+        jarred back to the top with all cards collapsed every 15 seconds.
+        """
+        # Capture expanded strategy IDs before the wipe.
+        expanded_my = {
+            getattr(c.strategy, "id", None) or c.strategy.name
+            for c in self._strategy_cards if c._expanded
+        }
+        expanded_ua = {
+            getattr(c.strategy, "id", None) or c.strategy.name
+            for c in self._ua_cards if c._expanded
+        }
+
+        # Capture scroll position.
+        sb = self._scroll_area.verticalScrollBar()
+        scroll_val = sb.value()
+
+        self._render(acct)
+
+        # Restore expanded state on newly-created cards.
+        for card in self._strategy_cards:
+            key = getattr(card.strategy, "id", None) or card.strategy.name
+            if key in expanded_my:
+                card._set_expanded(True)
+        for card in self._ua_cards:
+            key = getattr(card.strategy, "id", None) or card.strategy.name
+            if key in expanded_ua:
+                card._set_expanded(True)
+
+        # Restore scroll — defer one event loop so Qt has laid out the new
+        # widgets before we move the scrollbar.
+        QTimer.singleShot(0, lambda: sb.setValue(scroll_val))
+
+    def showEvent(self, event):
+        """
+        Flush any pending re-render that was deferred because the portfolio
+        was off-screen (user was on detail / watchlist / risk page).
+        """
+        super().showEvent(event)
+        acct = getattr(self, "_pending_acct", None)
+        if acct is not None:
+            self._pending_acct = None
+            self._render(acct)   # coming back from another page — no need to
+                                  # preserve state (there's nothing open to save)
 
     def _process_snapshots(self):
         now_iso = datetime.now(timezone.utc).isoformat()

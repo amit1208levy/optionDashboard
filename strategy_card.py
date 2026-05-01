@@ -404,24 +404,19 @@ class StrategyCard(QFrame):
         self._outer_lay.addWidget(body)
 
     def _build_leg_card(self, leg):
-        """Pretty per-leg detail card — headline on top, Greeks row below."""
-        from models import _is_future_option
+        """Compact single-row leg card: Qty|Exp|DTE|Strike|C/P|P&L|P&L%|Day|Θ$|DIT|DTE."""
+        from models import _is_future_option, _CONTRACT_MULT
 
         card = QFrame()
         card.setStyleSheet(
             f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
-            f"border-radius: 10px; }}"
+            f"border-radius: 8px; }}"
         )
-        cl = QVBoxLayout(card)
-        cl.setContentsMargins(14, 10, 14, 12)
-        cl.setSpacing(6)
+        row = QHBoxLayout(card)
+        row.setContentsMargins(12, 7, 12, 7)
+        row.setSpacing(10)
 
-        # ── Top line: signed-qty badge · type · strike · expiry ───────────
-        top = QHBoxLayout()
-        top.setSpacing(10)
-
-        # Buy = green, Sell = red.  Signed quantity is the most prominent
-        # element — replaces the old separate L/S badge + ×N chip.
+        # ── Direction-colored signed qty ───────────────────────────────────
         side_color = T.GREEN if leg.is_long else T.RED
         qty_signed = leg.sign * leg.quantity
         if abs(qty_signed - round(qty_signed)) < 1e-9:
@@ -429,120 +424,80 @@ class StrategyCard(QFrame):
         else:
             qty_text = f"{qty_signed:+g}".replace("-", "−")
         qty_lbl = QLabel(qty_text)
-        qty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         qty_lbl.setStyleSheet(
-            f"color: {side_color}; background: transparent; "
-            f"border: none; font-size: 19px; font-weight: 800; "
-            f"min-width: 44px; padding-right: 4px;"
+            f"color: {side_color}; font-size: 16px; font-weight: 800; "
+            f"background: transparent; border: none; min-width: 32px;"
         )
-        top.addWidget(qty_lbl)
+        row.addWidget(qty_lbl)
 
-        # "Put 450" / "Call 5800" / "Shares" / "Future"
-        if leg.is_option and leg.strike:
-            headline = f"{leg.type_label}  {leg.strike:g}"
+        def _cell(text, color, weight=500, size=11):
+            l = QLabel(text)
+            l.setStyleSheet(
+                f"color: {color}; font-size: {size}px; font-weight: {weight}; "
+                f"background: transparent; border: none;"
+            )
+            return l
+
+        # ── Identity: Ticker | Exp | DTE | Strike | C/P ───────────────────
+        row.addWidget(_cell(leg.root or "—", side_color, 800, 12))   # ticker — bold
+
+        exp_str = leg.expires_at.strftime("%b %d") if leg.expires_at else "—"
+        row.addWidget(_cell(exp_str, T.TEXT_DIM, 400, 11))             # expiry — quiet
+
+        dte_str = f"{leg.dte}d" if leg.dte is not None else "—"
+        row.addWidget(_cell(dte_str, dte_color(leg.dte), 700, 11))    # DTE — colored
+
+        strike_str = f"{leg.strike:g}" if leg.strike else "—"
+        row.addWidget(_cell(strike_str, T.TEXT, 800, 13))              # STRIKE — largest
+
+        cp_str = leg.call_put or "—"
+        row.addWidget(_cell(cp_str, side_color, 800, 13))              # C/P — bold+colored
+
+        # Thin vertical rule separating identity from performance
+        sep = QFrame()
+        sep.setFixedWidth(1)
+        sep.setFixedHeight(18)
+        sep.setStyleSheet(f"background: {T.BORDER}; border: none; margin: 0 2px;")
+        row.addWidget(sep)
+
+        # ── Performance: P&L | P&L% | Day | Θ$ | DIT | DTE ──────────────
+        row.addWidget(_cell(money(leg.pnl, signed=True),               # P&L — very bold
+                            pnl_color(leg.pnl), 800, 13))
+
+        pnl_pct = leg.pnl_pct
+        if pnl_pct is not None:
+            pnl_pct_str = (f"+{pnl_pct:.1f}%" if pnl_pct >= 0
+                           else f"−{abs(pnl_pct):.1f}%")
         else:
-            headline = leg.type_label
-        name_lbl = QLabel(headline)
-        name_lbl.setStyleSheet(
-            f"color: {side_color}; font-size: 14px; font-weight: bold; "
-            f"border: none; background: transparent;"
-        )
-        top.addWidget(name_lbl)
+            pnl_pct_str = "—"
+        row.addWidget(_cell(pnl_pct_str, pnl_color(pnl_pct), 600, 11))
 
-        # Expiry + DTE + DIT
-        if leg.is_option and leg.expires_at:
-            exp_text = leg.expires_at.strftime("%b %d %Y")
-            detail = f"  {exp_text}"
-            if leg.dte is not None:
-                detail += f"  ·  {leg.dte}d left"
-            if leg.dit is not None:
-                detail += f"  ·  {leg.dit}d held"
-            exp_lbl = QLabel(detail)
-            exp_lbl.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
-            )
-            top.addWidget(exp_lbl)
-
-        top.addStretch()
-
-        # Right side: P&L (big) + % on one block
-        pnl  = leg.pnl
-        pnl_pct_lbl = QLabel()
-        pnl_val_lbl = QLabel(money(pnl, signed=True))
-        pnl_val_lbl.setStyleSheet(
-            f"color: {pnl_color(pnl)}; font-size: 15px; font-weight: bold; "
-            f"border: none; background: transparent;"
-        )
-        pnl_val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        top.addWidget(pnl_val_lbl)
-
-        cl.addLayout(top)
-
-        # ── Bottom line: Entry → Mark, Day P&L, Greeks, IV ────────────────
-        bot = QHBoxLayout()
-        bot.setSpacing(14)
-
-        # Entry → Mark with arrow
-        arrow = "↑" if (leg.mark_price > leg.avg_open_price) else ("↓" if leg.mark_price < leg.avg_open_price else "·")
-        arrow_c = T.GREEN if (leg.mark_price > leg.avg_open_price) else (T.RED if leg.mark_price < leg.avg_open_price else T.MUTED)
-        price_lbl = QLabel(
-            f"Entry ${leg.avg_open_price:,.2f}   "
-            f"<span style='color:{arrow_c}'>{arrow}</span>   "
-            f"Mark ${leg.mark_price:,.2f}"
-        )
-        price_lbl.setStyleSheet(
-            f"color: {T.TEXT_DIM}; font-size: 11px; border: none; background: transparent;"
-        )
-        bot.addWidget(price_lbl)
-
-        # Day P&L pill
         if leg.close_price and leg.close_price > 0 and leg.mark_price:
-            leg_day = leg.sign * leg.quantity * leg.multiplier \
-                      * (leg.mark_price - leg.close_price)
-            day_lbl = QLabel(f"Day {money(leg_day, signed=True)}")
-            day_lbl.setStyleSheet(
-                f"color: {pnl_color(leg_day)}; font-size: 11px; "
-                f"font-weight: bold; border: none; background: transparent;"
-            )
-            bot.addWidget(day_lbl)
+            day_pnl = (leg.sign * leg.quantity * leg.multiplier
+                       * (leg.mark_price - leg.close_price))
+        else:
+            day_pnl = None
+        day_str = money(day_pnl, signed=True) if day_pnl is not None else "—"
+        row.addWidget(_cell(day_str,
+                            pnl_color(day_pnl) if day_pnl is not None else T.MUTED, 700, 12))
 
-        bot.addStretch()
+        if _is_future_option(leg.instrument_type):
+            theta_mult = float(_CONTRACT_MULT.get(leg.root or "", 1))
+        else:
+            theta_mult = 100.0
+        theta_dollar = (leg.theta * leg.quantity * theta_mult * leg.sign
+                        if leg.theta is not None else None)
+        theta_str = money(theta_dollar, signed=True) if theta_dollar is not None else "—"
+        row.addWidget(_cell(theta_str,
+                            pnl_color(theta_dollar) if theta_dollar is not None else T.MUTED,
+                            600, 11))
 
-        # Greeks (only for options) — dollar multiplier from our own table
-        if leg.is_option:
-            from models import _CONTRACT_MULT
-            if _is_future_option(leg.instrument_type):
-                mult = float(_CONTRACT_MULT.get(leg.root or "", 1))
-            else:
-                mult = 100.0
-            def _g(label, raw, color=T.TEXT_DIM):
-                if raw is None:
-                    return None
-                val = raw * leg.quantity * mult * leg.sign
-                g = QLabel(f"<span style='color:{T.MUTED}'>{label}</span> "
-                           f"<b>{_fmt_greek(val)}</b>")
-                g.setStyleSheet(
-                    f"color: {color}; font-size: 11px; border: none; background: transparent;"
-                )
-                return g
+        dit_str = f"{leg.dit}d" if leg.dit is not None else "—"
+        row.addWidget(_cell(dit_str, T.TEXT_DIM, 400, 10))
 
-            for g in (_g("Δ", leg.delta),
-                      _g("Γ", leg.gamma),
-                      _g("Θ", leg.theta, pnl_color(leg.theta * leg.sign) if leg.theta else T.MUTED),
-                      _g("V", leg.vega)):
-                if g is not None:
-                    bot.addWidget(g)
+        row.addWidget(_cell(dte_str, dte_color(leg.dte), 600, 10))
 
-            if leg.iv is not None:
-                iv_lbl = QLabel(
-                    f"<span style='color:{T.MUTED}'>IV</span> <b>{leg.iv*100:.0f}%</b>"
-                )
-                iv_lbl.setStyleSheet(
-                    f"color: {T.TEXT_DIM}; font-size: 11px; border: none; background: transparent;"
-                )
-                bot.addWidget(iv_lbl)
-
-        cl.addLayout(bot)
+        row.addStretch()
         return card
 
     def _chip(self, label, value, color):
