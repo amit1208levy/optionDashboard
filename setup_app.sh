@@ -88,6 +88,15 @@ cat > "$LAUNCHER/Contents/Info.plist" << 'PLIST'
     <key>LSMinimumSystemVersion</key>  <string>10.15</string>
     <key>NSHighResolutionCapable</key> <true/>
     <key>NSRequiresAquaSystemAppearance</key> <false/>
+    <!-- Prefer native arch so PyQt6 (installed as arm64 on Apple Silicon)
+         loads correctly. Without this macOS sometimes runs the launcher
+         under Rosetta (x86_64), which can't dlopen arm64 dylibs. -->
+    <key>LSArchitecturePriority</key>
+    <array>
+        <string>arm64</string>
+        <string>x86_64</string>
+    </array>
+    <key>LSRequiresNativeExecution</key> <true/>
 </dict>
 </plist>
 PLIST
@@ -126,12 +135,13 @@ echo "Using python: $PY" >> "$LOG"
 
 cd "$REPO" || { echo "ERROR: cd failed" >> "$LOG"; exit 1; }
 echo "CWD: $(pwd)" >> "$LOG"
-echo "Launching python3 app.py..." >> "$LOG"
 
-# Run python in foreground. Append all output to log. NO exec, NO pipefail —
-# both have caused early-exit bugs. The .app's PID stays as this shell, and
-# Python is its child. macOS keeps the dock icon visible until python exits.
-"$PY" app.py >>"$LOG" 2>&1
+# Force python to run under the kernel's native arch. Otherwise the .app
+# can launch under Rosetta (x86_64), and PyQt6 — installed as arm64 by pip
+# — will fail to dlopen with "incompatible architecture".
+ARCH="$(uname -m)"
+echo "Launching python3 app.py under arch=$ARCH..." >> "$LOG"
+arch -"$ARCH" "$PY" app.py >>"$LOG" 2>&1
 EC=$?
 echo "python3 exited with code $EC at $(date)" >> "$LOG"
 
