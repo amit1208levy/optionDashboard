@@ -235,9 +235,14 @@ class StrategyCard(QFrame):
             "Open P&L",
             money(strategy.pnl, signed=True),
             pnl_color(strategy.pnl),
-            sub=pct(strategy.pnl_pct),
             is_pnl=True,
-            width=110,
+            width=100,
+        ))
+        h.addWidget(self._stat(
+            "P&L %",
+            pct(strategy.pnl_pct),
+            pnl_color(strategy.pnl_pct),
+            width=72,
         ))
 
         # ── YTD and All-Time P&L (open + realized history) ─────────────────
@@ -254,8 +259,13 @@ class StrategyCard(QFrame):
                 "P&L YTD",
                 money(ytd_total, signed=True),
                 pnl_color(ytd_total),
-                sub=pct(ytd_pct) if ytd_pct is not None else None,
-                width=110,
+                width=100,
+            ))
+            h.addWidget(self._stat(
+                "YTD %",
+                pct(ytd_pct) if ytd_pct is not None else "—",
+                pnl_color(ytd_pct) if ytd_pct is not None else T.MUTED,
+                width=72,
             ))
             # Hide All Time when it equals YTD (no closed legs from prior years).
             if abs(all_total - ytd_total) > 0.01:
@@ -263,8 +273,13 @@ class StrategyCard(QFrame):
                     "All Time",
                     money(all_total, signed=True),
                     pnl_color(all_total),
-                    sub=pct(all_pct) if all_pct is not None else None,
-                    width=110,
+                    width=100,
+                ))
+                h.addWidget(self._stat(
+                    "All %",
+                    pct(all_pct) if all_pct is not None else "—",
+                    pnl_color(all_pct) if all_pct is not None else T.MUTED,
+                    width=72,
                 ))
 
         # Cache values for the parent's sort logic — exposes computed numbers
