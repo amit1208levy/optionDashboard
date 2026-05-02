@@ -37,16 +37,16 @@ def _f(v):
 # single warm pop (rose) for contrast.  Avoids the saturated orange/lime/cyan
 # that clashed with the rest of the dashboard's slate-purple look.
 _PALETTE = [
-    T.ACCENT,    # #a78bfa — violet-400 (matches header / buttons)
-    T.TEAL,      # #2dd4bf — teal-400
-    "#818cf8",   # indigo-400
-    T.BLUE,      # #60a5fa — blue-400
-    T.YELLOW,    # #fbbf24 — amber-400 (warm pop)
-    "#5eead4",   # teal-300 (lighter sibling)
-    "#38bdf8",   # sky-400
-    "#c4b5fd",   # violet-300 (lighter purple)
-    T.GREEN,     # #4ade80 — green-400
-    "#f472b6",   # pink-400 (second warm pop)
+    "#6d28d9",   # violet-700  (deep purple — primary)
+    "#0f766e",   # teal-700
+    "#4338ca",   # indigo-700
+    "#1d4ed8",   # blue-700
+    "#b45309",   # amber-700
+    "#0d9488",   # teal-600
+    "#0369a1",   # sky-700
+    "#7c3aed",   # violet-600
+    "#15803d",   # green-700
+    "#be185d",   # pink-700
 ]
 
 def _style_ax(ax, xlabel: str = "", ylabel: str = ""):
@@ -603,7 +603,7 @@ class RiskPage(QWidget):
         )
         inner.addWidget(title_lbl)
 
-        canvas = _make_canvas(width_px=380, height_px=280)
+        canvas = _make_canvas(width_px=460, height_px=280)
         canvas.setFixedHeight(280)
         # Let scroll-wheel events bubble up to the page scroll area
         canvas.wheelEvent = lambda ev: ev.ignore()
@@ -615,6 +615,8 @@ class RiskPage(QWidget):
         fig = canvas.figure
         fig.clear()
         fig.patch.set_facecolor(T.CARD)
+        # Leave the right ~45% of the figure for the legend; pie sits on the left.
+        fig.subplots_adjust(left=0.0, right=0.55, top=0.98, bottom=0.02)
         ax = fig.add_subplot(111)
         ax.set_facecolor(T.CARD)
 
@@ -630,21 +632,21 @@ class RiskPage(QWidget):
             counterclock=False,
             wedgeprops={"edgecolor": T.CARD, "linewidth": 1.5},
             pctdistance=0.75,
-            textprops={"color": "white", "fontsize": 8, "fontweight": "bold"},
+            textprops={"color": "white", "fontsize": 9, "fontweight": "bold"},
         )
         ax.axis("equal")
 
-        # Right-side legend
+        # Right-side legend — colored swatches + label + percentage.
         legend_labels = [
             f"{lbl}  ·  {v/total*100:.1f}%"
             for lbl, v in zip(labels, values)
         ]
         ax.legend(
             wedges, legend_labels,
-            loc="center left", bbox_to_anchor=(1.02, 0.5),
-            frameon=False, fontsize=8,
-            labelcolor=T.TEXT_DIM,
-            handlelength=1.2, handletextpad=0.6,
+            loc="center left", bbox_to_anchor=(1.05, 0.5),
+            frameon=False, fontsize=9,
+            labelcolor=T.TEXT,
+            handlelength=1.4, handletextpad=0.7,
         )
         canvas.draw()
 
