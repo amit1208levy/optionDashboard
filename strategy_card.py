@@ -65,11 +65,12 @@ class StrategyCard(QFrame):
     clicked        = pyqtSignal(object)   # strategy
     hide_requested = pyqtSignal(object)   # strategy — user clicked hide
 
-    def __init__(self, strategy, parent=None, metrics=None, hidden=False):
+    def __init__(self, strategy, parent=None, metrics=None, hidden=False, history=None):
         super().__init__(parent)
         self.strategy = strategy
         self.metrics = metrics or {}
         self.is_hidden = bool(hidden)
+        self.history = history or []
         self._pnl_val_lbl = None   # QLabel — set by _stat() when is_pnl=True
         self._pnl_pct_lbl = None   # QLabel for pct sub-label
         self._expanded  = False
@@ -212,15 +213,50 @@ class StrategyCard(QFrame):
             width=110,
         ))
 
+        # ── YTD and All-Time P&L (open + realized history) ─────────────────
+        from models import strategy_pnl_summary
+        sid = getattr(strategy, "id", None)
+        summary = strategy_pnl_summary(sid, self.history, strategy) if sid else None
+        if summary is not None:
+            ytd_total = summary["total_ytd"]
+            all_total = summary["total_all"]
+            ytd_real  = summary["realized_ytd"]
+            all_real  = summary["realized_all"]
+
+            # Sub-label shows how much of the total came from closed trades —
+            # so the user can tell at a glance whether YTD/All-Time is being
+            # carried by current open positions or by realized history.
+            ytd_sub = (f"realized {money(ytd_real, signed=True)}"
+                       if ytd_real else None)
+            all_sub = (f"realized {money(all_real, signed=True)}"
+                       if all_real else None)
+
+            h.addWidget(self._stat(
+                "P&L YTD",
+                money(ytd_total, signed=True),
+                pnl_color(ytd_total),
+                sub=ytd_sub,
+                width=120,
+            ))
+            h.addWidget(self._stat(
+                "All Time",
+                money(all_total, signed=True),
+                pnl_color(all_total),
+                sub=all_sub,
+                width=120,
+            ))
+
         # Cache values for the parent's sort logic — exposes computed numbers
         # without re-deriving them in app.py.
         self._sort_values = {
-            "dte":   float(strategy.dte) if strategy.dte is not None else None,
-            "pop":   float(pop) if pop is not None else None,
-            "delta": float(nd) if nd is not None else None,
-            "theta": float(nt) if nt is not None else None,
-            "day":   float(day_pnl) if day_pnl else 0.0,
-            "pnl":   float(strategy.pnl) if strategy.pnl is not None else 0.0,
+            "dte":      float(strategy.dte) if strategy.dte is not None else None,
+            "pop":      float(pop) if pop is not None else None,
+            "delta":    float(nd) if nd is not None else None,
+            "theta":    float(nt) if nt is not None else None,
+            "day":      float(day_pnl) if day_pnl else 0.0,
+            "pnl":      float(strategy.pnl) if strategy.pnl is not None else 0.0,
+            "ytd":      float(summary["total_ytd"]) if summary else 0.0,
+            "all_time": float(summary["total_all"]) if summary else 0.0,
         }
 
         self._chevron = QLabel("›")

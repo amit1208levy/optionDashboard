@@ -1138,6 +1138,52 @@ def strategy_performance(strategy_id, history, capital_req=None):
     }
 
 
+def strategy_pnl_summary(strategy_id, history, instance):
+    """
+    Combined realized+unrealized P&L for a single strategy instance.
+
+    Args
+    ----
+    strategy_id : the StrategyInstance.id
+    history     : the global closed-leg history list
+    instance    : the StrategyInstance (used for current open P&L)
+
+    Returns
+    -------
+    dict with:
+        realized_ytd  – sum of closed-leg P&L closed in the current year
+        realized_all  – sum of P&L for every closed leg ever
+        open_pnl      – current unrealized P&L on legs still in the portfolio
+        total_ytd     – realized_ytd + open_pnl   (year-to-date P&L incl. open)
+        total_all     – realized_all + open_pnl   (all-time P&L incl. open)
+
+    Either total can be None if there are no closed legs and the strategy
+    has no open P&L. Open-only strategies still get sensible numbers.
+    """
+    from datetime import date
+    year = date.today().year
+
+    entries = [h for h in (history or []) if h.get("strategy_id") == strategy_id]
+
+    realized_all = sum(float(h.get("pnl", 0.0) or 0.0) for h in entries)
+
+    realized_ytd = 0.0
+    for h in entries:
+        cl = _parse_any_iso(h.get("closed_at"))
+        if cl and cl.year == year:
+            realized_ytd += float(h.get("pnl", 0.0) or 0.0)
+
+    open_pnl = float(getattr(instance, "pnl", 0.0) or 0.0)
+
+    return {
+        "realized_ytd": realized_ytd,
+        "realized_all": realized_all,
+        "open_pnl":     open_pnl,
+        "total_ytd":    realized_ytd + open_pnl,
+        "total_all":    realized_all + open_pnl,
+    }
+
+
 def template_ytd_pnl_map(history, instances):
     """
     Aggregate realized P&L year-to-date for each template.

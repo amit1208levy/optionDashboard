@@ -2188,6 +2188,7 @@ class PortfolioScreen(QWidget):
                 card = StrategyCard(
                     inst, metrics=metrics,
                     hidden=bool(inst._raw.get("hidden")),
+                    history=self.history,
                 )
                 card.clicked.connect(self.strategy_clicked.emit)
                 card.hide_requested.connect(self._on_strategy_hide)
