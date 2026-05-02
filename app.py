@@ -2045,8 +2045,30 @@ class PortfolioScreen(QWidget):
         # SDK call failed (e.g. session token issue), fall back to summing
         # transactions ourselves.
         ytd_pnl = acct.get("ytd_pnl_sdk")
+        is_ibkr_acct = acct.get("source") == "ibkr"
 
-        if ytd_pnl is not None:
+        if is_ibkr_acct:
+            # IBKR Gateway doesn't expose YTD natively — its summary fields
+            # are session-only (since the gateway started). The TastyTrade-
+            # specific SDK + transactions path doesn't apply here. Showing
+            # "SDK fetch failed" was misleading because nothing actually
+            # failed. Show "—" with a clarifying note instead.
+            self.status_lbl.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
+            )
+            self.status_lbl.setText(
+                "YTD via IBKR Gateway not supported — track YTD on the TastyTrade account."
+            )
+            try:
+                current_nl = float(bal.get("net-liquidating-value") or 0)
+            except (TypeError, ValueError):
+                current_nl = 0.0
+            ytd_total     = None
+            ytd_wf        = None
+            ytd_fees      = 0.0
+            net_deposits  = 0.0
+            year_start_nl = current_nl
+        elif ytd_pnl is not None:
             ytd_total      = ytd_pnl["p_l_ytd"]
             ytd_wf         = ytd_pnl["p_l_ytd_w_fees"]
             ytd_fees       = ytd_pnl["ytd_fees"]
