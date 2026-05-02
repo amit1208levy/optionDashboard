@@ -220,11 +220,14 @@ class StrategyCard(QFrame):
         if summary is not None:
             ytd_total = summary["total_ytd"]
             all_total = summary["total_all"]
+            ytd_pct   = summary["total_ytd_pct"]
+            all_pct   = summary["total_all_pct"]
 
             h.addWidget(self._stat(
                 "P&L YTD",
                 money(ytd_total, signed=True),
                 pnl_color(ytd_total),
+                sub=pct(ytd_pct) if ytd_pct is not None else None,
                 width=110,
             ))
             # Hide All Time when it equals YTD (no closed legs from prior years).
@@ -233,6 +236,7 @@ class StrategyCard(QFrame):
                     "All Time",
                     money(all_total, signed=True),
                     pnl_color(all_total),
+                    sub=pct(all_pct) if all_pct is not None else None,
                     width=110,
                 ))
 

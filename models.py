@@ -1190,9 +1190,10 @@ def strategy_pnl_summary(strategy_id, history, instance):
         open_pnl      – current unrealized P&L on legs still in the portfolio
         total_ytd     – realized_ytd + open_pnl   (year-to-date P&L incl. open)
         total_all     – realized_all + open_pnl   (all-time P&L incl. open)
-
-    Either total can be None if there are no closed legs and the strategy
-    has no open P&L. Open-only strategies still get sensible numbers.
+        total_ytd_pct – total_ytd as % of capital deployed (YTD closed
+                        trades' notional + current open cost basis)
+        total_all_pct – total_all as % of capital deployed (all closed
+                        trades' notional + current open cost basis)
     """
     from datetime import date
     year = date.today().year
@@ -1200,21 +1201,41 @@ def strategy_pnl_summary(strategy_id, history, instance):
     entries = [h for h in (history or []) if h.get("strategy_id") == strategy_id]
 
     realized_all = sum(float(h.get("pnl", 0.0) or 0.0) for h in entries)
-
     realized_ytd = 0.0
+
+    # Capital deployed = sum of |open_price × qty × multiplier| across the
+    # closed lots in the period. Approximate but consistent enough for a
+    # relative percentage.
+    capital_ytd = 0.0
+    capital_all = 0.0
     for h in entries:
+        op = float(h.get("open_price") or 0.0)
+        q  = float(h.get("qty") or 0.0)
+        m  = float(h.get("multiplier") or 1.0)
+        cap = abs(op * q * m)
+        capital_all += cap
         cl = _parse_any_iso(h.get("closed_at"))
         if cl and cl.year == year:
+            capital_ytd += cap
             realized_ytd += float(h.get("pnl", 0.0) or 0.0)
 
-    open_pnl = float(getattr(instance, "pnl", 0.0) or 0.0)
+    open_pnl  = float(getattr(instance, "pnl", 0.0) or 0.0)
+    open_cap  = float(getattr(instance, "cost_basis", 0.0) or 0.0)
+
+    total_ytd = realized_ytd + open_pnl
+    total_all = realized_all + open_pnl
+
+    denom_ytd = capital_ytd + open_cap
+    denom_all = capital_all + open_cap
 
     return {
-        "realized_ytd": realized_ytd,
-        "realized_all": realized_all,
-        "open_pnl":     open_pnl,
-        "total_ytd":    realized_ytd + open_pnl,
-        "total_all":    realized_all + open_pnl,
+        "realized_ytd":  realized_ytd,
+        "realized_all":  realized_all,
+        "open_pnl":      open_pnl,
+        "total_ytd":     total_ytd,
+        "total_all":     total_all,
+        "total_ytd_pct": (total_ytd / denom_ytd * 100.0) if denom_ytd else None,
+        "total_all_pct": (total_all / denom_all * 100.0) if denom_all else None,
     }
 
 
