@@ -159,20 +159,30 @@ def fetch_ibkr_account(ibkr_provider: "IBKRQuotesProvider") -> Optional[dict]:
     portfolio_items = ibkr_provider.get_portfolio()
     summary         = ibkr_provider.get_account_summary()
 
+    print(f"[ibkr_account] portfolio_items={len(portfolio_items)} "
+          f"summary_tags={len(summary)}", flush=True)
+
     if not portfolio_items and not summary:
         return None
 
     # Build Position objects from portfolio items.
     positions: list[models.Position] = []
+    skipped = 0
     for item in portfolio_items:
         raw = _portfolio_item_to_raw(item)
         if raw is None:
+            skipped += 1
             continue
         try:
             positions.append(models.Position(raw))
         except Exception as e:
+            skipped += 1
             print(f"[ibkr_account] skipping position {getattr(item, 'contract', '?')}: {e}",
                   flush=True)
+    if skipped:
+        print(f"[ibkr_account] {skipped} portfolio items couldn't be converted",
+              flush=True)
+    print(f"[ibkr_account] built {len(positions)} positions", flush=True)
 
     if not positions and not summary:
         return None

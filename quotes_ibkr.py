@@ -235,15 +235,46 @@ class IBKRQuotesProvider(QuotesProvider):
         if not await self._ensure_connected():
             return []
         try:
-            # reqAccountUpdatesAsync subscribes and waits for the broker to
-            # send the initial accountDownloadEnd — after which portfolio() is
-            # fully populated.  Without this the cache is empty on the first
-            # call because the push hasn't arrived yet.
+            import asyncio
             accts = self._ib.managedAccounts()
             acct_code = accts[0] if accts else ""
-            await self._ib.reqAccountUpdatesAsync(subscribe=True,
-                                                   acctCode=acct_code)
-            return list(self._ib.portfolio())
+
+            # Subscribe, then wait for the broker's accountDownloadEnd event.
+            # Just calling reqAccountUpdatesAsync isn't enough — it returns as
+            # soon as the subscribe message is sent, not when the initial data
+            # arrives. We register an event listener to know when the snapshot
+            # is fully populated.
+            end_event = asyncio.Event()
+
+            def _on_end(account):
+                # Some ib_insync builds emit account="", others the code.
+                if (not acct_code) or (not account) or account == acct_code:
+                    end_event.set()
+
+            self._ib.accountDownloadEndEvent += _on_end
+            try:
+                await self._ib.reqAccountUpdatesAsync(subscribe=True,
+                                                       acctCode=acct_code)
+                try:
+                    await asyncio.wait_for(end_event.wait(), timeout=6.0)
+                except asyncio.TimeoutError:
+                    pass   # fall through and read whatever we have
+
+                # Even after accountDownloadEnd, portfolio items can trickle
+                # in for a fraction of a second. A short poll catches them.
+                items = list(self._ib.portfolio())
+                if not items:
+                    for _ in range(6):           # up to ~3 s extra
+                        await asyncio.sleep(0.5)
+                        items = list(self._ib.portfolio())
+                        if items:
+                            break
+                return items
+            finally:
+                try:
+                    self._ib.accountDownloadEndEvent -= _on_end
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[ibkr] portfolio(): {e}", flush=True)
             return []
