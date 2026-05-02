@@ -13,17 +13,21 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 def _user_data_dir() -> str:
     """
     Return the directory where user data (credentials, strategies, history…)
-    is stored.  When running inside a PyInstaller .app bundle we store under
-    ~/Library/Application Support/OptionsDashboard/ so that replacing the
-    .app does not wipe the user's data.  When running from source we keep
-    using the project dir for easier dev workflow.
+    is stored. On macOS we ALWAYS use ~/Library/Application Support/OptionsDashboard/
+    — regardless of whether the app is running from a PyInstaller bundle or a
+    git clone. This way:
+      • credentials survive replacing / re-cloning the app code
+      • credentials survive switching between bundle and source installs
+      • re-running setup_app.sh never wipes the user's login
+
+    Old installs that stored data inside the source folder are migrated on
+    first run.
     """
-    frozen = getattr(sys, "frozen", False) or "Contents/Resources" in HERE
-    if frozen:
+    if sys.platform == "darwin":
         d = os.path.expanduser("~/Library/Application Support/OptionsDashboard")
         os.makedirs(d, exist_ok=True)
-        # One-time migration: if the old .app bundle still contained data
-        # files, copy them over so existing users don't lose their settings.
+        # One-time migration: pick up any data that's still sitting in the
+        # project / bundle directory (older versions stored data there).
         for name in (".credentials.json", ".groups.json", ".account_names.json",
                      ".strategies.json", ".history.json", ".snapshots.json",
                      ".settings.json"):
@@ -35,6 +39,7 @@ def _user_data_dir() -> str:
                 except Exception:
                     pass
         return d
+    # Linux / other: keep using the project dir
     return HERE
 
 
