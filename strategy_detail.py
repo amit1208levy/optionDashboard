@@ -1327,15 +1327,18 @@ class StrategyDetailPage(QWidget):
             )
             hl.addWidget(spin)
 
-            sld = QSlider(Qt.Orientation.Horizontal)
-            sld.setMinimum(0)
-            sld.setMaximum(50)   # 0-50% offset from current spot
-            sld.setFixedWidth(140)
-            sld.setEnabled(bool(underlying))
+            # Slider only makes sense when we know the current spot — it maps
+            # a 0-50% offset to a target price. Without spot, hide it entirely
+            # rather than showing an inert disabled control.
+            sld = None
             if underlying:
+                sld = QSlider(Qt.Orientation.Horizontal)
+                sld.setMinimum(0)
+                sld.setMaximum(50)   # 0-50% offset from current spot
+                sld.setFixedWidth(140)
                 diff_pct = abs((initial - underlying) / underlying * 100.0) if initial else 0
                 sld.setValue(int(min(50, round(diff_pct))))
-            hl.addWidget(sld)
+                hl.addWidget(sld)
 
             ctx_lbl = QLabel("")
             ctx_lbl.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 11px; border: none;")
@@ -1379,7 +1382,7 @@ class StrategyDetailPage(QWidget):
                 _refresh_status()
 
             def _spin_changed():
-                if not underlying:
+                if not underlying or sld is None:
                     _refresh_status()
                     return
                 pct = (spin.value() / underlying - 1.0) * 100.0
@@ -1389,10 +1392,11 @@ class StrategyDetailPage(QWidget):
                 sld.blockSignals(False)
                 _refresh_status()
 
-            sld.valueChanged.connect(_slider_moved)
+            if sld is not None:
+                sld.valueChanged.connect(_slider_moved)
+                sld.sliderReleased.connect(lambda: self._save_exit_field(ep_key, spin.value()))
             spin.valueChanged.connect(lambda _v: _spin_changed())
             spin.editingFinished.connect(lambda: self._save_exit_field(ep_key, spin.value()))
-            sld.sliderReleased.connect(lambda: self._save_exit_field(ep_key, spin.value()))
 
             _refresh_status()
             return hl
@@ -1432,7 +1436,7 @@ class StrategyDetailPage(QWidget):
             spot_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none; margin-top: 4px;")
             right.addWidget(spot_lbl)
         else:
-            spot_lbl = QLabel("Current underlying:  —  (slider disabled until quote available)")
+            spot_lbl = QLabel("Current underlying:  —  enter target prices manually")
             spot_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none; margin-top: 4px;")
             right.addWidget(spot_lbl)
         right.addStretch()
