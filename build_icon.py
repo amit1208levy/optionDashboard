@@ -10,11 +10,15 @@ import shutil
 import subprocess
 from PIL import Image, ImageDraw
 
-# Project palette (kept in sync with theme.py)
-PURPLE_TOP    = (139,  92, 246)   # #8b5cf6
-PURPLE_BOTTOM = (109,  40, 217)   # #6d28d9
+# Dark background — deep indigo fading into near-black for a finance-terminal
+# vibe. Candles are kept saturated and bright so they pop against it.
+BG_TOP        = ( 49,  46, 129)   # #312e81  (indigo-900)
+BG_BOTTOM    = (  9,   9,  20)   # #090914  (near-black with violet undertone)
+
+# Vibrant candle colors
 WHITE         = (255, 255, 255)
-GREEN         = ( 74, 222, 128)   # #4ade80
+NEON_GREEN    = ( 16, 245, 129)   # #10f581  (bullish, slightly brighter than emerald)
+NEON_RED      = (255,  60,  76)   # #ff3c4c  (bearish)
 
 SIZE   = 1024
 MARGIN = 64                       # transparent padding around the rounded square
@@ -42,35 +46,35 @@ def rounded_mask(size: int, margin: int, radius: int) -> Image.Image:
 
 
 def draw_candlesticks(img: Image.Image) -> None:
-    """Three white candlesticks with the middle one in soft green."""
+    """Three vibrant candlesticks: red bearish, green bullish, neutral white."""
     d = ImageDraw.Draw(img)
 
     candle_w = 110     # body width
     wick_w   = 22      # wick width
-    body_r   = 12      # body corner radius
+    body_r   = 14      # body corner radius
 
-    # (center_x, wick_top, wick_bot, body_top, body_bot, body_color)
+    # (center_x, wick_top, wick_bot, body_top, body_bot, body_color, wick_color)
     candles = [
-        (340, 380, 700, 460, 640,  WHITE),
-        (512, 290, 760, 360, 680,  GREEN),
-        (684, 400, 670, 470, 620,  WHITE),
+        (340, 400, 700, 470, 640,  NEON_RED,    NEON_RED),     # bearish
+        (512, 280, 770, 350, 690,  NEON_GREEN,  NEON_GREEN),   # bullish (tallest)
+        (684, 380, 680, 460, 620,  WHITE,       WHITE),        # neutral
     ]
 
-    for cx, wt, wb, bt, bb, color in candles:
+    for cx, wt, wb, bt, bb, body_color, wick_color in candles:
         # Wick
         d.rectangle((cx - wick_w // 2, wt, cx + wick_w // 2, wb),
-                    fill=WHITE)
+                    fill=wick_color)
         # Body
         d.rounded_rectangle(
             (cx - candle_w // 2, bt, cx + candle_w // 2, bb),
             radius=body_r,
-            fill=color,
+            fill=body_color,
         )
 
 
 def build_master() -> Image.Image:
     """1024x1024 RGBA master image."""
-    gradient = vertical_gradient(SIZE, PURPLE_TOP, PURPLE_BOTTOM)
+    gradient = vertical_gradient(SIZE, BG_TOP, BG_BOTTOM)
     mask     = rounded_mask(SIZE, MARGIN, RADIUS)
 
     canvas = Image.new("RGBA", (SIZE, SIZE), (0, 0, 0, 0))
