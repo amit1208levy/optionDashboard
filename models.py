@@ -248,22 +248,56 @@ class Strategy:
 
     def _agg(self, key):
         """
-        Sum Greeks across legs, converting each leg to dollar units:
-          Equity options  → ×100
-          Futures options → ×contract $-multiplier from _CONTRACT_MULT
+        Sum a Greek across legs in DOLLAR units — i.e. dollars of P&L per
+        $1 move in the underlying (for delta), per 1 vol-pt (for vega), etc.
+
+        Per-leg rules:
+          • Equity option  : ×100  × leg's per-share Greek × signed qty
+          • Futures option : ×_CONTRACT_MULT[root]  × leg's per-point Greek
+                             × signed qty.  TastyTrade's leg.multiplier on
+                             futures-option positions is unreliable, so we
+                             always look up the official contract multiplier.
+          • Pure future    : delta = 1 implicitly × leg.multiplier × signed
+                             qty.  Gamma/theta/vega are zero for linear
+                             instruments and the broker doesn't supply them.
+          • Stock (Equity) : delta = 1 per share × signed qty.  Same: only
+                             contributes to delta.
+          • Anything else  : skipped.
+
+        This mirrors portfolio_greeks() so strategy-level Δ matches the
+        portfolio-level Δ when the strategy contains the whole portfolio.
+        Returns None only if no leg contributes anything.
         """
         total = 0.0
         any_set = False
         for l in self.legs:
-            v = getattr(l, key)
-            if v is None:
+            # ── Options (both equity and futures) ──────────────────────────
+            if l.is_option:
+                v = getattr(l, key, None)
+                if v is None:
+                    continue
+                any_set = True
+                if _is_future_option(l.instrument_type):
+                    mult = float(_CONTRACT_MULT.get(l.root or "", 1))
+                else:
+                    mult = 100.0
+                total += l.sign * l.quantity * mult * v
                 continue
-            any_set = True
-            if _is_future_option(l.instrument_type):
-                mult = float(_CONTRACT_MULT.get(l.root or "", 1))
-            else:
-                mult = 100.0
-            total += l.sign * l.quantity * mult * v
+
+            # ── Non-options: only delta has a meaningful value ────────────
+            if key != "delta":
+                continue
+            if l.is_future:
+                # Pure futures contract: linear, delta = 1, multiplier from
+                # the broker (or fall back to _CONTRACT_MULT if missing).
+                mult = float(getattr(l, "multiplier", None)
+                             or _CONTRACT_MULT.get(l.root or "", 1))
+                any_set = True
+                total += l.sign * l.quantity * mult
+            elif (l.instrument_type or "").lower() == "equity":
+                # Stock: delta = 1 per share.
+                any_set = True
+                total += l.sign * l.quantity
         return total if any_set else None
 
     def _detect_name(self):
