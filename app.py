@@ -1963,9 +1963,16 @@ class PortfolioScreen(QWidget):
         return [StrategyInstance(d, positions) for d in self.strategies_raw]
 
     def reload_after_config_change(self):
+        # Re-render immediately with whatever's cached so the user sees the
+        # strategy structure update right away…
         acct = self.current_account()
         if acct:
             self._render(acct)
+        # …and kick off a fresh fetch in the background so newly-assigned
+        # legs (especially ones that weren't in the cached snapshot) get
+        # populated with live quotes/Greeks. Without this, the home screen
+        # shows the old structure until the user manually clicks Refresh.
+        self._load_data()
 
     def _render(self, acct):
         is_ibkr = acct.get("source") == "ibkr"
