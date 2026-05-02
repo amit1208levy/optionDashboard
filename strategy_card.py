@@ -433,11 +433,9 @@ class StrategyCard(QFrame):
         """Compact single-row leg card: Qty|Exp|DTE|Strike|C/P|P&L|P&L%|Day|Θ$|DIT|DTE."""
         from models import _is_future_option, _CONTRACT_MULT
 
-        # Futures contracts and futures options need to stand out — they
-        # have very different multipliers ($50 /ES, $5 /MES, …) and margin
-        # requirements vs. equity options. Visual cues: yellow border,
-        # subtle yellow card tint, "FUT" pill, yellow ticker.
-        is_fut = bool(getattr(leg, "is_future", False))
+        is_fut          = bool(getattr(leg, "is_future", False))
+        is_fut_opt      = is_fut and bool(getattr(leg, "is_option", False))
+        is_fut_contract = is_fut and not getattr(leg, "is_option", False)
 
         card = QFrame()
         if is_fut:
@@ -451,10 +449,9 @@ class StrategyCard(QFrame):
                 f"border-radius: 8px; }}"
             )
         row = QHBoxLayout(card)
-        row.setContentsMargins(12, 7, 12, 7)
-        row.setSpacing(10)
+        row.setContentsMargins(16, 12, 16, 12)
+        row.setSpacing(14)
 
-        # ── Direction-colored signed qty ───────────────────────────────────
         side_color = T.GREEN if leg.is_long else T.RED
         qty_signed = leg.sign * leg.quantity
         if abs(qty_signed - round(qty_signed)) < 1e-9:
@@ -463,23 +460,12 @@ class StrategyCard(QFrame):
             qty_text = f"{qty_signed:+g}".replace("-", "−")
         qty_lbl = QLabel(qty_text)
         qty_lbl.setStyleSheet(
-            f"color: {side_color}; font-size: 16px; font-weight: 800; "
-            f"background: transparent; border: none; min-width: 32px;"
+            f"color: {side_color}; font-size: 18px; font-weight: 800; "
+            f"background: transparent; border: none; min-width: 36px;"
         )
         row.addWidget(qty_lbl)
 
-        # FUT badge — appears right after quantity, before the ticker
-        if is_fut:
-            fut_label = "FUT OPT" if _is_future_option(leg.instrument_type) else "FUTURE"
-            fut_pill = QLabel(fut_label)
-            fut_pill.setStyleSheet(
-                f"color: #1a1500; background: {T.YELLOW}; border: none; "
-                f"border-radius: 5px; padding: 1px 6px; "
-                f"font-size: 9px; font-weight: 900; letter-spacing: 0.6px;"
-            )
-            row.addWidget(fut_pill)
-
-        def _cell(text, color, weight=500, size=11):
+        def _cell(text, color, weight=500, size=12):
             l = QLabel(text)
             l.setStyleSheet(
                 f"color: {color}; font-size: {size}px; font-weight: {weight}; "
@@ -487,34 +473,40 @@ class StrategyCard(QFrame):
             )
             return l
 
-        # ── Identity: Ticker | Exp | DTE | Strike | C/P ───────────────────
-        # Ticker is yellow + slightly larger for futures so it pops at a glance.
         ticker_color = T.YELLOW if is_fut else side_color
-        ticker_size  = 13 if is_fut else 12
+        ticker_size  = 14 if is_fut else 13
         row.addWidget(_cell(leg.root or "—", ticker_color, 800, ticker_size))
 
         exp_str = leg.expires_at.strftime("%b %d") if leg.expires_at else "—"
-        row.addWidget(_cell(exp_str, T.TEXT_DIM, 400, 11))             # expiry — quiet
+        row.addWidget(_cell(exp_str, T.TEXT_DIM, 400, 12))
 
         dte_str = f"{leg.dte}d" if leg.dte is not None else "—"
-        row.addWidget(_cell(dte_str, dte_color(leg.dte), 700, 11))    # DTE — colored
+        row.addWidget(_cell(dte_str, dte_color(leg.dte), 700, 12))
 
-        strike_str = f"{leg.strike:g}" if leg.strike else "—"
-        row.addWidget(_cell(strike_str, T.TEXT, 800, 13))              # STRIKE — largest
-
-        cp_str = leg.call_put or "—"
-        row.addWidget(_cell(cp_str, side_color, 800, 13))              # C/P — bold+colored
+        if is_fut_contract:
+            pill = QLabel("FUTURES CONTRACT")
+            pill.setStyleSheet(
+                f"color: #1a1500; background: {T.YELLOW}; border: none; "
+                f"border-radius: 5px; padding: 3px 10px; "
+                f"font-size: 11px; font-weight: 900; letter-spacing: 0.6px;"
+            )
+            row.addWidget(pill)
+        else:
+            strike_str = f"{leg.strike:g}" if leg.strike else "—"
+            row.addWidget(_cell(strike_str, T.TEXT, 800, 14))
+            cp_str = leg.call_put or "—"
+            row.addWidget(_cell(cp_str, side_color, 800, 14))
 
         # Thin vertical rule separating identity from performance
         sep = QFrame()
         sep.setFixedWidth(1)
-        sep.setFixedHeight(18)
-        sep.setStyleSheet(f"background: {T.BORDER}; border: none; margin: 0 2px;")
+        sep.setFixedHeight(22)
+        sep.setStyleSheet(f"background: {T.BORDER}; border: none; margin: 0 4px;")
         row.addWidget(sep)
 
         # ── Performance: P&L | P&L% | Day | Θ$ | DIT | DTE ──────────────
-        row.addWidget(_cell(money(leg.pnl, signed=True),               # P&L — very bold
-                            pnl_color(leg.pnl), 800, 13))
+        row.addWidget(_cell(money(leg.pnl, signed=True),
+                            pnl_color(leg.pnl), 800, 14))
 
         pnl_pct = leg.pnl_pct
         if pnl_pct is not None:
@@ -522,7 +514,7 @@ class StrategyCard(QFrame):
                            else f"−{abs(pnl_pct):.1f}%")
         else:
             pnl_pct_str = "—"
-        row.addWidget(_cell(pnl_pct_str, pnl_color(pnl_pct), 600, 11))
+        row.addWidget(_cell(pnl_pct_str, pnl_color(pnl_pct), 600, 12))
 
         if leg.close_price and leg.close_price > 0 and leg.mark_price:
             day_pnl = (leg.sign * leg.quantity * leg.multiplier
@@ -531,7 +523,7 @@ class StrategyCard(QFrame):
             day_pnl = None
         day_str = money(day_pnl, signed=True) if day_pnl is not None else "—"
         row.addWidget(_cell(day_str,
-                            pnl_color(day_pnl) if day_pnl is not None else T.MUTED, 700, 12))
+                            pnl_color(day_pnl) if day_pnl is not None else T.MUTED, 700, 13))
 
         if _is_future_option(leg.instrument_type):
             theta_mult = float(_CONTRACT_MULT.get(leg.root or "", 1))
@@ -542,12 +534,12 @@ class StrategyCard(QFrame):
         theta_str = money(theta_dollar, signed=True) if theta_dollar is not None else "—"
         row.addWidget(_cell(theta_str,
                             pnl_color(theta_dollar) if theta_dollar is not None else T.MUTED,
-                            600, 11))
+                            600, 12))
 
         dit_str = f"{leg.dit}d" if leg.dit is not None else "—"
-        row.addWidget(_cell(dit_str, T.TEXT_DIM, 400, 10))
+        row.addWidget(_cell(dit_str, T.TEXT_DIM, 400, 11))
 
-        row.addWidget(_cell(dte_str, dte_color(leg.dte), 600, 10))
+        row.addWidget(_cell(dte_str, dte_color(leg.dte), 600, 11))
 
         row.addStretch()
         return card

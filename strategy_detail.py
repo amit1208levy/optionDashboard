@@ -240,31 +240,21 @@ class LegRow(QFrame):
         )
         h.addWidget(qty_lbl)
 
-        # FUT pill — for futures and futures options, between the qty and the ticker.
-        is_fut = bool(getattr(leg, "is_future", False))
-        if is_fut:
-            fut_label = "FUT OPT" if _is_future_option(leg.instrument_type) else "FUTURE"
-            fut_pill = QLabel(fut_label)
-            fut_pill.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
-            fut_pill.setStyleSheet(
-                f"color: #1a1500; background: {T.YELLOW}; border: none; "
-                f"border-radius: 5px; padding: 1px 7px; margin-right: 4px; "
-                f"font-size: 9px; font-weight: 900; letter-spacing: 0.6px;"
-            )
-            h.addWidget(fut_pill)
+        is_fut          = bool(getattr(leg, "is_future", False))
+        is_fut_contract = is_fut and not getattr(leg, "is_option", False)
 
-        # ── Identity columns: Ticker | Exp | DTE | Strike | C/P ─────────────
-        # Ticker is yellow + slightly larger for futures so they stand out.
         ticker_color = T.YELLOW if is_fut else side_color
         ticker_size  = 13 if is_fut else 12
-        # (text, color, weight, width, font_size)
         id_cells = [
             (leg.root or "—", ticker_color,        800, 64, ticker_size),
-            (exp_str,         T.TEXT_DIM,          400, 68, 11),  # expiry — quiet
-            (dte_str,         dte_color(leg.dte),  700, 44, 11),  # DTE — colored
-            (strike_str,      T.TEXT,              800, 70, 13),  # STRIKE — largest
-            (cp_str,          side_color,          800, 32, 13),  # C/P — bold+colored
+            (exp_str,         T.TEXT_DIM,          400, 68, 11),
+            (dte_str,         dte_color(leg.dte),  700, 44, 11),
         ]
+        if not is_fut_contract:
+            id_cells.extend([
+                (strike_str, T.TEXT,      800, 70, 13),
+                (cp_str,     side_color,  800, 32, 13),
+            ])
         for text, color, weight, width, fsize in id_cells:
             l = QLabel(text)
             l.setFixedWidth(width)
@@ -273,6 +263,17 @@ class LegRow(QFrame):
                 f"font-size: {fsize}px; font-weight: {weight};"
             )
             h.addWidget(l)
+
+        if is_fut_contract:
+            pill = QLabel("FUTURES CONTRACT")
+            pill.setFixedHeight(22)
+            pill.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
+            pill.setStyleSheet(
+                f"color: #1a1500; background: {T.YELLOW}; border: none; "
+                f"border-radius: 5px; padding: 1px 8px; "
+                f"font-size: 10px; font-weight: 900; letter-spacing: 0.6px;"
+            )
+            h.addWidget(pill)
 
         # Thin vertical rule separating identity from performance
         sep = QFrame()
