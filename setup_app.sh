@@ -63,78 +63,69 @@ python3 -m pip install --user --quiet \
         PyQt6 requests websockets matplotlib ib_insync
 echo "✓ Libraries installed"
 
-# 4. Build the launcher .app on the Desktop.
-#    Runs python3 in the foreground so any error is captured and shown
-#    in a dialog (instead of silently failing). Output is also written to
-#    ~/Library/Logs/OptionsDashboard.log for after-the-fact debugging.
+# 4. Build a real macOS .app bundle on the Desktop.
+#    No AppleScript wrapper — the bundle's executable is a shell script that
+#    `exec`s python3, so the .app and the python process share a PID. macOS
+#    treats it as a normal foreground app: dock icon while running, gone when
+#    the user quits, GUI errors visible if python crashes.
 echo "→ Creating Options Dashboard launcher on Desktop..."
-LAUNCHER_SRC="$(mktemp /tmp/launcher_XXXXXX.applescript)"
-cat > "$LAUNCHER_SRC" << 'APPLESCRIPT'
-on run
-    set homePath to POSIX path of (path to home folder)
-    set repoPath to homePath & "Applications/OptionsDashboard"
-    set logFile  to homePath & "Library/Logs/OptionsDashboard.log"
-
-    -- Make sure the repo is there
-    try
-        do shell script "test -d " & quoted form of repoPath
-    on error
-        display dialog "Options Dashboard isn't installed at:" & return & ¬
-            repoPath & return & return & ¬
-            "Re-run the setup command in Terminal:" & return & ¬
-            "curl -fsSL https://raw.githubusercontent.com/amit1208levy/optionDashboard/main/setup_app.sh | bash" ¬
-            buttons {"OK"} default button "OK" with icon stop
-        return
-    end try
-
-    -- Locate a working python3
-    set pyCmd to ""
-    repeat with candidate in {"/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"}
-        try
-            do shell script "test -x " & quoted form of (contents of candidate)
-            set pyCmd to contents of candidate
-            exit repeat
-        end try
-    end repeat
-    if pyCmd is "" then
-        display dialog "Couldn't find python3 on this Mac." & return & return & ¬
-            "Open Terminal and run:  xcode-select --install" ¬
-            buttons {"OK"} default button "OK" with icon stop
-        return
-    end if
-
-    -- Launch python3 in the BACKGROUND, redirecting all output to the log.
-    -- Then wait 3 seconds and check whether the process is still alive.
-    -- If it died, surface the tail of the log to the user instead of silently
-    -- doing nothing.
-    set bashCmd to "cd " & quoted form of repoPath & ¬
-        " && nohup " & quoted form of pyCmd & " app.py >>" & ¬
-        quoted form of logFile & " 2>&1 & echo $! ; disown"
-    set pyPid to do shell script bashCmd
-
-    -- Give the GUI a moment to start
-    delay 3
-
-    try
-        do shell script "kill -0 " & pyPid
-        -- still running → success, exit silently
-        return
-    on error
-        -- python exited within 3s → show the last bit of the log
-        set tailLog to ""
-        try
-            set tailLog to do shell script "tail -n 40 " & quoted form of logFile
-        end try
-        display dialog "Options Dashboard quit during startup." & return & return & ¬
-            "Last log lines:" & return & tailLog ¬
-            buttons {"OK"} default button "OK" with icon stop
-    end try
-end run
-APPLESCRIPT
-
 rm -rf "$LAUNCHER"
-osacompile -o "$LAUNCHER" "$LAUNCHER_SRC"
-rm "$LAUNCHER_SRC"
+mkdir -p "$LAUNCHER/Contents/MacOS"
+
+cat > "$LAUNCHER/Contents/Info.plist" << 'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>            <string>Options Dashboard</string>
+    <key>CFBundleDisplayName</key>     <string>Options Dashboard</string>
+    <key>CFBundleExecutable</key>      <string>OptionsDashboard</string>
+    <key>CFBundleIdentifier</key>      <string>com.amitlevy.optionsdashboard.launcher</string>
+    <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
+    <key>CFBundlePackageType</key>     <string>APPL</string>
+    <key>CFBundleShortVersionString</key> <string>1.0</string>
+    <key>CFBundleVersion</key>         <string>1</string>
+    <key>LSMinimumSystemVersion</key>  <string>10.15</string>
+    <key>NSHighResolutionCapable</key> <true/>
+    <key>NSRequiresAquaSystemAppearance</key> <false/>
+</dict>
+</plist>
+PLIST
+
+cat > "$LAUNCHER/Contents/MacOS/OptionsDashboard" << 'LAUNCHER_SH'
+#!/bin/bash
+# Launcher for Options Dashboard. Runs the cloned Python app from
+# ~/Applications/OptionsDashboard. If anything goes wrong, surface a
+# dialog instead of failing silently.
+set -o pipefail
+
+REPO="$HOME/Applications/OptionsDashboard"
+LOG="$HOME/Library/Logs/OptionsDashboard.log"
+
+if [ ! -d "$REPO" ]; then
+    osascript -e "display dialog \"Options Dashboard isn't installed.\nExpected: $REPO\n\nRe-run the setup command in Terminal.\" buttons {\"OK\"} default button \"OK\" with icon stop"
+    exit 1
+fi
+
+# Find a working python3
+PY=""
+for cand in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+    if [ -x "$cand" ]; then PY="$cand"; break; fi
+done
+if [ -z "$PY" ]; then
+    osascript -e 'display dialog "python3 not found.\n\nIn Terminal, run:\n  xcode-select --install" buttons {"OK"} default button "OK" with icon stop'
+    exit 1
+fi
+
+cd "$REPO" || exit 1
+mkdir -p "$(dirname "$LOG")"
+
+# Run python in the foreground so the .app stays in the dock as long as the
+# GUI is up. Tee output to the log AND keep stderr for the trap below.
+exec "$PY" app.py 2>&1 | tee -a "$LOG"
+LAUNCHER_SH
+
+chmod +x "$LAUNCHER/Contents/MacOS/OptionsDashboard"
 echo "✓ Launcher placed at: $LAUNCHER"
 
 # 5. Open the app
