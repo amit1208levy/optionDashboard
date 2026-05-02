@@ -407,11 +407,23 @@ class StrategyCard(QFrame):
         """Compact single-row leg card: Qty|Exp|DTE|Strike|C/P|P&L|P&L%|Day|Θ$|DIT|DTE."""
         from models import _is_future_option, _CONTRACT_MULT
 
+        # Futures contracts and futures options need to stand out — they
+        # have very different multipliers ($50 /ES, $5 /MES, …) and margin
+        # requirements vs. equity options. Visual cues: yellow border,
+        # subtle yellow card tint, "FUT" pill, yellow ticker.
+        is_fut = bool(getattr(leg, "is_future", False))
+
         card = QFrame()
-        card.setStyleSheet(
-            f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
-            f"border-radius: 8px; }}"
-        )
+        if is_fut:
+            card.setStyleSheet(
+                f"QFrame {{ background: {T.CARD_ALT}; border: 1.5px solid {T.YELLOW}; "
+                f"border-radius: 8px; }}"
+            )
+        else:
+            card.setStyleSheet(
+                f"QFrame {{ background: {T.CARD}; border: 1px solid {T.BORDER}; "
+                f"border-radius: 8px; }}"
+            )
         row = QHBoxLayout(card)
         row.setContentsMargins(12, 7, 12, 7)
         row.setSpacing(10)
@@ -430,6 +442,17 @@ class StrategyCard(QFrame):
         )
         row.addWidget(qty_lbl)
 
+        # FUT badge — appears right after quantity, before the ticker
+        if is_fut:
+            fut_label = "FUT OPT" if _is_future_option(leg.instrument_type) else "FUTURE"
+            fut_pill = QLabel(fut_label)
+            fut_pill.setStyleSheet(
+                f"color: #1a1500; background: {T.YELLOW}; border: none; "
+                f"border-radius: 5px; padding: 1px 6px; "
+                f"font-size: 9px; font-weight: 900; letter-spacing: 0.6px;"
+            )
+            row.addWidget(fut_pill)
+
         def _cell(text, color, weight=500, size=11):
             l = QLabel(text)
             l.setStyleSheet(
@@ -439,7 +462,10 @@ class StrategyCard(QFrame):
             return l
 
         # ── Identity: Ticker | Exp | DTE | Strike | C/P ───────────────────
-        row.addWidget(_cell(leg.root or "—", side_color, 800, 12))   # ticker — bold
+        # Ticker is yellow + slightly larger for futures so it pops at a glance.
+        ticker_color = T.YELLOW if is_fut else side_color
+        ticker_size  = 13 if is_fut else 12
+        row.addWidget(_cell(leg.root or "—", ticker_color, 800, ticker_size))
 
         exp_str = leg.expires_at.strftime("%b %d") if leg.expires_at else "—"
         row.addWidget(_cell(exp_str, T.TEXT_DIM, 400, 11))             # expiry — quiet

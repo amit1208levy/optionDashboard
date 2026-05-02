@@ -170,6 +170,11 @@ class LegRow(QFrame):
         "QFrame {{ background: {card}; border: 1px solid {border}; border-radius: 8px; }}"
         "QFrame:hover {{ border-color: {bh}; background: #1d2034; }}"
     )
+    _NORMAL_FUT = (
+        "QFrame {{ background: {card_alt}; border: 1.5px solid {yellow}; "
+        "border-radius: 8px; }}"
+        "QFrame:hover {{ background: #20251a; }}"
+    )
     _DRAGGING = (
         "QFrame {{ background: #2a2e4a; border: 1px solid {purple}; "
         "border-radius: 8px; }}"
@@ -235,10 +240,26 @@ class LegRow(QFrame):
         )
         h.addWidget(qty_lbl)
 
+        # FUT pill — for futures and futures options, between the qty and the ticker.
+        is_fut = bool(getattr(leg, "is_future", False))
+        if is_fut:
+            fut_label = "FUT OPT" if _is_future_option(leg.instrument_type) else "FUTURE"
+            fut_pill = QLabel(fut_label)
+            fut_pill.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
+            fut_pill.setStyleSheet(
+                f"color: #1a1500; background: {T.YELLOW}; border: none; "
+                f"border-radius: 5px; padding: 1px 7px; margin-right: 4px; "
+                f"font-size: 9px; font-weight: 900; letter-spacing: 0.6px;"
+            )
+            h.addWidget(fut_pill)
+
         # ── Identity columns: Ticker | Exp | DTE | Strike | C/P ─────────────
+        # Ticker is yellow + slightly larger for futures so they stand out.
+        ticker_color = T.YELLOW if is_fut else side_color
+        ticker_size  = 13 if is_fut else 12
         # (text, color, weight, width, font_size)
         id_cells = [
-            (leg.root or "—", side_color,         800, 64, 12),  # ticker — bold+colored
+            (leg.root or "—", ticker_color,        800, 64, ticker_size),
             (exp_str,         T.TEXT_DIM,          400, 68, 11),  # expiry — quiet
             (dte_str,         dte_color(leg.dte),  700, 44, 11),  # DTE — colored
             (strike_str,      T.TEXT,              800, 70, 13),  # STRIKE — largest
@@ -302,6 +323,11 @@ class LegRow(QFrame):
         if dragging:
             self.setStyleSheet(
                 self._DRAGGING.format(purple=T.PURPLE)
+            )
+        elif getattr(self.leg, "is_future", False):
+            # Futures stand out with a yellow border + tinted background
+            self.setStyleSheet(
+                self._NORMAL_FUT.format(card_alt=T.CARD_ALT, yellow=T.YELLOW)
             )
         else:
             self.setStyleSheet(
