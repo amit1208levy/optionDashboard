@@ -220,31 +220,21 @@ class StrategyCard(QFrame):
         if summary is not None:
             ytd_total = summary["total_ytd"]
             all_total = summary["total_all"]
-            ytd_real  = summary["realized_ytd"]
-            all_real  = summary["realized_all"]
-
-            # Sub-label shows how much of the total came from closed trades —
-            # so the user can tell at a glance whether YTD/All-Time is being
-            # carried by current open positions or by realized history.
-            ytd_sub = (f"realized {money(ytd_real, signed=True)}"
-                       if ytd_real else None)
-            all_sub = (f"realized {money(all_real, signed=True)}"
-                       if all_real else None)
 
             h.addWidget(self._stat(
                 "P&L YTD",
                 money(ytd_total, signed=True),
                 pnl_color(ytd_total),
-                sub=ytd_sub,
-                width=120,
+                width=110,
             ))
-            h.addWidget(self._stat(
-                "All Time",
-                money(all_total, signed=True),
-                pnl_color(all_total),
-                sub=all_sub,
-                width=120,
-            ))
+            # Hide All Time when it equals YTD (no closed legs from prior years).
+            if abs(all_total - ytd_total) > 0.01:
+                h.addWidget(self._stat(
+                    "All Time",
+                    money(all_total, signed=True),
+                    pnl_color(all_total),
+                    width=110,
+                ))
 
         # Cache values for the parent's sort logic — exposes computed numbers
         # without re-deriving them in app.py.
