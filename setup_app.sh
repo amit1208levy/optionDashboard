@@ -95,34 +95,53 @@ PLIST
 cat > "$LAUNCHER/Contents/MacOS/OptionsDashboard" << 'LAUNCHER_SH'
 #!/bin/bash
 # Launcher for Options Dashboard. Runs the cloned Python app from
-# ~/Applications/OptionsDashboard. If anything goes wrong, surface a
-# dialog instead of failing silently.
-set -o pipefail
+# ~/Applications/OptionsDashboard. Every step is logged so we can debug
+# if something doesn't work.
+LOG="$HOME/Library/Logs/OptionsDashboard.log"
+mkdir -p "$(dirname "$LOG")"
+
+{
+    echo ""
+    echo "═══ launcher started at $(date) ═══"
+    echo "PATH=$PATH"
+} >> "$LOG"
 
 REPO="$HOME/Applications/OptionsDashboard"
-LOG="$HOME/Library/Logs/OptionsDashboard.log"
-
 if [ ! -d "$REPO" ]; then
-    osascript -e "display dialog \"Options Dashboard isn't installed.\nExpected: $REPO\n\nRe-run the setup command in Terminal.\" buttons {\"OK\"} default button \"OK\" with icon stop"
+    echo "ERROR: repo missing at $REPO" >> "$LOG"
+    osascript -e "display dialog \"Options Dashboard not installed at $REPO. Re-run the setup command.\" buttons {\"OK\"} default button \"OK\" with icon stop" >>"$LOG" 2>&1
     exit 1
 fi
 
-# Find a working python3
 PY=""
 for cand in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
     if [ -x "$cand" ]; then PY="$cand"; break; fi
 done
 if [ -z "$PY" ]; then
-    osascript -e 'display dialog "python3 not found.\n\nIn Terminal, run:\n  xcode-select --install" buttons {"OK"} default button "OK" with icon stop'
+    echo "ERROR: no python3 found" >> "$LOG"
+    osascript -e "display dialog \"python3 not found. In Terminal: xcode-select --install\" buttons {\"OK\"} default button \"OK\" with icon stop" >>"$LOG" 2>&1
     exit 1
 fi
+echo "Using python: $PY" >> "$LOG"
 
-cd "$REPO" || exit 1
-mkdir -p "$(dirname "$LOG")"
+cd "$REPO" || { echo "ERROR: cd failed" >> "$LOG"; exit 1; }
+echo "CWD: $(pwd)" >> "$LOG"
+echo "Launching python3 app.py..." >> "$LOG"
 
-# Run python in the foreground so the .app stays in the dock as long as the
-# GUI is up. Tee output to the log AND keep stderr for the trap below.
-exec "$PY" app.py 2>&1 | tee -a "$LOG"
+# Run python in foreground. Append all output to log. NO exec, NO pipefail —
+# both have caused early-exit bugs. The .app's PID stays as this shell, and
+# Python is its child. macOS keeps the dock icon visible until python exits.
+"$PY" app.py >>"$LOG" 2>&1
+EC=$?
+echo "python3 exited with code $EC at $(date)" >> "$LOG"
+
+# Show the tail of the log on a real crash (any non-zero except SIGINT/Cmd+Q).
+if [ $EC -ne 0 ] && [ $EC -ne 130 ] && [ $EC -ne 143 ]; then
+    TAIL=$(tail -n 25 "$LOG" | sed 's/"/\\"/g; s/\\$/\\\\/g')
+    osascript -e "display dialog \"Options Dashboard crashed (exit $EC).\n\n$TAIL\" buttons {\"OK\"} default button \"OK\" with icon stop" >>"$LOG" 2>&1
+fi
+
+exit $EC
 LAUNCHER_SH
 
 chmod +x "$LAUNCHER/Contents/MacOS/OptionsDashboard"
