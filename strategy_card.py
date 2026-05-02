@@ -65,12 +65,39 @@ class StrategyCard(QFrame):
     clicked        = pyqtSignal(object)   # strategy
     hide_requested = pyqtSignal(object)   # strategy — user clicked hide
 
+    # Color cycle for leg-group markers — high contrast against dark theme.
+    _GROUP_COLORS = (
+        "#60a5fa",  # blue
+        "#4ade80",  # green
+        "#fbbf24",  # amber
+        "#f472b6",  # pink
+        "#a78bfa",  # violet
+        "#2dd4bf",  # teal
+        "#fb923c",  # orange
+    )
+
     def __init__(self, strategy, parent=None, metrics=None, hidden=False, history=None):
         super().__init__(parent)
         self.strategy = strategy
         self.metrics = metrics or {}
         self.is_hidden = bool(hidden)
         self.history = history or []
+
+        # Build a {leg_symbol: (color, group_name)} map from the strategy's
+        # saved leg groups (set in the strategy detail page). Used by
+        # _build_leg_card to draw a colored stripe + group pill on each leg.
+        self._sym_to_group: dict = {}
+        try:
+            from models import StrategyInstance
+            if isinstance(strategy, StrategyInstance):
+                groups = (strategy._raw.get("leg_groups") or [])
+                for i, g in enumerate(groups):
+                    color = self._GROUP_COLORS[i % len(self._GROUP_COLORS)]
+                    name  = g.get("name") or f"Group {i+1}"
+                    for sym in (g.get("legs") or []):
+                        self._sym_to_group[sym] = (color, name)
+        except Exception:
+            self._sym_to_group = {}
         self._pnl_val_lbl = None   # QLabel — set by _stat() when is_pnl=True
         self._pnl_pct_lbl = None   # QLabel for pct sub-label
         self._expanded  = False
@@ -455,6 +482,29 @@ class StrategyCard(QFrame):
         row = QHBoxLayout(card)
         row.setContentsMargins(16, 12, 16, 12)
         row.setSpacing(14)
+
+        # Group marker: colored vertical stripe on the left side of the card +
+        # a small pill with the group name. Both inserted before everything
+        # else so they're the leftmost visual on the row.
+        group_info = self._sym_to_group.get(getattr(leg, "symbol", None))
+        if group_info:
+            g_color, g_name = group_info
+            stripe = QFrame()
+            stripe.setFixedWidth(4)
+            stripe.setMinimumHeight(28)
+            stripe.setStyleSheet(
+                f"background: {g_color}; border: none; border-radius: 2px;"
+            )
+            row.addWidget(stripe)
+
+            g_pill = QLabel(g_name.upper())
+            g_pill.setStyleSheet(
+                f"color: {g_color}; background: transparent; "
+                f"border: 1px solid {g_color}; border-radius: 5px; "
+                f"padding: 2px 8px; font-size: 10px; font-weight: 800; "
+                f"letter-spacing: 0.5px;"
+            )
+            row.addWidget(g_pill)
 
         side_color = T.GREEN if leg.is_long else T.RED
         qty_signed = leg.sign * leg.quantity

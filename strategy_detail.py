@@ -180,7 +180,7 @@ class LegRow(QFrame):
         "border-radius: 8px; }}"
     )
 
-    def __init__(self, leg, enabled_greeks, parent=None):
+    def __init__(self, leg, enabled_greeks, parent=None, group_info=None):
         super().__init__(parent)
         self.leg = leg
         self.setFixedHeight(44)
@@ -194,6 +194,28 @@ class LegRow(QFrame):
         handle = _DragHandle()
         handle.pressed.connect(lambda y: self.drag_started.emit(self, y))
         h.addWidget(handle)
+
+        # ── Leg-group marker (colored stripe + group-name pill) ────────────
+        # group_info is (color, name) when this leg belongs to a saved
+        # leg group; None if it doesn't.
+        if group_info:
+            g_color, g_name = group_info
+            stripe = QFrame()
+            stripe.setFixedWidth(4)
+            stripe.setStyleSheet(
+                f"background: {g_color}; border: none; border-radius: 2px;"
+            )
+            h.addWidget(stripe)
+            h.addSpacing(6)
+            g_pill = QLabel(g_name.upper())
+            g_pill.setStyleSheet(
+                f"color: {g_color}; background: transparent; "
+                f"border: 1px solid {g_color}; border-radius: 5px; "
+                f"padding: 1px 7px; font-size: 9px; font-weight: 800; "
+                f"letter-spacing: 0.5px;"
+            )
+            h.addWidget(g_pill)
+            h.addSpacing(6)
 
         # ── Data cells ────────────────────────────────────────────────────
         # Color by trade direction: BUY (long) = green, SELL (short) = red.
@@ -353,7 +375,13 @@ class _LegsBody(QWidget):
     """
     reordered = pyqtSignal(list)   # [symbol, ...] in new order
 
-    def __init__(self, legs, enabled_greeks, parent=None):
+    # Same palette as StrategyCard so groups have consistent colors across views.
+    _GROUP_COLORS = (
+        "#60a5fa", "#4ade80", "#fbbf24", "#f472b6",
+        "#a78bfa", "#2dd4bf", "#fb923c",
+    )
+
+    def __init__(self, legs, enabled_greeks, parent=None, leg_groups=None):
         super().__init__(parent)
         self._rows: list[LegRow] = []
         self._dragging: LegRow | None = None
@@ -362,8 +390,17 @@ class _LegsBody(QWidget):
         self._lay.setSpacing(4)
         self._lay.setContentsMargins(0, 0, 0, 0)
 
+        # Build {leg_symbol: (color, group_name)} so each row knows its group.
+        sym_to_group: dict = {}
+        for i, g in enumerate(leg_groups or []):
+            color = self._GROUP_COLORS[i % len(self._GROUP_COLORS)]
+            name  = g.get("name") or f"Group {i+1}"
+            for sym in (g.get("legs") or []):
+                sym_to_group[sym] = (color, name)
+
         for leg in legs:
-            row = LegRow(leg, enabled_greeks)
+            row = LegRow(leg, enabled_greeks,
+                         group_info=sym_to_group.get(getattr(leg, "symbol", None)))
             row.drag_started.connect(self._on_drag_started)
             self._rows.append(row)
             self._lay.addWidget(row)
@@ -1046,7 +1083,9 @@ class StrategyDetailPage(QWidget):
                 order = {sym: i for i, sym in enumerate(raw["leg_order"])}
                 legs.sort(key=lambda l: order.get(l.symbol, 999))
 
-        body = _LegsBody(legs, enabled_greeks)
+        leg_groups = (self.strategy._raw.get("leg_groups") or []
+                      if isinstance(self.strategy, StrategyInstance) else [])
+        body = _LegsBody(legs, enabled_greeks, leg_groups=leg_groups)
         if isinstance(self.strategy, StrategyInstance):
             body.reordered.connect(self._on_legs_reordered)
         lay.addWidget(body)
