@@ -2638,6 +2638,15 @@ class MainWindow(QStackedWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+
+    # Set the dock / window icon. Looks for AppIcon.png next to app.py
+    # (works for source-clone installs); PyInstaller bundles use CFBundleIconFile
+    # in the .app's Info.plist, so this is just a fallback / window-icon source.
+    _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AppIcon.png")
+    if os.path.exists(_icon_path):
+        from PyQt6.QtGui import QIcon
+        app.setWindowIcon(QIcon(_icon_path))
+
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

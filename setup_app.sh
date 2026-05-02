@@ -71,6 +71,12 @@ echo "✓ Libraries installed"
 echo "→ Creating Options Dashboard launcher on Desktop..."
 rm -rf "$LAUNCHER"
 mkdir -p "$LAUNCHER/Contents/MacOS"
+mkdir -p "$LAUNCHER/Contents/Resources"
+
+# Copy the app icon from the cloned repo into the launcher bundle
+if [ -f "$INSTALL_DIR/AppIcon.icns" ]; then
+    cp "$INSTALL_DIR/AppIcon.icns" "$LAUNCHER/Contents/Resources/AppIcon.icns"
+fi
 
 cat > "$LAUNCHER/Contents/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -85,6 +91,8 @@ cat > "$LAUNCHER/Contents/Info.plist" << 'PLIST'
     <key>CFBundlePackageType</key>     <string>APPL</string>
     <key>CFBundleShortVersionString</key> <string>1.0</string>
     <key>CFBundleVersion</key>         <string>1</string>
+    <key>CFBundleIconFile</key>        <string>AppIcon</string>
+    <key>CFBundleIconName</key>        <string>AppIcon</string>
     <key>LSMinimumSystemVersion</key>  <string>10.15</string>
     <key>NSHighResolutionCapable</key> <true/>
     <key>NSRequiresAquaSystemAppearance</key> <false/>

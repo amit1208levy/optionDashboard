@@ -17,6 +17,9 @@ datas = [
     ("templates", "templates"),          # HTML templates (if used)
     ("tickers.json", "."),               # Watchlist ticker list
 ]
+# App icon — only included if it's been generated (build_icon.py)
+if os.path.exists("AppIcon.png"):
+    datas.append(("AppIcon.png", "."))
 # Add static/ only if it exists
 if os.path.isdir("static"):
     datas.append(("static", "static"))
@@ -113,7 +116,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name="OptionsDashboard.app",
-    icon=None,
+    icon="AppIcon.icns" if os.path.exists("AppIcon.icns") else None,
     bundle_identifier="com.amitlevy.optionsdashboard",
     info_plist={
         "CFBundleName":             "Options Dashboard",
