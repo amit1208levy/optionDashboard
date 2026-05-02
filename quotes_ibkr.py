@@ -236,12 +236,31 @@ class IBKRQuotesProvider(QuotesProvider):
             return []
         try:
             import asyncio
+            import inspect
 
-            # ib_insync.connect() automatically subscribes to account updates,
-            # so portfolio() will be populated shortly after the connection.
-            # The `subscribe` keyword on reqAccountUpdatesAsync was removed in
-            # newer ib_insync versions, so we don't call it explicitly — just
-            # poll until data arrives or we time out (~6 s).
+            accts = self._ib.managedAccounts()
+            acct_code = accts[0] if accts else ""
+
+            # ib_insync's reqAccountUpdates signature varies by version:
+            #   0.9.x : reqAccountUpdates(subscribe: bool, account: str = '')
+            #   newer : reqAccountUpdates(acctCode: str = '')
+            # Inspect the signature and call accordingly. Without this call
+            # the gateway never pushes portfolio data → portfolio() stays [].
+            req = self._ib.reqAccountUpdatesAsync
+            try:
+                params = inspect.signature(req).parameters
+                if "subscribe" in params:
+                    await req(True, acct_code)
+                elif "acctCode" in params or "account" in params:
+                    await req(acct_code)
+                else:
+                    await req()
+                print(f"[ibkr] reqAccountUpdates subscribed for {acct_code or '(default)'}",
+                      flush=True)
+            except Exception as e:
+                print(f"[ibkr] reqAccountUpdates failed: {e}", flush=True)
+
+            # Poll up to ~6 s for the initial portfolio snapshot to arrive.
             items = list(self._ib.portfolio())
             if items:
                 return items
@@ -250,7 +269,7 @@ class IBKRQuotesProvider(QuotesProvider):
                 items = list(self._ib.portfolio())
                 if items:
                     return items
-            return items   # may be [] if account truly has no positions
+            return items   # genuinely empty account, or push delayed
         except Exception as e:
             print(f"[ibkr] portfolio(): {e}", flush=True)
             return []
