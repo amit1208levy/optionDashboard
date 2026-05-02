@@ -64,21 +64,71 @@ python3 -m pip install --user --quiet \
 echo "✓ Libraries installed"
 
 # 4. Build the launcher .app on the Desktop.
-#    AppleScript app runs python3 in the background, no Terminal window.
+#    Runs python3 in the foreground so any error is captured and shown
+#    in a dialog (instead of silently failing). Output is also written to
+#    ~/Library/Logs/OptionsDashboard.log for after-the-fact debugging.
 echo "→ Creating Options Dashboard launcher on Desktop..."
 LAUNCHER_SRC="$(mktemp /tmp/launcher_XXXXXX.applescript)"
 cat > "$LAUNCHER_SRC" << 'APPLESCRIPT'
 on run
-    set repoPath to (POSIX path of (path to home folder)) & "Applications/OptionsDashboard"
+    set homePath to POSIX path of (path to home folder)
+    set repoPath to homePath & "Applications/OptionsDashboard"
+    set logFile  to homePath & "Library/Logs/OptionsDashboard.log"
+
+    -- Make sure the repo is there
     try
         do shell script "test -d " & quoted form of repoPath
     on error
-        display dialog "Options Dashboard isn't installed." & return & ¬
-            "Run the setup command again." buttons {"OK"} default button "OK" with icon stop
+        display dialog "Options Dashboard isn't installed at:" & return & ¬
+            repoPath & return & return & ¬
+            "Re-run the setup command in Terminal:" & return & ¬
+            "curl -fsSL https://raw.githubusercontent.com/amit1208levy/optionDashboard/main/setup_app.sh | bash" ¬
+            buttons {"OK"} default button "OK" with icon stop
         return
     end try
-    do shell script "cd " & quoted form of repoPath & ¬
-        " && /usr/bin/env python3 app.py > /dev/null 2>&1 &"
+
+    -- Locate a working python3
+    set pyCmd to ""
+    repeat with candidate in {"/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"}
+        try
+            do shell script "test -x " & quoted form of (contents of candidate)
+            set pyCmd to contents of candidate
+            exit repeat
+        end try
+    end repeat
+    if pyCmd is "" then
+        display dialog "Couldn't find python3 on this Mac." & return & return & ¬
+            "Open Terminal and run:  xcode-select --install" ¬
+            buttons {"OK"} default button "OK" with icon stop
+        return
+    end if
+
+    -- Launch python3 in the BACKGROUND, redirecting all output to the log.
+    -- Then wait 3 seconds and check whether the process is still alive.
+    -- If it died, surface the tail of the log to the user instead of silently
+    -- doing nothing.
+    set bashCmd to "cd " & quoted form of repoPath & ¬
+        " && nohup " & quoted form of pyCmd & " app.py >>" & ¬
+        quoted form of logFile & " 2>&1 & echo $! ; disown"
+    set pyPid to do shell script bashCmd
+
+    -- Give the GUI a moment to start
+    delay 3
+
+    try
+        do shell script "kill -0 " & pyPid
+        -- still running → success, exit silently
+        return
+    on error
+        -- python exited within 3s → show the last bit of the log
+        set tailLog to ""
+        try
+            set tailLog to do shell script "tail -n 40 " & quoted form of logFile
+        end try
+        display dialog "Options Dashboard quit during startup." & return & return & ¬
+            "Last log lines:" & return & tailLog ¬
+            buttons {"OK"} default button "OK" with icon stop
+    end try
 end run
 APPLESCRIPT
 
