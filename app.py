@@ -1482,13 +1482,18 @@ class PortfolioScreen(QWidget):
     # (column label, sort key, fixed width, default ascending direction)
     # Widths/spacing match the per-card stats in StrategyCard so the headers
     # line up over the values they sort.
+    # Widths must match the per-card stat widths in StrategyCard exactly so
+    # headers line up over their values.
     _MY_SORT_COLS = [
-        ("DTE",      "dte",   68,  True),
-        ("POP",      "pop",   68,  False),
-        ("Δ",        "delta", 82,  False),
-        ("Θ",        "theta", 82,  False),
-        ("DAY P&L",  "day",   100, False),
-        ("OPEN P&L", "pnl",   110, False),
+        ("DTE",      "dte",      68,  True),
+        ("POP",      "pop",      68,  False),
+        ("Δ",        "delta",    82,  False),
+        ("Θ",        "theta",    82,  False),
+        ("DAY P&L",  "day",      100, False),
+        ("OPEN P&L", "pnl",      100, False),
+        ("P&L %",    "pnl_pct",  72,  False),
+        ("P&L YTD",  "ytd",      100, False),
+        ("YTD %",    "ytd_pct",  72,  False),
     ]
 
     def _build_my_sort_bar(self):
@@ -1603,6 +1608,12 @@ class PortfolioScreen(QWidget):
             )
         if col == "pnl":
             return inst.pnl
+        if col == "pnl_pct":
+            return inst.pnl_pct
+        if col in ("ytd", "ytd_pct"):
+            from models import strategy_pnl_summary
+            s = strategy_pnl_summary(inst.id, self.history, inst)
+            return s["total_ytd"] if col == "ytd" else s["total_ytd_pct"]
         return None
 
     def _bal_tile(self, label):

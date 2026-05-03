@@ -291,7 +291,9 @@ class StrategyCard(QFrame):
             "theta":    float(nt) if nt is not None else None,
             "day":      float(day_pnl) if day_pnl else 0.0,
             "pnl":      float(strategy.pnl) if strategy.pnl is not None else 0.0,
+            "pnl_pct":  float(strategy.pnl_pct) if strategy.pnl_pct is not None else 0.0,
             "ytd":      float(summary["total_ytd"]) if summary else 0.0,
+            "ytd_pct":  float(summary["total_ytd_pct"]) if summary and summary["total_ytd_pct"] is not None else 0.0,
             "all_time": float(summary["total_all"]) if summary else 0.0,
         }
 
