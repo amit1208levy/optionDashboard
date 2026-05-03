@@ -1520,6 +1520,9 @@ class PortfolioScreen(QWidget):
         return bar
 
     def _update_my_sort_headers(self):
+        # Reserve a fixed-width slot at the end of the text for the arrow so
+        # the label doesn't shift left/right when an arrow is added/removed.
+        # Use the same padding on both states so the vertical box doesn't grow.
         for key, (lbl, base, _ad) in (self._my_sort_lbls or {}).items():
             if key == self._my_sort_col:
                 arrow = " ▲" if self._my_sort_asc else " ▼"
@@ -1527,13 +1530,18 @@ class PortfolioScreen(QWidget):
                 lbl.setStyleSheet(
                     f"color: {T.ACCENT}; font-size: 10px; font-weight: bold; "
                     f"letter-spacing: 0.6px; border: none; "
-                    f"background: {T.CARD_ALT}; border-radius: 3px; padding: 1px 3px;"
+                    f"background: {T.CARD_ALT}; border-radius: 3px; "
+                    f"padding: 1px 3px;"
                 )
             else:
-                lbl.setText(base)
+                # Trailing two spaces stand in for the arrow's slot — keeps
+                # the right-aligned text from shifting when the arrow appears.
+                lbl.setText(f"{base}  ")
                 lbl.setStyleSheet(
                     f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
-                    f"letter-spacing: 0.6px; border: none;"
+                    f"letter-spacing: 0.6px; border: none; "
+                    f"background: transparent; border-radius: 3px; "
+                    f"padding: 1px 3px;"
                 )
 
     def _on_my_sort_click(self, col_key: str, default_asc: bool):
