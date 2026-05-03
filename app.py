@@ -641,73 +641,67 @@ class AccountSettingsDialog(QDialog):
 
 class _ColumnSettingsDialog(QDialog):
     """
-    Lets the user pick which columns appear in the strategies list and in
-    what order. Columns can be dragged to reorder; the checkbox controls
-    visibility. Modeled after TastyTrade's customize-columns dialog.
+    Two-pane column customizer: VISIBLE on the left (in order), HIDDEN on
+    the right. User drags items between lists to toggle visibility, and
+    drags within the VISIBLE list to reorder columns.
     """
 
     def __init__(self, current_keys, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Customize Columns")
-        self.setMinimumWidth(360)
+        self.setMinimumSize(680, 540)
+        self.resize(720, 560)
         self.setStyleSheet(T.BASE_STYLE)
 
-        all_cols = list(StrategyCard.ALL_COLUMNS)   # [(key, label, w, asc), ...]
-        current  = list(current_keys or [])
-
-        # Reorder so currently-shown columns appear at the top in their
-        # configured order; hidden columns trail at the bottom.
-        ordered_keys = [k for k in current if any(c[0] == k for c in all_cols)]
-        for c in all_cols:
-            if c[0] not in ordered_keys:
-                ordered_keys.append(c[0])
-        label_by_key = {c[0]: c[1] for c in all_cols}
+        self._all_cols     = list(StrategyCard.ALL_COLUMNS)   # (key,label,w,asc)
+        self._label_by_key = {c[0]: c[1] for c in self._all_cols}
+        current            = list(current_keys or [])
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 18, 20, 18)
-        root.setSpacing(10)
+        root.setContentsMargins(22, 20, 22, 20)
+        root.setSpacing(12)
 
         title = QLabel("Customize Columns")
         title.setStyleSheet(
-            f"color: {T.ACCENT}; font-size: 16px; font-weight: bold; "
+            f"color: {T.ACCENT}; font-size: 18px; font-weight: bold; "
             f"border: none; background: transparent;"
         )
         root.addWidget(title)
 
-        hint = QLabel("Drag to reorder. Toggle the checkbox to show or hide.")
-        hint.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
+        hint = QLabel(
+            "Drag rows between VISIBLE and HIDDEN to show/hide. "
+            "Drag within VISIBLE to reorder."
+        )
+        hint.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
         hint.setWordWrap(True)
         root.addWidget(hint)
 
-        self._list = QListWidget()
-        self._list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
-        self._list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self._list.setStyleSheet(
-            f"QListWidget {{ background: {T.BG_ALT}; color: {T.TEXT}; "
-            f"border: 1px solid {T.BORDER}; border-radius: 8px; padding: 4px; "
-            f"font-size: 13px; }}"
-            f"QListWidget::item {{ padding: 6px 8px; border-radius: 4px; }}"
-            f"QListWidget::item:selected {{ background: {T.CARD_ALT}; }}"
-        )
-        for k in ordered_keys:
-            it = QListWidgetItem(f"⠿  {label_by_key.get(k, k)}")
-            it.setData(Qt.ItemDataRole.UserRole, k)
-            it.setFlags(it.flags()
-                        | Qt.ItemFlag.ItemIsUserCheckable
-                        | Qt.ItemFlag.ItemIsDragEnabled)
-            it.setCheckState(
-                Qt.CheckState.Checked if k in current else Qt.CheckState.Unchecked
-            )
-            self._list.addItem(it)
-        root.addWidget(self._list, 1)
+        # ── Two side-by-side lists ────────────────────────────────────────
+        cols = QHBoxLayout()
+        cols.setSpacing(20)
+
+        self.visible_list = self._make_list_widget()
+        self.hidden_list  = self._make_list_widget()
+
+        cols.addLayout(self._labelled_list("VISIBLE", T.ACCENT, self.visible_list), 1)
+        cols.addLayout(self._labelled_list("HIDDEN",  T.MUTED,  self.hidden_list),  1)
+        root.addLayout(cols, 1)
+
+        # Populate initial state
+        ordered_visible = [k for k in current if k in self._label_by_key]
+        hidden = [c[0] for c in self._all_cols if c[0] not in ordered_visible]
+        for k in ordered_visible:
+            self.visible_list.addItem(self._make_item(k))
+        for k in hidden:
+            self.hidden_list.addItem(self._make_item(k))
 
         # Reset to defaults
         reset_btn = QPushButton("Reset to defaults")
         reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         reset_btn.setStyleSheet(
             f"QPushButton {{ background: transparent; color: {T.MUTED}; "
-            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 6px 12px; "
-            f"font-size: 11px; }}"
+            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 6px 14px; "
+            f"font-size: 12px; }}"
             f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
         )
         reset_btn.clicked.connect(self._reset_defaults)
@@ -725,25 +719,58 @@ class _ColumnSettingsDialog(QDialog):
         bottom.addWidget(btns)
         root.addLayout(bottom)
 
+    def _make_list_widget(self):
+        w = QListWidget()
+        w.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
+        w.setDefaultDropAction(Qt.DropAction.MoveAction)
+        w.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        w.setAcceptDrops(True)
+        w.setDragEnabled(True)
+        w.setMovement(QListWidget.Movement.Snap)
+        w.setStyleSheet(
+            f"QListWidget {{ background: {T.BG_ALT}; color: {T.TEXT}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 10px; padding: 6px; "
+            f"font-size: 14px; }}"
+            f"QListWidget::item {{ padding: 10px 12px; border-radius: 6px; "
+            f"margin: 2px 0; }}"
+            f"QListWidget::item:hover {{ background: {T.CARD_ALT}; }}"
+            f"QListWidget::item:selected {{ background: {T.CARD_ALT}; "
+            f"color: {T.ACCENT}; }}"
+        )
+        return w
+
+    def _labelled_list(self, label_text, label_color, list_widget):
+        v = QVBoxLayout()
+        v.setSpacing(6)
+        lbl = QLabel(label_text)
+        lbl.setStyleSheet(
+            f"color: {label_color}; font-size: 11px; font-weight: bold; "
+            f"letter-spacing: 0.8px; border: none; background: transparent;"
+        )
+        v.addWidget(lbl)
+        v.addWidget(list_widget, 1)
+        return v
+
+    def _make_item(self, key):
+        it = QListWidgetItem(f"⠿   {self._label_by_key.get(key, key)}")
+        it.setData(Qt.ItemDataRole.UserRole, key)
+        it.setFlags(
+            (it.flags() | Qt.ItemFlag.ItemIsDragEnabled)
+            & ~Qt.ItemFlag.ItemIsDropEnabled
+        )
+        return it
+
     def _reset_defaults(self):
-        defaults = list(StrategyCard.DEFAULT_COLUMN_KEYS)
-        label_by_key = {c[0]: c[1] for c in StrategyCard.ALL_COLUMNS}
-        self._list.clear()
-        for k in defaults:
-            it = QListWidgetItem(f"⠿  {label_by_key.get(k, k)}")
-            it.setData(Qt.ItemDataRole.UserRole, k)
-            it.setFlags(it.flags()
-                        | Qt.ItemFlag.ItemIsUserCheckable
-                        | Qt.ItemFlag.ItemIsDragEnabled)
-            it.setCheckState(Qt.CheckState.Checked)
-            self._list.addItem(it)
+        self.visible_list.clear()
+        self.hidden_list.clear()
+        for k in StrategyCard.DEFAULT_COLUMN_KEYS:
+            self.visible_list.addItem(self._make_item(k))
 
     def result_keys(self):
+        # Order = order of items in the visible list.
         out = []
-        for i in range(self._list.count()):
-            it = self._list.item(i)
-            if it.checkState() == Qt.CheckState.Checked:
-                out.append(it.data(Qt.ItemDataRole.UserRole))
+        for i in range(self.visible_list.count()):
+            out.append(self.visible_list.item(i).data(Qt.ItemDataRole.UserRole))
         return out
 
 
