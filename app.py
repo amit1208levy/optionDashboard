@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QComboBox,
     QDialog, QDialogButtonBox, QFormLayout, QMessageBox, QTextEdit,
     QCheckBox, QListWidget, QListWidgetItem, QAbstractItemView,
+    QTabWidget,
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
@@ -639,63 +640,36 @@ class AccountSettingsDialog(QDialog):
 
 # ── Column-customization dialog ──────────────────────────────────────────────
 
-class _ColumnSettingsDialog(QDialog):
+class _ColumnPicker(QWidget):
     """
-    Two-pane column customizer: VISIBLE on the left (in order), HIDDEN on
-    the right. User drags items between lists to toggle visibility, and
-    drags within the VISIBLE list to reorder columns.
+    Reusable two-pane (VISIBLE / HIDDEN) column picker. Drag items between
+    lists to show/hide, drag within VISIBLE to reorder.
     """
-
-    def __init__(self, current_keys, parent=None):
+    def __init__(self, all_cols, current_keys, default_keys, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Customize Columns")
-        self.setMinimumSize(680, 540)
-        self.resize(720, 560)
-        self.setStyleSheet(T.BASE_STYLE)
+        self._label_by_key = {c[0]: c[1] for c in all_cols}
+        self._all_cols     = list(all_cols)
+        self._defaults     = tuple(default_keys)
 
-        self._all_cols     = list(StrategyCard.ALL_COLUMNS)   # (key,label,w,asc)
-        self._label_by_key = {c[0]: c[1] for c in self._all_cols}
-        current            = list(current_keys or [])
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(10)
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(22, 20, 22, 20)
-        root.setSpacing(12)
-
-        title = QLabel("Customize Columns")
-        title.setStyleSheet(
-            f"color: {T.ACCENT}; font-size: 18px; font-weight: bold; "
-            f"border: none; background: transparent;"
-        )
-        root.addWidget(title)
-
-        hint = QLabel(
-            "Drag rows between VISIBLE and HIDDEN to show/hide. "
-            "Drag within VISIBLE to reorder."
-        )
-        hint.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
-        hint.setWordWrap(True)
-        root.addWidget(hint)
-
-        # ── Two side-by-side lists ────────────────────────────────────────
         cols = QHBoxLayout()
         cols.setSpacing(20)
-
         self.visible_list = self._make_list_widget()
         self.hidden_list  = self._make_list_widget()
-
         cols.addLayout(self._labelled_list("VISIBLE", T.ACCENT, self.visible_list), 1)
         cols.addLayout(self._labelled_list("HIDDEN",  T.MUTED,  self.hidden_list),  1)
-        root.addLayout(cols, 1)
+        v.addLayout(cols, 1)
 
-        # Populate initial state
-        ordered_visible = [k for k in current if k in self._label_by_key]
-        hidden = [c[0] for c in self._all_cols if c[0] not in ordered_visible]
+        ordered_visible = [k for k in (current_keys or []) if k in self._label_by_key]
+        hidden = [c[0] for c in all_cols if c[0] not in ordered_visible]
         for k in ordered_visible:
             self.visible_list.addItem(self._make_item(k))
         for k in hidden:
             self.hidden_list.addItem(self._make_item(k))
 
-        # Reset to defaults
         reset_btn = QPushButton("Reset to defaults")
         reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         reset_btn.setStyleSheet(
@@ -704,20 +678,11 @@ class _ColumnSettingsDialog(QDialog):
             f"font-size: 12px; }}"
             f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
         )
-        reset_btn.clicked.connect(self._reset_defaults)
-
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        btns.accepted.connect(self.accept)
-        btns.rejected.connect(self.reject)
-
-        bottom = QHBoxLayout()
-        bottom.addWidget(reset_btn)
-        bottom.addStretch()
-        bottom.addWidget(btns)
-        root.addLayout(bottom)
+        reset_btn.clicked.connect(self.reset_defaults)
+        bot = QHBoxLayout()
+        bot.addWidget(reset_btn)
+        bot.addStretch()
+        v.addLayout(bot)
 
     def _make_list_widget(self):
         w = QListWidget()
@@ -739,12 +704,12 @@ class _ColumnSettingsDialog(QDialog):
         )
         return w
 
-    def _labelled_list(self, label_text, label_color, list_widget):
+    def _labelled_list(self, text, color, list_widget):
         v = QVBoxLayout()
         v.setSpacing(6)
-        lbl = QLabel(label_text)
+        lbl = QLabel(text)
         lbl.setStyleSheet(
-            f"color: {label_color}; font-size: 11px; font-weight: bold; "
+            f"color: {color}; font-size: 11px; font-weight: bold; "
             f"letter-spacing: 0.8px; border: none; background: transparent;"
         )
         v.addWidget(lbl)
@@ -760,18 +725,98 @@ class _ColumnSettingsDialog(QDialog):
         )
         return it
 
-    def _reset_defaults(self):
+    def reset_defaults(self):
         self.visible_list.clear()
         self.hidden_list.clear()
-        for k in StrategyCard.DEFAULT_COLUMN_KEYS:
+        for k in self._defaults:
             self.visible_list.addItem(self._make_item(k))
 
     def result_keys(self):
-        # Order = order of items in the visible list.
         out = []
         for i in range(self.visible_list.count()):
             out.append(self.visible_list.item(i).data(Qt.ItemDataRole.UserRole))
         return out
+
+
+class _ColumnSettingsDialog(QDialog):
+    """
+    Tabbed dialog for customizing both strategy-level columns (home-screen
+    sort bar + per-strategy stats) and leg-level columns (cells inside each
+    leg row in the home dropdown AND the strategy detail page).
+    """
+
+    def __init__(self, current_keys, current_leg_keys, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Customize Columns")
+        self.setMinimumSize(720, 600)
+        self.resize(780, 640)
+        self.setStyleSheet(T.BASE_STYLE)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 20)
+        root.setSpacing(10)
+
+        title = QLabel("Customize Columns")
+        title.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 18px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        root.addWidget(title)
+
+        hint = QLabel(
+            "Drag rows between VISIBLE and HIDDEN to show/hide. "
+            "Drag within VISIBLE to reorder."
+        )
+        hint.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        # Two-tab interface — Strategies and Leg Details. Same change to
+        # leg columns affects every leg display (home drop-down + detail page).
+        tabs = QTabWidget()
+        tabs.setStyleSheet(
+            f"QTabWidget::pane {{ border: 1px solid {T.BORDER}; border-radius: 8px; "
+            f"background: transparent; top: -1px; }}"
+            f"QTabBar::tab {{ background: transparent; color: {T.MUTED}; "
+            f"padding: 8px 18px; margin-right: 4px; border: 1px solid {T.BORDER}; "
+            f"border-bottom: none; border-top-left-radius: 8px; "
+            f"border-top-right-radius: 8px; font-weight: bold; font-size: 12px; }}"
+            f"QTabBar::tab:selected {{ background: {T.CARD}; color: {T.ACCENT}; }}"
+            f"QTabBar::tab:hover:!selected {{ color: {T.TEXT_DIM}; }}"
+        )
+
+        self._strategy_picker = _ColumnPicker(
+            StrategyCard.ALL_COLUMNS,
+            current_keys,
+            StrategyCard.DEFAULT_COLUMN_KEYS,
+        )
+        self._leg_picker = _ColumnPicker(
+            StrategyCard.LEG_ALL_COLUMNS,
+            current_leg_keys,
+            StrategyCard.DEFAULT_LEG_COLUMN_KEYS,
+        )
+
+        s_w = QWidget(); s_l = QVBoxLayout(s_w); s_l.setContentsMargins(14, 14, 14, 14)
+        s_l.addWidget(self._strategy_picker)
+        l_w = QWidget(); l_l = QVBoxLayout(l_w); l_l.setContentsMargins(14, 14, 14, 14)
+        l_l.addWidget(self._leg_picker)
+        tabs.addTab(s_w, "Strategies")
+        tabs.addTab(l_w, "Leg Details")
+        root.addWidget(tabs, 1)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    def result_keys(self):
+        return self._strategy_picker.result_keys()
+
+    def result_leg_keys(self):
+        return self._leg_picker.result_keys()
 
 
 # ── IBKR late-connect probe ──────────────────────────────────────────────────
@@ -913,6 +958,15 @@ class PortfolioScreen(QWidget):
             self._my_columns = saved
         else:
             self._my_columns = all_keys
+
+        # Leg-row columns (per-leg cells inside the expanded strategy card
+        # AND in the strategy detail page). Same shape as my_columns.
+        all_leg_keys = list(StrategyCard.DEFAULT_LEG_COLUMN_KEYS)
+        saved_leg = self._settings.get("my_leg_columns")
+        if isinstance(saved_leg, list) and all(k in all_leg_keys for k in saved_leg) and saved_leg:
+            self._my_leg_columns = saved_leg
+        else:
+            self._my_leg_columns = all_leg_keys
 
         # Section header row: title on the left, "show hidden (N)" on the right
         my_hdr_row = QHBoxLayout()
@@ -1713,19 +1767,26 @@ class PortfolioScreen(QWidget):
                 )
 
     def _open_columns_dialog(self):
-        """Open the customize-columns dialog. Saves the new order on accept."""
-        dlg = _ColumnSettingsDialog(self._my_columns, parent=self)
+        """Open the customize-columns dialog. Saves the new orders on accept."""
+        dlg = _ColumnSettingsDialog(
+            self._my_columns, self._my_leg_columns, parent=self,
+        )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_order = dlg.result_keys()
-            if new_order != self._my_columns:
-                self._my_columns = new_order or list(StrategyCard.DEFAULT_COLUMN_KEYS)
-                self._settings["my_columns"] = list(self._my_columns)
-                api.save_settings(self._settings)
-                # Drop the existing sort bar and re-render the section.
-                self._rebuild_my_sort_bar()
-                acct = self.current_account()
-                if acct:
-                    self._render(acct)
+            new_order     = dlg.result_keys()     or list(StrategyCard.DEFAULT_COLUMN_KEYS)
+            new_leg_order = dlg.result_leg_keys() or list(StrategyCard.DEFAULT_LEG_COLUMN_KEYS)
+            changed = (new_order != self._my_columns
+                       or new_leg_order != self._my_leg_columns)
+            if not changed:
+                return
+            self._my_columns     = new_order
+            self._my_leg_columns = new_leg_order
+            self._settings["my_columns"]     = list(self._my_columns)
+            self._settings["my_leg_columns"] = list(self._my_leg_columns)
+            api.save_settings(self._settings)
+            self._rebuild_my_sort_bar()
+            acct = self.current_account()
+            if acct:
+                self._render(acct)
 
     def _rebuild_my_sort_bar(self):
         """Replace the sort bar with a freshly built one (after column changes)."""
@@ -2439,6 +2500,7 @@ class PortfolioScreen(QWidget):
                     hidden=bool(inst._raw.get("hidden")),
                     history=self.history,
                     column_keys=self._my_columns,
+                    leg_column_keys=self._my_leg_columns,
                 )
                 card.clicked.connect(self.strategy_clicked.emit)
                 card.hide_requested.connect(self._on_strategy_hide)
@@ -2466,7 +2528,8 @@ class PortfolioScreen(QWidget):
         else:
             for strat in unassigned:
                 card = StrategyCard(strat, metrics=metrics,
-                                    column_keys=self._my_columns)
+                                    column_keys=self._my_columns,
+                                    leg_column_keys=self._my_leg_columns)
                 card.clicked.connect(self.strategy_clicked.emit)
                 self.ua_container.addWidget(card)
                 self._ua_cards.append(card)

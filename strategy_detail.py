@@ -180,11 +180,13 @@ class LegRow(QFrame):
         "border-radius: 8px; }}"
     )
 
-    def __init__(self, leg, enabled_greeks, parent=None, group_info=None):
+    def __init__(self, leg, enabled_greeks, parent=None, group_info=None,
+                 leg_column_keys=None):
         super().__init__(parent)
         self.leg = leg
         self.setFixedHeight(44)
         self._set_style(False)
+        self._leg_column_keys = list(leg_column_keys) if leg_column_keys else None
 
         h = QHBoxLayout(self)
         h.setContentsMargins(0, 0, 6, 0)
@@ -267,78 +269,108 @@ class LegRow(QFrame):
 
         ticker_color = T.YELLOW if is_fut else side_color
         ticker_size  = 13 if is_fut else 12
-        id_cells = [
-            (leg.root or "—", ticker_color,        800, 64, ticker_size),
-            (exp_str,         T.TEXT_DIM,          400, 68, 11),
-            (dte_str,         dte_color(leg.dte),  700, 44, 11),
-        ]
-        if not is_fut_contract:
-            id_cells.extend([
-                (strike_str, T.TEXT,      800, 70, 13),
-                (cp_str,     side_color,  800, 32, 13),
-            ])
-        for text, color, weight, width, fsize in id_cells:
-            l = QLabel(text)
-            l.setFixedWidth(width)
-            l.setStyleSheet(
-                f"color: {color}; background: transparent; border: none; "
-                f"font-size: {fsize}px; font-weight: {weight};"
-            )
-            h.addWidget(l)
 
-        if is_fut_contract:
-            pill = QLabel("FUTURES CONTRACT")
-            pill.setFixedHeight(22)
-            pill.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
-            pill.setStyleSheet(
-                f"color: #1a1500; background: {T.YELLOW}; border: none; "
-                f"border-radius: 5px; padding: 1px 8px; "
-                f"font-size: 10px; font-weight: 900; letter-spacing: 0.6px;"
-            )
-            h.addWidget(pill)
+        # Ticker cell — always shown (identity).
+        tk = QLabel(leg.root or "—")
+        tk.setFixedWidth(64)
+        tk.setStyleSheet(
+            f"color: {ticker_color}; background: transparent; border: none; "
+            f"font-size: {ticker_size}px; font-weight: 800;"
+        )
+        h.addWidget(tk)
 
-        # Thin vertical rule separating identity from performance
-        sep = QFrame()
-        sep.setFixedWidth(1)
-        sep.setFixedHeight(22)
-        sep.setStyleSheet(f"background: {T.BORDER}; border: none; margin: 0 4px;")
-        h.addWidget(sep)
-
-        # ── Performance columns: P&L | P&L% | Day | Θ$ | DIT | DTE ─────────
-        perf_cells = [
-            (money(leg.pnl, signed=True), pnl_color(leg.pnl),               800, 90, 13),
-            (pnl_pct_str,   pnl_color(pnl_pct_val),                          600, 68, 11),
-            (money(day, signed=True) if day is not None else "—",
-             pnl_color(day) if day is not None else T.MUTED,                  700, 82, 12),
-            (theta_str,     theta_clr,                                        600, 66, 11),
-            (dit_str,       T.TEXT_DIM,                                       400, 44, 10),
-            (dte_str,       dte_color(leg.dte),                               600, 44, 10),
-        ]
-        for text, color, weight, width, fsize in perf_cells:
-            l = QLabel(text)
-            l.setFixedWidth(width)
-            l.setStyleSheet(
-                f"color: {color}; background: transparent; border: none; "
-                f"font-size: {fsize}px; font-weight: {weight};"
-            )
-            h.addWidget(l)
-
-        # ── Greek cells (optional extras) ─────────────────────────────────
-        greek_vals = {
-            "delta": _fmt_greek(leg.delta),
-            "gamma": _fmt_greek(leg.gamma),
-            "vega":  _fmt_greek(leg.vega),
+        # Per-key cell builder — fixed widths matching the original layout
+        # so the rows stay aligned across legs even with different visible
+        # column sets.
+        WIDTH = {
+            "exp":     68,  "dte":     44,  "strike":  70,  "cp":      32,
+            "pnl":     90,  "pnl_pct": 68,  "day":     82,  "theta_d": 66,
+            "delta":   60,  "gamma":   60,  "vega":    60,  "dit":     44,
         }
-        for key in _GREEK_ORDER:
-            if key in enabled_greeks:
-                _, width = _GREEK_COL_DEFS[key]
-                l = QLabel(greek_vals[key])
-                l.setFixedWidth(width)
-                l.setStyleSheet(
-                    f"color: {T.TEXT_DIM}; background: transparent; border: none; "
-                    f"font-size: 11px; font-weight: 500;"
-                )
-                h.addWidget(l)
+        SIZE = {
+            "exp":     11,  "dte":     11,  "strike":  13,  "cp":      13,
+            "pnl":     13,  "pnl_pct": 11,  "day":     12,  "theta_d": 11,
+            "delta":   11,  "gamma":   11,  "vega":    11,  "dit":     10,
+        }
+        WEIGHT = {
+            "exp":     400, "dte":     700, "strike":  800, "cp":      800,
+            "pnl":     800, "pnl_pct": 600, "day":     700, "theta_d": 600,
+            "delta":   500, "gamma":   500, "vega":    500, "dit":     400,
+        }
+
+        def _add_cell(text, color, key):
+            l = QLabel(text)
+            l.setFixedWidth(WIDTH.get(key, 60))
+            l.setStyleSheet(
+                f"color: {color}; background: transparent; border: none; "
+                f"font-size: {SIZE.get(key, 11)}px; "
+                f"font-weight: {WEIGHT.get(key, 500)};"
+            )
+            h.addWidget(l)
+
+        # Default keys = the legacy order (preserves visual layout when
+        # leg_column_keys isn't passed).
+        keys = self._leg_column_keys or [
+            "exp", "dte", "strike", "cp",
+            "pnl", "pnl_pct", "day", "theta_d", "dit", "dte",
+        ]
+
+        sep_inserted = [False]
+        identity_keys = {"exp", "dte", "strike", "cp"}
+
+        def _maybe_separator(key):
+            if not sep_inserted[0] and key not in identity_keys:
+                sep = QFrame()
+                sep.setFixedWidth(1)
+                sep.setFixedHeight(22)
+                sep.setStyleSheet(f"background: {T.BORDER}; border: none; margin: 0 4px;")
+                h.addWidget(sep)
+                sep_inserted[0] = True
+
+        future_pill_drawn = [False]
+
+        for key in keys:
+            _maybe_separator(key)
+
+            if key in ("strike", "cp") and is_fut_contract:
+                if not future_pill_drawn[0]:
+                    pill = QLabel("FUTURES CONTRACT")
+                    pill.setFixedHeight(22)
+                    pill.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
+                    pill.setStyleSheet(
+                        f"color: #1a1500; background: {T.YELLOW}; border: none; "
+                        f"border-radius: 5px; padding: 1px 8px; "
+                        f"font-size: 10px; font-weight: 900; letter-spacing: 0.6px;"
+                    )
+                    h.addWidget(pill)
+                    future_pill_drawn[0] = True
+                continue
+
+            if key == "exp":
+                _add_cell(exp_str, T.TEXT_DIM, key)
+            elif key == "dte":
+                _add_cell(dte_str, dte_color(leg.dte), key)
+            elif key == "strike":
+                _add_cell(strike_str, T.TEXT, key)
+            elif key == "cp":
+                _add_cell(cp_str, side_color, key)
+            elif key == "pnl":
+                _add_cell(money(leg.pnl, signed=True), pnl_color(leg.pnl), key)
+            elif key == "pnl_pct":
+                _add_cell(pnl_pct_str, pnl_color(pnl_pct_val), key)
+            elif key == "day":
+                txt = money(day, signed=True) if day is not None else "—"
+                _add_cell(txt, pnl_color(day) if day is not None else T.MUTED, key)
+            elif key == "theta_d":
+                _add_cell(theta_str, theta_clr, key)
+            elif key == "dit":
+                _add_cell(dit_str, T.TEXT_DIM, key)
+            elif key == "delta":
+                _add_cell(_fmt_greek(leg.delta), T.TEXT_DIM, key)
+            elif key == "gamma":
+                _add_cell(_fmt_greek(leg.gamma), T.TEXT_DIM, key)
+            elif key == "vega":
+                _add_cell(_fmt_greek(leg.vega),  T.TEXT_DIM, key)
 
         h.addStretch()
 
@@ -381,7 +413,8 @@ class _LegsBody(QWidget):
         "#a78bfa", "#2dd4bf", "#fb923c",
     )
 
-    def __init__(self, legs, enabled_greeks, parent=None, leg_groups=None):
+    def __init__(self, legs, enabled_greeks, parent=None, leg_groups=None,
+                 leg_column_keys=None):
         super().__init__(parent)
         self._rows: list[LegRow] = []
         self._dragging: LegRow | None = None
@@ -400,7 +433,8 @@ class _LegsBody(QWidget):
 
         for leg in legs:
             row = LegRow(leg, enabled_greeks,
-                         group_info=sym_to_group.get(getattr(leg, "symbol", None)))
+                         group_info=sym_to_group.get(getattr(leg, "symbol", None)),
+                         leg_column_keys=leg_column_keys)
             row.drag_started.connect(self._on_drag_started)
             self._rows.append(row)
             self._lay.addWidget(row)
@@ -1085,7 +1119,18 @@ class StrategyDetailPage(QWidget):
 
         leg_groups = (self.strategy._raw.get("leg_groups") or []
                       if isinstance(self.strategy, StrategyInstance) else [])
-        body = _LegsBody(legs, enabled_greeks, leg_groups=leg_groups)
+        # Pull configured leg-column order from settings so the detail
+        # page matches the home-page drop-down.
+        leg_keys = None
+        try:
+            settings = api.load_settings() or {}
+            saved = settings.get("my_leg_columns")
+            if isinstance(saved, list) and saved:
+                leg_keys = saved
+        except Exception:
+            pass
+        body = _LegsBody(legs, enabled_greeks, leg_groups=leg_groups,
+                         leg_column_keys=leg_keys)
         if isinstance(self.strategy, StrategyInstance):
             body.reordered.connect(self._on_legs_reordered)
         lay.addWidget(body)

@@ -93,13 +93,38 @@ class StrategyCard(QFrame):
     )
     DEFAULT_COLUMN_KEYS = tuple(c[0] for c in ALL_COLUMNS)
 
+    # ── LEG-LEVEL columns (shown inside each leg row) ─────────────────────
+    # Identity columns (qty, group marker, ticker, FUT pill, futures-contract
+    # pill) always render — they're not configurable. Everything else IS.
+    LEG_ALL_COLUMNS = (
+        ("exp",     "Expiration"),
+        ("dte",     "DTE"),
+        ("strike",  "Strike"),
+        ("cp",      "C/P"),
+        ("pnl",     "P&L"),
+        ("pnl_pct", "P&L %"),
+        ("day",     "Day P&L"),
+        ("theta_d", "Θ $"),
+        ("delta",   "Δ"),
+        ("gamma",   "Γ"),
+        ("vega",    "V"),
+        ("dit",     "DIT"),
+    )
+    DEFAULT_LEG_COLUMN_KEYS = (
+        "exp", "dte", "strike", "cp", "pnl", "pnl_pct", "day", "theta_d", "dit",
+    )
+
     def __init__(self, strategy, parent=None, metrics=None, hidden=False,
-                 history=None, column_keys=None):
+                 history=None, column_keys=None, leg_column_keys=None):
         super().__init__(parent)
         self.strategy = strategy
         self.metrics = metrics or {}
         self.is_hidden = bool(hidden)
         self.history = history or []
+        self.leg_column_keys = (
+            list(leg_column_keys) if leg_column_keys
+            else list(self.DEFAULT_LEG_COLUMN_KEYS)
+        )
 
         # Build a {leg_symbol: (color, group_name)} map from the strategy's
         # saved leg groups (set in the strategy detail page). Used by
@@ -543,36 +568,10 @@ class StrategyCard(QFrame):
         ticker_size  = 14 if is_fut else 13
         row.addWidget(_cell(leg.root or "—", ticker_color, 800, ticker_size))
 
+        # Pre-compute everything once; stat cells are added based on the
+        # configured leg-column order.
         exp_str = leg.expires_at.strftime("%b %d") if leg.expires_at else "—"
-        row.addWidget(_cell(exp_str, T.TEXT_DIM, 400, 12))
-
         dte_str = f"{leg.dte}d" if leg.dte is not None else "—"
-        row.addWidget(_cell(dte_str, dte_color(leg.dte), 700, 12))
-
-        if is_fut_contract:
-            pill = QLabel("FUTURES CONTRACT")
-            pill.setStyleSheet(
-                f"color: #1a1500; background: {T.YELLOW}; border: none; "
-                f"border-radius: 5px; padding: 3px 10px; "
-                f"font-size: 11px; font-weight: 900; letter-spacing: 0.6px;"
-            )
-            row.addWidget(pill)
-        else:
-            strike_str = f"{leg.strike:g}" if leg.strike else "—"
-            row.addWidget(_cell(strike_str, T.TEXT, 800, 14))
-            cp_str = leg.call_put or "—"
-            row.addWidget(_cell(cp_str, side_color, 800, 14))
-
-        # Thin vertical rule separating identity from performance
-        sep = QFrame()
-        sep.setFixedWidth(1)
-        sep.setFixedHeight(22)
-        sep.setStyleSheet(f"background: {T.BORDER}; border: none; margin: 0 4px;")
-        row.addWidget(sep)
-
-        # ── Performance: P&L | P&L% | Day | Θ$ | DIT | DTE ──────────────
-        row.addWidget(_cell(money(leg.pnl, signed=True),
-                            pnl_color(leg.pnl), 800, 14))
 
         pnl_pct = leg.pnl_pct
         if pnl_pct is not None:
@@ -580,7 +579,6 @@ class StrategyCard(QFrame):
                            else f"−{abs(pnl_pct):.1f}%")
         else:
             pnl_pct_str = "—"
-        row.addWidget(_cell(pnl_pct_str, pnl_color(pnl_pct), 600, 12))
 
         if leg.close_price and leg.close_price > 0 and leg.mark_price:
             day_pnl = (leg.sign * leg.quantity * leg.multiplier
@@ -588,8 +586,6 @@ class StrategyCard(QFrame):
         else:
             day_pnl = None
         day_str = money(day_pnl, signed=True) if day_pnl is not None else "—"
-        row.addWidget(_cell(day_str,
-                            pnl_color(day_pnl) if day_pnl is not None else T.MUTED, 700, 13))
 
         if _is_future_option(leg.instrument_type):
             theta_mult = float(_CONTRACT_MULT.get(leg.root or "", 1))
@@ -598,14 +594,77 @@ class StrategyCard(QFrame):
         theta_dollar = (leg.theta * leg.quantity * theta_mult * leg.sign
                         if leg.theta is not None else None)
         theta_str = money(theta_dollar, signed=True) if theta_dollar is not None else "—"
-        row.addWidget(_cell(theta_str,
-                            pnl_color(theta_dollar) if theta_dollar is not None else T.MUTED,
-                            600, 12))
 
         dit_str = f"{leg.dit}d" if leg.dit is not None else "—"
-        row.addWidget(_cell(dit_str, T.TEXT_DIM, 400, 11))
 
-        row.addWidget(_cell(dte_str, dte_color(leg.dte), 600, 11))
+        # Insert a vertical rule between the identity cells (exp/dte/strike/cp)
+        # and the performance cells (pnl/pnl_pct/day/...) once we cross over.
+        sep_inserted = [False]
+        identity_keys = {"exp", "dte", "strike", "cp"}
+
+        def _maybe_separator(key):
+            if not sep_inserted[0] and key not in identity_keys:
+                sep = QFrame()
+                sep.setFixedWidth(1)
+                sep.setFixedHeight(22)
+                sep.setStyleSheet(f"background: {T.BORDER}; border: none; margin: 0 4px;")
+                row.addWidget(sep)
+                sep_inserted[0] = True
+
+        # For futures contracts, the "FUTURES CONTRACT" pill replaces strike+cp.
+        # We render it on the first 'strike' key we encounter and skip the 'cp'.
+        future_pill_drawn = [False]
+
+        for key in self.leg_column_keys:
+            _maybe_separator(key)
+
+            if key in ("strike", "cp") and is_fut_contract:
+                if not future_pill_drawn[0]:
+                    pill = QLabel("FUTURES CONTRACT")
+                    pill.setStyleSheet(
+                        f"color: #1a1500; background: {T.YELLOW}; border: none; "
+                        f"border-radius: 5px; padding: 3px 10px; "
+                        f"font-size: 11px; font-weight: 900; letter-spacing: 0.6px;"
+                    )
+                    row.addWidget(pill)
+                    future_pill_drawn[0] = True
+                continue
+
+            if key == "exp":
+                row.addWidget(_cell(exp_str, T.TEXT_DIM, 400, 12))
+            elif key == "dte":
+                row.addWidget(_cell(dte_str, dte_color(leg.dte), 700, 12))
+            elif key == "strike":
+                strike_str = f"{leg.strike:g}" if leg.strike else "—"
+                row.addWidget(_cell(strike_str, T.TEXT, 800, 14))
+            elif key == "cp":
+                cp_str = leg.call_put or "—"
+                row.addWidget(_cell(cp_str, side_color, 800, 14))
+            elif key == "pnl":
+                row.addWidget(_cell(money(leg.pnl, signed=True),
+                                    pnl_color(leg.pnl), 800, 14))
+            elif key == "pnl_pct":
+                row.addWidget(_cell(pnl_pct_str, pnl_color(pnl_pct), 600, 12))
+            elif key == "day":
+                row.addWidget(_cell(
+                    day_str,
+                    pnl_color(day_pnl) if day_pnl is not None else T.MUTED,
+                    700, 13,
+                ))
+            elif key == "theta_d":
+                row.addWidget(_cell(
+                    theta_str,
+                    pnl_color(theta_dollar) if theta_dollar is not None else T.MUTED,
+                    600, 12,
+                ))
+            elif key == "delta":
+                row.addWidget(_cell(_fmt_greek(leg.delta), T.TEXT_DIM, 500, 11))
+            elif key == "gamma":
+                row.addWidget(_cell(_fmt_greek(leg.gamma), T.TEXT_DIM, 500, 11))
+            elif key == "vega":
+                row.addWidget(_cell(_fmt_greek(leg.vega),  T.TEXT_DIM, 500, 11))
+            elif key == "dit":
+                row.addWidget(_cell(dit_str, T.TEXT_DIM, 400, 11))
 
         row.addStretch()
         return card
