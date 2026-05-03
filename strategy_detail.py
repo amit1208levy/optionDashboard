@@ -1160,7 +1160,12 @@ class StrategyDetailPage(QWidget):
     def _current_spot(self):
         """
         Best-effort current price of the underlying for this strategy.
-        Tries: option leg's underlying_price → stock leg's mark → live API quote.
+        Tries:
+          1. an option leg's `underlying_price`
+          2. a stock leg's mark price
+          3. a live quote via the configured quotes provider
+          4. average of option strikes (last-resort reference for when no
+             live quote is available — at least the slider has a baseline)
         Returns float or None.
         """
         legs = self.strategy.legs
@@ -1197,6 +1202,14 @@ class StrategyDetailPage(QWidget):
                 pass
         except Exception:
             pass
+
+        # Last-resort fallback: average of option strikes. Not the live
+        # underlying, but at least it gives the % slider a reasonable
+        # reference and keeps the UI usable when no quote is available.
+        strikes = [float(l.strike) for l in legs
+                   if l.is_option and l.strike and l.strike > 0]
+        if strikes:
+            return sum(strikes) / len(strikes)
         return None
 
     def _build_exit_plan_card(self):
@@ -1460,6 +1473,26 @@ class StrategyDetailPage(QWidget):
             dte_ctx, "dte",
         ))
 
+        # Show the current underlying at the top of the right column so the
+        # user sees the reference price BEFORE the stop fields below.
+        if underlying is not None:
+            spot_lbl = QLabel(
+                f"Current underlying:  <b style='color:{T.TEXT}'>"
+                f"{underlying:.{decimals_u}f}</b>"
+            )
+            spot_lbl.setTextFormat(Qt.TextFormat.RichText)
+            spot_lbl.setStyleSheet(
+                f"color: {T.LABEL}; font-size: 12px; border: none; "
+                f"padding: 4px 0; background: transparent;"
+            )
+        else:
+            spot_lbl = QLabel("Current underlying:  —  (enter target prices manually)")
+            spot_lbl.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 11px; border: none; "
+                f"padding: 4px 0; background: transparent;"
+            )
+        right.addWidget(spot_lbl)
+
         right.addLayout(_spot_row(
             "Stop Below", "underlying_below",
             "Stop out if underlying price falls to or below this level",
@@ -1470,14 +1503,6 @@ class StrategyDetailPage(QWidget):
             "Stop out if underlying price rises to or above this level",
             "above", is_below=False,
         ))
-        if underlying is not None:
-            spot_lbl = QLabel(f"Current underlying:  {underlying:.{decimals_u}f}")
-            spot_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none; margin-top: 4px;")
-            right.addWidget(spot_lbl)
-        else:
-            spot_lbl = QLabel("Current underlying:  —  enter target prices manually")
-            spot_lbl.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none; margin-top: 4px;")
-            right.addWidget(spot_lbl)
         right.addStretch()
 
         cols = QHBoxLayout()
