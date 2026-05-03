@@ -454,12 +454,26 @@ def _draw_vix_chart(chart: "_ScenarioChart",
 class RiskPage(QWidget):
     back_requested = pyqtSignal()
 
+    # (column label, sort key, fixed width, default ascending direction)
+    # Widths must match the per-row column widths in _AllocationRow exactly so
+    # the header labels line up over the values they sort.
+    _ALLOC_SORT_COLS = [
+        ("ALLOC",     "pct",     90,  False),   # high % first
+        ("CAPITAL",   "capital", 120, False),   # high $ first
+        ("OPEN P&L",  "pnl",     120, False),   # winners first
+    ]
+
     def __init__(self, portfolio, parent=None):
         super().__init__(parent)
         self.portfolio = portfolio
         self._worker   = None
         self._spy_chart = None
         self._vix_chart = None
+        self._alloc_sort_col = None
+        self._alloc_sort_asc = False
+        self._alloc_rows = []           # latest rows from strategy_allocation
+        self._alloc_rows_container = None
+        self._alloc_sort_lbls: dict = {}
         self.setStyleSheet(T.BASE_STYLE)
 
         root_lay = QVBoxLayout(self)
@@ -654,6 +668,67 @@ class RiskPage(QWidget):
 
     # ── allocation section ────────────────────────────────────────────────────
 
+    # ── allocation-table sort helpers ─────────────────────────────────────────
+
+    def _render_alloc_rows(self):
+        """(Re)populate the allocation rows container, sorted by the active column."""
+        if self._alloc_rows_container is None:
+            return
+        # Clear prior rows
+        while self._alloc_rows_container.count():
+            it = self._alloc_rows_container.takeAt(0)
+            w = it.widget()
+            if w:
+                w.deleteLater()
+
+        rows = list(self._alloc_rows)
+        col  = self._alloc_sort_col
+        if col:
+            def _key(r):
+                v = r.get(col)
+                return (0, v) if v is not None else (1, 0)
+            rows.sort(key=_key, reverse=not self._alloc_sort_asc)
+
+        for i, r in enumerate(rows):
+            color = _PALETTE[i % len(_PALETTE)]
+            self._alloc_rows_container.addWidget(_AllocationRow(r, color))
+
+    def _update_alloc_sort_headers(self):
+        # Same active/inactive styling pattern as the home-page sort bar:
+        # equal padding both states, trailing 2-space placeholder for the arrow.
+        for key, (lbl, base, _ad) in (self._alloc_sort_lbls or {}).items():
+            if key == self._alloc_sort_col:
+                arrow = " ▲" if self._alloc_sort_asc else " ▼"
+                lbl.setText(base + arrow)
+                lbl.setStyleSheet(
+                    f"color: {T.ACCENT}; font-size: 10px; font-weight: bold; "
+                    f"letter-spacing: 0.4px; border: none; "
+                    f"background: {T.CARD_ALT}; border-radius: 3px; "
+                    f"padding: 1px 3px;"
+                )
+            else:
+                lbl.setText(f"{base}  ")
+                lbl.setStyleSheet(
+                    f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
+                    f"letter-spacing: 0.4px; border: none; "
+                    f"background: transparent; border-radius: 3px; "
+                    f"padding: 1px 3px;"
+                )
+
+    def _on_alloc_sort_click(self, col_key: str, default_asc: bool):
+        if self._alloc_sort_col == col_key:
+            if self._alloc_sort_asc == default_asc:
+                self._alloc_sort_asc = not self._alloc_sort_asc
+            else:
+                # Third click → clear
+                self._alloc_sort_col = None
+                self._alloc_sort_asc = False
+        else:
+            self._alloc_sort_col = col_key
+            self._alloc_sort_asc = default_asc
+        self._update_alloc_sort_headers()
+        self._render_alloc_rows()
+
     def _build_allocation(self, instances, unassigned, overrides):
         self.body.addWidget(self._section_header("PORTFOLIO ALLOCATION BY STRATEGY"))
         card, lay = self._card_frame()
@@ -686,34 +761,53 @@ class RiskPage(QWidget):
         ))
         lay.addLayout(pie_row)
 
-        # ── column headers ───────────────────────────────────────────────────
+        # ── column headers (clickable for sort, same look as home page) ─────
         lay.addSpacing(10)
         hdr_row = QHBoxLayout()
-        hdr_row.setContentsMargins(22, 0, 0, 0)
+        hdr_row.setContentsMargins(22, 0, 20, 0)
         hdr_row.setSpacing(0)
-        for text, width, align in [
-            ("Strategy",  0,   Qt.AlignmentFlag.AlignLeft),
-            ("Alloc",     90,  Qt.AlignmentFlag.AlignRight),
-            ("Capital",   120, Qt.AlignmentFlag.AlignRight),
-            ("Open P&L",  120, Qt.AlignmentFlag.AlignRight),
-        ]:
-            lbl = QLabel(text)
-            lbl.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
-                f"letter-spacing: 0.4px; border: none;"
+
+        # Strategy column (non-sortable, takes remaining space)
+        strat_lbl = QLabel("STRATEGY")
+        strat_lbl.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
+            f"letter-spacing: 0.4px; border: none; padding: 1px 3px;"
+        )
+        strat_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        hdr_row.addWidget(strat_lbl, 1)
+        # Account for the colored accent (6) + spacing (16) consumed by the
+        # left edge of every _AllocationRow, so the STRATEGY label sits over
+        # the strategy name rather than over the accent bar.
+        hdr_row.insertSpacing(0, 6 + 16)
+
+        self._alloc_sort_lbls = {}
+        for label, key, width, asc_default in self._ALLOC_SORT_COLS:
+            lbl = QLabel(f"{label}  ")
+            lbl.setFixedWidth(width)
+            lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+            lbl.setToolTip(f"Sort by {label}  ·  click again to reverse  ·  third click clears")
+            lbl.mousePressEvent = (
+                lambda _e, k=key, a=asc_default: self._on_alloc_sort_click(k, a)
             )
-            if width:
-                lbl.setFixedWidth(width)
-            lbl.setAlignment(align)
-            hdr_row.addWidget(lbl, 0 if width else 1)
+            self._alloc_sort_lbls[key] = (lbl, label, asc_default)
+            hdr_row.addWidget(lbl)
+            # Spacing between columns matches _AllocationRow's hl.addSpacing(20/16/...).
+            if key == "pct":
+                hdr_row.addSpacing(20)
+            elif key == "capital":
+                hdr_row.addSpacing(16)
+        self._update_alloc_sort_headers()
         lay.addLayout(hdr_row)
         lay.addSpacing(4)
 
-        # ── per-strategy rows ────────────────────────────────────────────────
-        for i, r in enumerate(rows):
-            row = _AllocationRow(r, _PALETTE[i % len(_PALETTE)])
-            lay.addWidget(row)
-            lay.setSpacing(6)
+        # ── per-strategy rows (in a container so sort can re-render just these) ─
+        self._alloc_rows = list(rows)
+        self._alloc_rows_container = QVBoxLayout()
+        self._alloc_rows_container.setSpacing(6)
+        self._alloc_rows_container.setContentsMargins(0, 0, 0, 0)
+        lay.addLayout(self._alloc_rows_container)
+        self._render_alloc_rows()
 
         # ── footer ───────────────────────────────────────────────────────────
         sep = QFrame()
