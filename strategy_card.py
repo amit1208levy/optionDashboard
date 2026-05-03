@@ -245,42 +245,29 @@ class StrategyCard(QFrame):
             width=72,
         ))
 
-        # ── YTD and All-Time P&L (open + realized history) ─────────────────
+        # ── YTD P&L (open + realized history this year) ─────────────────────
+        # Rendered for EVERY card — even if the strategy has no id (e.g. auto-
+        # grouped legs) — so the column widths match across all cards and the
+        # sort-header bar lines up over its values. Empty values fall back to
+        # "—" placeholders so the column still occupies the same width.
         from models import strategy_pnl_summary
         sid = getattr(strategy, "id", None)
         summary = strategy_pnl_summary(sid, self.history, strategy) if sid else None
-        if summary is not None:
-            ytd_total = summary["total_ytd"]
-            all_total = summary["total_all"]
-            ytd_pct   = summary["total_ytd_pct"]
-            all_pct   = summary["total_all_pct"]
+        ytd_total = summary["total_ytd"]    if summary else None
+        ytd_pct   = summary["total_ytd_pct"] if summary else None
 
-            h.addWidget(self._stat(
-                "P&L YTD",
-                money(ytd_total, signed=True),
-                pnl_color(ytd_total),
-                width=100,
-            ))
-            h.addWidget(self._stat(
-                "YTD %",
-                pct(ytd_pct) if ytd_pct is not None else "—",
-                pnl_color(ytd_pct) if ytd_pct is not None else T.MUTED,
-                width=72,
-            ))
-            # Hide All Time when it equals YTD (no closed legs from prior years).
-            if abs(all_total - ytd_total) > 0.01:
-                h.addWidget(self._stat(
-                    "All Time",
-                    money(all_total, signed=True),
-                    pnl_color(all_total),
-                    width=100,
-                ))
-                h.addWidget(self._stat(
-                    "All %",
-                    pct(all_pct) if all_pct is not None else "—",
-                    pnl_color(all_pct) if all_pct is not None else T.MUTED,
-                    width=72,
-                ))
+        h.addWidget(self._stat(
+            "P&L YTD",
+            money(ytd_total, signed=True) if ytd_total is not None else "—",
+            pnl_color(ytd_total) if ytd_total is not None else T.MUTED,
+            width=100,
+        ))
+        h.addWidget(self._stat(
+            "YTD %",
+            pct(ytd_pct) if ytd_pct is not None else "—",
+            pnl_color(ytd_pct) if ytd_pct is not None else T.MUTED,
+            width=72,
+        ))
 
         # Cache values for the parent's sort logic — exposes computed numbers
         # without re-deriving them in app.py.
