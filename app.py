@@ -822,10 +822,28 @@ class PortfolioScreen(QWidget):
             f"QFrame {{ background: {T.CARD}; border-bottom: 1px solid {T.BORDER}; border-radius: 0; }}"
         )
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(28, 0, 28, 0)
-        hl.setSpacing(16)
+        hl.setContentsMargins(20, 0, 28, 0)
+        hl.setSpacing(12)
 
-        title = QLabel("⬢  Options Dashboard")
+        # App logo — show AppIcon.png if it's bundled next to app.py.
+        # Falls back to the previous hex-glyph if the file is missing.
+        from PyQt6.QtGui import QPixmap
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AppIcon.png")
+        if os.path.exists(icon_path):
+            logo = QLabel()
+            pix = QPixmap(icon_path).scaled(
+                36, 36,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            logo.setPixmap(pix)
+            logo.setStyleSheet("background: transparent; border: none;")
+            hl.addWidget(logo)
+            title_text = "Options Dashboard"
+        else:
+            title_text = "⬢  Options Dashboard"
+
+        title = QLabel(title_text)
         title.setStyleSheet(
             f"color: {T.ACCENT}; font-size: 17px; font-weight: bold; border: none; background: transparent;"
         )
