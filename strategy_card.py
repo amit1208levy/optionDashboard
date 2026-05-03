@@ -76,7 +76,25 @@ class StrategyCard(QFrame):
         "#fb923c",  # orange
     )
 
-    def __init__(self, strategy, parent=None, metrics=None, hidden=False, history=None):
+    # Master column registry. Used for both the sort-header bar and the per-
+    # card stats so they stay in sync. Tuple: (key, label, width, default_asc).
+    # ALL_COLUMNS is the complete catalog; the user picks which to show and
+    # in what order via the column-settings dialog.
+    ALL_COLUMNS = (
+        ("dte",     "DTE",       68,  True),
+        ("pop",     "POP",       68,  False),
+        ("delta",   "Δ",         82,  False),
+        ("theta",   "Θ",         82,  False),
+        ("day",     "DAY P&L",   100, False),
+        ("pnl",     "OPEN P&L",  100, False),
+        ("pnl_pct", "P&L %",     72,  False),
+        ("ytd",     "P&L YTD",   100, False),
+        ("ytd_pct", "YTD %",     72,  False),
+    )
+    DEFAULT_COLUMN_KEYS = tuple(c[0] for c in ALL_COLUMNS)
+
+    def __init__(self, strategy, parent=None, metrics=None, hidden=False,
+                 history=None, column_keys=None):
         super().__init__(parent)
         self.strategy = strategy
         self.metrics = metrics or {}
@@ -183,91 +201,81 @@ class StrategyCard(QFrame):
 
         h.addLayout(left, 3)
 
-        # ── Right: essential stats only ────────────────────────────────────
-        h.addWidget(self._stat(
-            "DTE",
-            str(strategy.dte) if strategy.dte is not None else "—",
-            T.TEXT,
-            width=68,
-        ))
+        # ── Stats: render columns in the order the user configured ───────
+        # Compute every value up-front; we'll iterate column_keys to add
+        # only the ones the user wants, in the order they want.
+        col_meta = {k: (label, w) for k, label, w, _ in self.ALL_COLUMNS}
+        column_keys = list(column_keys or self.DEFAULT_COLUMN_KEYS)
 
+        from models import strategy_pnl_summary
+        sid     = getattr(strategy, "id", None)
+        summary = strategy_pnl_summary(sid, self.history, strategy) if sid else None
+
+        # POP
         pop = probability_of_profit(strategy)
-        if pop is None:
-            pop_text, pop_c = "—", T.MUTED
-        else:
-            pop_text = f"{pop:.0f}%"
-            pop_c = T.GREEN if pop >= 60 else (T.YELLOW if pop >= 40 else T.RED)
-        h.addWidget(self._stat("POP", pop_text, pop_c, width=68))
-
-        # Net Δ and Θ in dollar units (Strategy._agg multiplies by contract mult)
+        # Net Δ / Θ
         nd = strategy.net_delta
-        if nd is None:
-            d_text, d_c = "—", T.MUTED
-        else:
-            d_text = f"{nd:+,.0f}" if abs(nd) >= 100 else f"{nd:+.1f}"
-            d_text = d_text.replace("-", "−")
-            d_c = pnl_color(nd)
-        h.addWidget(self._stat("Δ", d_text, d_c, width=82))
-
         nt = strategy.net_theta
-        if nt is None:
-            t_text, t_c = "—", T.MUTED
-        else:
-            t_text = f"{nt:+,.0f}" if abs(nt) >= 100 else f"{nt:+.1f}"
-            t_text = t_text.replace("-", "−")
-            t_c = pnl_color(nt)
-        h.addWidget(self._stat("Θ", t_text, t_c, width=82))
-
-        # Day P&L: sum over legs of sign × qty × mult × (mark − close_price)
+        # Day P&L
         day_pnl = sum(
             l.sign * l.quantity * l.multiplier * (l.mark_price - l.close_price)
             for l in strategy.legs
             if l.close_price and l.close_price > 0 and l.mark_price
         )
-        if day_pnl == 0:
-            day_text, day_c = "—", T.MUTED
-        else:
-            day_text = money(day_pnl, signed=True)
-            day_c = pnl_color(day_pnl)
-        h.addWidget(self._stat("Day P&L", day_text, day_c, width=100))
-
-        h.addWidget(self._stat(
-            "Open P&L",
-            money(strategy.pnl, signed=True),
-            pnl_color(strategy.pnl),
-            is_pnl=True,
-            width=100,
-        ))
-        h.addWidget(self._stat(
-            "P&L %",
-            pct(strategy.pnl_pct),
-            pnl_color(strategy.pnl_pct),
-            width=72,
-        ))
-
-        # ── YTD P&L (open + realized history this year) ─────────────────────
-        # Rendered for EVERY card — even if the strategy has no id (e.g. auto-
-        # grouped legs) — so the column widths match across all cards and the
-        # sort-header bar lines up over its values. Empty values fall back to
-        # "—" placeholders so the column still occupies the same width.
-        from models import strategy_pnl_summary
-        sid = getattr(strategy, "id", None)
-        summary = strategy_pnl_summary(sid, self.history, strategy) if sid else None
-        ytd_total = summary["total_ytd"]    if summary else None
+        # YTD totals
+        ytd_total = summary["total_ytd"]     if summary else None
         ytd_pct   = summary["total_ytd_pct"] if summary else None
 
-        h.addWidget(self._stat(
-            "P&L YTD",
-            money(ytd_total, signed=True) if ytd_total is not None else "—",
-            pnl_color(ytd_total) if ytd_total is not None else T.MUTED,
-            width=100,
-        ))
-        h.addWidget(self._stat(
-            "YTD %",
-            pct(ytd_pct) if ytd_pct is not None else "—",
-            pnl_color(ytd_pct) if ytd_pct is not None else T.MUTED,
-            width=72,
-        ))
+        def _greek_text(v):
+            if v is None:
+                return "—", T.MUTED
+            t = (f"{v:+,.0f}" if abs(v) >= 100 else f"{v:+.1f}").replace("-", "−")
+            return t, pnl_color(v)
+
+        for key in column_keys:
+            if key not in col_meta:
+                continue
+            label, width = col_meta[key]
+            if key == "dte":
+                txt = str(strategy.dte) if strategy.dte is not None else "—"
+                h.addWidget(self._stat(label, txt, T.TEXT, width=width))
+            elif key == "pop":
+                if pop is None:
+                    txt, c = "—", T.MUTED
+                else:
+                    txt = f"{pop:.0f}%"
+                    c = T.GREEN if pop >= 60 else (T.YELLOW if pop >= 40 else T.RED)
+                h.addWidget(self._stat(label, txt, c, width=width))
+            elif key == "delta":
+                txt, c = _greek_text(nd)
+                h.addWidget(self._stat(label, txt, c, width=width))
+            elif key == "theta":
+                txt, c = _greek_text(nt)
+                h.addWidget(self._stat(label, txt, c, width=width))
+            elif key == "day":
+                if day_pnl == 0:
+                    txt, c = "—", T.MUTED
+                else:
+                    txt, c = money(day_pnl, signed=True), pnl_color(day_pnl)
+                h.addWidget(self._stat(label, txt, c, width=width))
+            elif key == "pnl":
+                h.addWidget(self._stat(
+                    label, money(strategy.pnl, signed=True),
+                    pnl_color(strategy.pnl), is_pnl=True, width=width,
+                ))
+            elif key == "pnl_pct":
+                h.addWidget(self._stat(
+                    label, pct(strategy.pnl_pct),
+                    pnl_color(strategy.pnl_pct), width=width,
+                ))
+            elif key == "ytd":
+                txt = (money(ytd_total, signed=True) if ytd_total is not None else "—")
+                c   = pnl_color(ytd_total) if ytd_total is not None else T.MUTED
+                h.addWidget(self._stat(label, txt, c, width=width))
+            elif key == "ytd_pct":
+                txt = (pct(ytd_pct) if ytd_pct is not None else "—")
+                c   = pnl_color(ytd_pct) if ytd_pct is not None else T.MUTED
+                h.addWidget(self._stat(label, txt, c, width=width))
 
         # Cache values for the parent's sort logic — exposes computed numbers
         # without re-deriving them in app.py.

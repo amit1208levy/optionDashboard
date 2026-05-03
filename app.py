@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QStackedWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QComboBox,
     QDialog, QDialogButtonBox, QFormLayout, QMessageBox, QTextEdit,
-    QCheckBox,
+    QCheckBox, QListWidget, QListWidgetItem, QAbstractItemView,
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
@@ -637,6 +637,116 @@ class AccountSettingsDialog(QDialog):
         }
 
 
+# ── Column-customization dialog ──────────────────────────────────────────────
+
+class _ColumnSettingsDialog(QDialog):
+    """
+    Lets the user pick which columns appear in the strategies list and in
+    what order. Columns can be dragged to reorder; the checkbox controls
+    visibility. Modeled after TastyTrade's customize-columns dialog.
+    """
+
+    def __init__(self, current_keys, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Customize Columns")
+        self.setMinimumWidth(360)
+        self.setStyleSheet(T.BASE_STYLE)
+
+        all_cols = list(StrategyCard.ALL_COLUMNS)   # [(key, label, w, asc), ...]
+        current  = list(current_keys or [])
+
+        # Reorder so currently-shown columns appear at the top in their
+        # configured order; hidden columns trail at the bottom.
+        ordered_keys = [k for k in current if any(c[0] == k for c in all_cols)]
+        for c in all_cols:
+            if c[0] not in ordered_keys:
+                ordered_keys.append(c[0])
+        label_by_key = {c[0]: c[1] for c in all_cols}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(10)
+
+        title = QLabel("Customize Columns")
+        title.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 16px; font-weight: bold; "
+            f"border: none; background: transparent;"
+        )
+        root.addWidget(title)
+
+        hint = QLabel("Drag to reorder. Toggle the checkbox to show or hide.")
+        hint.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        self._list = QListWidget()
+        self._list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._list.setStyleSheet(
+            f"QListWidget {{ background: {T.BG_ALT}; color: {T.TEXT}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 8px; padding: 4px; "
+            f"font-size: 13px; }}"
+            f"QListWidget::item {{ padding: 6px 8px; border-radius: 4px; }}"
+            f"QListWidget::item:selected {{ background: {T.CARD_ALT}; }}"
+        )
+        for k in ordered_keys:
+            it = QListWidgetItem(f"⠿  {label_by_key.get(k, k)}")
+            it.setData(Qt.ItemDataRole.UserRole, k)
+            it.setFlags(it.flags()
+                        | Qt.ItemFlag.ItemIsUserCheckable
+                        | Qt.ItemFlag.ItemIsDragEnabled)
+            it.setCheckState(
+                Qt.CheckState.Checked if k in current else Qt.CheckState.Unchecked
+            )
+            self._list.addItem(it)
+        root.addWidget(self._list, 1)
+
+        # Reset to defaults
+        reset_btn = QPushButton("Reset to defaults")
+        reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        reset_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 6px 12px; "
+            f"font-size: 11px; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.ACCENT}; }}"
+        )
+        reset_btn.clicked.connect(self._reset_defaults)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+
+        bottom = QHBoxLayout()
+        bottom.addWidget(reset_btn)
+        bottom.addStretch()
+        bottom.addWidget(btns)
+        root.addLayout(bottom)
+
+    def _reset_defaults(self):
+        defaults = list(StrategyCard.DEFAULT_COLUMN_KEYS)
+        label_by_key = {c[0]: c[1] for c in StrategyCard.ALL_COLUMNS}
+        self._list.clear()
+        for k in defaults:
+            it = QListWidgetItem(f"⠿  {label_by_key.get(k, k)}")
+            it.setData(Qt.ItemDataRole.UserRole, k)
+            it.setFlags(it.flags()
+                        | Qt.ItemFlag.ItemIsUserCheckable
+                        | Qt.ItemFlag.ItemIsDragEnabled)
+            it.setCheckState(Qt.CheckState.Checked)
+            self._list.addItem(it)
+
+    def result_keys(self):
+        out = []
+        for i in range(self._list.count()):
+            it = self._list.item(i)
+            if it.checkState() == Qt.CheckState.Checked:
+                out.append(it.data(Qt.ItemDataRole.UserRole))
+        return out
+
+
 # ── IBKR late-connect probe ──────────────────────────────────────────────────
 
 class _IBKRProbeWorker(QThread):
@@ -767,6 +877,15 @@ class PortfolioScreen(QWidget):
         self._my_sort_col       = self._settings.get("my_sort_col") or None
         self._my_sort_asc       = bool(self._settings.get("my_sort_asc", False))
         self._show_hidden_strats= bool(self._settings.get("show_hidden_strats", False))
+
+        # Column visibility / order — list of column keys (subset of
+        # StrategyCard.ALL_COLUMNS). Falls back to the full default order.
+        all_keys = list(StrategyCard.DEFAULT_COLUMN_KEYS)
+        saved = self._settings.get("my_columns")
+        if isinstance(saved, list) and all(k in all_keys for k in saved) and saved:
+            self._my_columns = saved
+        else:
+            self._my_columns = all_keys
 
         # Section header row: title on the left, "show hidden (N)" on the right
         my_hdr_row = QHBoxLayout()
@@ -1482,19 +1601,20 @@ class PortfolioScreen(QWidget):
     # (column label, sort key, fixed width, default ascending direction)
     # Widths/spacing match the per-card stats in StrategyCard so the headers
     # line up over the values they sort.
-    # Widths must match the per-card stat widths in StrategyCard exactly so
-    # headers line up over their values.
-    _MY_SORT_COLS = [
-        ("DTE",      "dte",      68,  True),
-        ("POP",      "pop",      68,  False),
-        ("Δ",        "delta",    82,  False),
-        ("Θ",        "theta",    82,  False),
-        ("DAY P&L",  "day",      100, False),
-        ("OPEN P&L", "pnl",      100, False),
-        ("P&L %",    "pnl_pct",  72,  False),
-        ("P&L YTD",  "ytd",      100, False),
-        ("YTD %",    "ytd_pct",  72,  False),
-    ]
+    # Master column registry pulled from StrategyCard so the sort-header bar
+    # and per-card stats stay in sync.  The user picks visibility/order via
+    # the column-settings dialog (gear icon at the right of the sort bar).
+    @property
+    def _my_sort_cols(self):
+        # Return only the columns the user has chosen, in their order, with
+        # (UPPER_LABEL, key, width, default_asc) tuples for the sort bar.
+        meta = {k: (label, w, asc) for k, label, w, asc in StrategyCard.ALL_COLUMNS}
+        out = []
+        for k in self._my_columns:
+            if k in meta:
+                label, w, asc = meta[k]
+                out.append((label.upper(), k, w, asc))
+        return out
 
     def _build_my_sort_bar(self):
         bar = QFrame()
@@ -1506,7 +1626,7 @@ class PortfolioScreen(QWidget):
         h.addStretch()                 # consume the name+badges area on the left
 
         self._my_sort_lbls: dict = {}  # {key: (label, base_text, default_asc)}
-        for label, key, width, asc_default in self._MY_SORT_COLS:
+        for label, key, width, asc_default in self._my_sort_cols:
             lbl = QLabel(label)
             lbl.setFixedWidth(width)
             lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -1519,8 +1639,24 @@ class PortfolioScreen(QWidget):
             )
             self._my_sort_lbls[key] = (lbl, label, asc_default)
             h.addWidget(lbl)
-        # Trailing space matching chevron(22) + hide button(20) + spacing.
+        # Trailing chevron(22) + hide button(20) + spacing — same offset the
+        # rows use, so the right edge of the bar lines up with the row's
+        # right edge.
         h.addSpacing(22 + 20 + 16)
+        # Gear button to open the column-customization dialog.
+        gear = QPushButton("⚙")
+        gear.setFixedSize(22, 22)
+        gear.setCursor(Qt.CursorShape.PointingHandCursor)
+        gear.setToolTip("Customize columns — choose which to show and in what order")
+        gear.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
+            f"border: 1px solid transparent; border-radius: 11px; "
+            f"font-size: 13px; padding: 0; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT}; border-color: {T.BORDER}; "
+            f"background: {T.BG_ALT}; }}"
+        )
+        gear.clicked.connect(self._open_columns_dialog)
+        h.addWidget(gear)
         self._update_my_sort_headers()
         return bar
 
@@ -1548,6 +1684,33 @@ class PortfolioScreen(QWidget):
                     f"background: transparent; border-radius: 3px; "
                     f"padding: 1px 3px;"
                 )
+
+    def _open_columns_dialog(self):
+        """Open the customize-columns dialog. Saves the new order on accept."""
+        dlg = _ColumnSettingsDialog(self._my_columns, parent=self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_order = dlg.result_keys()
+            if new_order != self._my_columns:
+                self._my_columns = new_order or list(StrategyCard.DEFAULT_COLUMN_KEYS)
+                self._settings["my_columns"] = list(self._my_columns)
+                api.save_settings(self._settings)
+                # Drop the existing sort bar and re-render the section.
+                self._rebuild_my_sort_bar()
+                acct = self.current_account()
+                if acct:
+                    self._render(acct)
+
+    def _rebuild_my_sort_bar(self):
+        """Replace the sort bar with a freshly built one (after column changes)."""
+        old = getattr(self, "_my_sort_bar_widget", None)
+        new = self._build_my_sort_bar()
+        if old is not None:
+            idx = self.body.indexOf(old)
+            if idx >= 0:
+                self.body.insertWidget(idx, new)
+                old.setParent(None)
+                old.deleteLater()
+        self._my_sort_bar_widget = new
 
     def _on_my_sort_click(self, col_key: str, default_asc: bool):
         if self._my_sort_col == col_key:
@@ -2248,6 +2411,7 @@ class PortfolioScreen(QWidget):
                     inst, metrics=metrics,
                     hidden=bool(inst._raw.get("hidden")),
                     history=self.history,
+                    column_keys=self._my_columns,
                 )
                 card.clicked.connect(self.strategy_clicked.emit)
                 card.hide_requested.connect(self._on_strategy_hide)
@@ -2274,7 +2438,8 @@ class PortfolioScreen(QWidget):
             self.ua_container.addWidget(empty)
         else:
             for strat in unassigned:
-                card = StrategyCard(strat, metrics=metrics)
+                card = StrategyCard(strat, metrics=metrics,
+                                    column_keys=self._my_columns)
                 card.clicked.connect(self.strategy_clicked.emit)
                 self.ua_container.addWidget(card)
                 self._ua_cards.append(card)
