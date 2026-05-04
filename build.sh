@@ -88,45 +88,70 @@ DEVELOPER_ID="$(security find-identity -v -p codesigning 2>/dev/null \
 TEAM_ID="$(echo "$DEVELOPER_ID" | sed -nE 's/.*\(([A-Z0-9]+)\).*/\1/p')"
 
 if [ -n "$DEVELOPER_ID" ]; then
+    # macOS 14+ Sequoia adds the kernel-protected `com.apple.provenance`
+    # xattr to every executable created on APFS. codesign rejects this for
+    # Mach-O *executables* (but not dylibs or directories) with
+    #     "resource fork, Finder information, or similar detritus not allowed"
+    # The xattr is unremovable from userspace.
+    #
+    # Workaround: do all signing on a temporary HFS+ disk image. codesign
+    # on HFS+ doesn't reject provenance. The signed bundle is then copied
+    # back to dist/ — bit-for-bit, so the embedded signature survives.
+    echo ""
+    echo "→ Creating clean HFS+ disk image for signing..."
+    DMG="/tmp/optdash_sign_$$.dmg"
+    DMG_VOL="OptDashSign$$"
+    DMG_MNT="/Volumes/$DMG_VOL"
+    rm -f "$DMG"
+    hdiutil create -size 500m -fs HFS+ -volname "$DMG_VOL" "$DMG" -quiet -ov
+    hdiutil attach "$DMG" -quiet -mountpoint "$DMG_MNT"
+    DMG_APP="$DMG_MNT/OptionsDashboard.app"
+
+    echo "→ Copying app onto disk image..."
+    ditto "$APP_PATH" "$DMG_APP"
+    xattr -cr "$DMG_APP" 2>/dev/null || true
+
     echo ""
     echo "→ Signing with: $DEVELOPER_ID"
 
-    # 1. Sign every Mach-O binary inside the bundle (dylibs, .so files, the
-    #    main exe). PyInstaller's own --deep doesn't catch everything, so we
-    #    do an explicit pass.
-    find "$APP_PATH" \( -name "*.dylib" -o -name "*.so" \) -print0 \
-        | xargs -0 codesign --force --options=runtime --timestamp \
+    # 1. Sign every dylib / .so. Sequential (not parallel) avoids races when
+    #    codesign serially rewrites files on the disk image.
+    find "$DMG_APP" \( -name "*.dylib" -o -name "*.so" \) -print0 \
+        | xargs -0 -n 1 codesign --force --options=runtime --timestamp \
             --entitlements entitlements.plist \
-            --sign "$DEVELOPER_ID" 2>&1 | grep -v "replacing existing signature" || true
+            --sign "$DEVELOPER_ID" >/dev/null 2>&1 || true
 
-    # 2. Sign all executable Mach-O files (anything with the executable bit
-    #    set that isn't a script).
-    find "$APP_PATH/Contents/MacOS" -type f -perm +111 -print0 \
-        | xargs -0 codesign --force --options=runtime --timestamp \
+    # 2. Sign all executables in Contents/MacOS.
+    find "$DMG_APP/Contents/MacOS" -type f -perm +111 -print0 \
+        | xargs -0 -n 1 codesign --force --options=runtime --timestamp \
             --entitlements entitlements.plist \
-            --sign "$DEVELOPER_ID" 2>&1 | grep -v "replacing existing signature" || true
+            --sign "$DEVELOPER_ID" >/dev/null 2>&1 || true
 
-    # 3. Sign the .app bundle itself
+    # 3. Sign the .app bundle itself (this seals the resources).
     codesign --force --options=runtime --timestamp \
         --entitlements entitlements.plist \
-        --sign "$DEVELOPER_ID" "$APP_PATH"
+        --sign "$DEVELOPER_ID" "$DMG_APP" 2>&1 | grep -v "replacing existing signature" || true
 
-    # 4. Verify signature is valid + complete
-    if codesign --verify --strict --verbose=2 "$APP_PATH" 2>&1 | grep -q "valid on disk"; then
-        echo "✓ Signature verified"
+    # 4. Verify signature is valid + complete. Check codesign's exit code
+    #    directly — piping to `grep -q` would race (grep exits on first
+    #    match, sending SIGPIPE to codesign, which pipefail reports as fail).
+    if codesign --verify --strict "$DMG_APP" >/dev/null 2>&1; then
+        echo "✓ Signature verified  (Team ID: ${TEAM_ID})"
     else
-        echo "✗ Signature verification failed — check codesign output above."
-        codesign --verify --strict --verbose=2 "$APP_PATH"
+        echo "✗ Signature verification failed:"
+        codesign --verify --strict --verbose=2 "$DMG_APP"
+        hdiutil detach "$DMG_MNT" -quiet 2>/dev/null
+        rm -f "$DMG"
         exit 1
     fi
 
     # 5. Notarize (if keychain profile is configured)
     if xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" &>/dev/null; then
         echo ""
-        echo "→ Submitting to Apple notary service (this can take 1-5 minutes)..."
+        echo "→ Submitting to Apple notary service (~1-5 min wait)..."
 
-        NOTARY_ZIP="$(mktemp -t optdash-notary).zip"
-        ditto -c -k --keepParent "$APP_PATH" "$NOTARY_ZIP"
+        NOTARY_ZIP="$DMG_MNT/notary_submission.zip"
+        ditto -c -k --keepParent "$DMG_APP" "$NOTARY_ZIP"
 
         if xcrun notarytool submit "$NOTARY_ZIP" \
                 --keychain-profile "$NOTARY_PROFILE" \
@@ -134,18 +159,19 @@ if [ -n "$DEVELOPER_ID" ]; then
             rm -f "$NOTARY_ZIP"
             echo "✓ Notarization accepted"
 
-            # Staple the ticket onto the .app so it works offline
-            xcrun stapler staple "$APP_PATH"
+            # Staple the ticket so the app works offline (no callback to Apple
+            # required at launch).
+            xcrun stapler staple "$DMG_APP"
             echo "✓ Notarization ticket stapled"
             NOTARIZED=true
         else
             rm -f "$NOTARY_ZIP"
-            echo "✗ Notarization failed. Log:"
+            echo "✗ Notarization failed. Apple's response:"
             cat /tmp/notary.log
             echo ""
-            echo "  Get detailed logs with:"
             SUBMIT_ID="$(grep -oE 'id: [a-f0-9-]+' /tmp/notary.log | head -1 | awk '{print $2}')"
             if [ -n "$SUBMIT_ID" ]; then
+                echo "  Detailed logs:"
                 echo "    xcrun notarytool log $SUBMIT_ID --keychain-profile $NOTARY_PROFILE"
             fi
         fi
@@ -158,6 +184,18 @@ if [ -n "$DEVELOPER_ID" ]; then
         echo "        --team-id ${TEAM_ID:-YOUR_TEAM_ID} \\"
         echo "        --password YOUR_APP_SPECIFIC_PASSWORD"
     fi
+
+    # 6. Replace the on-disk dist/ copy with the signed (and possibly
+    #    stapled) bundle from the disk image. ditto preserves the
+    #    embedded signature byte-for-byte.
+    echo ""
+    echo "→ Copying signed bundle back to dist/..."
+    rm -rf "$APP_PATH"
+    ditto "$DMG_APP" "$APP_PATH"
+
+    # 7. Detach and remove the disk image.
+    hdiutil detach "$DMG_MNT" -quiet 2>/dev/null || true
+    rm -f "$DMG"
 else
     echo ""
     echo "! No 'Developer ID Application' certificate found in keychain."
