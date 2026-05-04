@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QFrame, QScrollArea, QComboBox,
     QDialog, QDialogButtonBox, QFormLayout, QMessageBox, QTextEdit,
     QCheckBox, QListWidget, QListWidgetItem, QAbstractItemView,
-    QTabWidget,
+    QTabWidget, QSystemTrayIcon, QMenu,
 )
 from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 
@@ -2815,7 +2815,66 @@ class MainWindow(QStackedWidget):
         self.detail    = None
         self.watchlist = None
         self.risk      = None
+        self._really_quit = False
+        self._tray         = None
+        self._build_tray()
         self._show_initial()
+
+    # ── Background / tray behavior ────────────────────────────────────────
+    def _build_tray(self):
+        """Create a system-tray icon so the app stays reachable when its
+        window is hidden. Click → reopen window. Right-click → menu."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "AppIcon.png")
+        from PyQt6.QtGui import QIcon
+        icon = QIcon(icon_path) if os.path.exists(icon_path) else QApplication.windowIcon()
+
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray.setToolTip("Options Dashboard")
+
+        menu = QMenu()
+        show_act = menu.addAction("Show Options Dashboard")
+        show_act.triggered.connect(self._reopen_from_tray)
+        menu.addSeparator()
+        quit_act = menu.addAction("Quit")
+        quit_act.triggered.connect(self._quit_from_tray)
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _on_tray_activated(self, reason):
+        # Single-click / double-click on the tray icon → reopen window.
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._reopen_from_tray()
+
+    def _reopen_from_tray(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self):
+        self._really_quit = True
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        # Pressing the red X (or Cmd+W) hides the window instead of quitting,
+        # so background workers (live quote streamer, IBKR Gateway watcher,
+        # update poller, future notification jobs) keep running. Cmd+Q or the
+        # tray menu's Quit actually terminates the app.
+        if self._really_quit:
+            event.accept()
+            return
+        event.ignore()
+        self.hide()
+        if self._tray is not None and self._tray.isVisible():
+            self._tray.showMessage(
+                "Options Dashboard",
+                "Still running in the background. Click the tray icon to reopen.",
+                QSystemTrayIcon.MessageIcon.Information,
+                4000,
+            )
 
     def _show_initial(self):
         creds = api.load_credentials()
@@ -2960,6 +3019,11 @@ class MainWindow(QStackedWidget):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    # Don't quit when the last visible window closes — the tray icon and
+    # background workers (quote streamer, IBKR probe, update poller,
+    # notification jobs) need to keep the process alive even after the
+    # user clicks the red X on the main window.
+    app.setQuitOnLastWindowClosed(False)
 
     # Set the dock / window icon. Looks for AppIcon.png next to app.py
     # (works for source-clone installs); PyInstaller bundles use CFBundleIconFile
