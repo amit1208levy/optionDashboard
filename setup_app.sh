@@ -55,13 +55,21 @@ fi
 echo "✓ Repo ready"
 
 # 3. Install Python dependencies
-echo "→ Installing Python libraries (this can take a minute)..."
-python3 -m pip install --user --quiet --upgrade pip 2>/dev/null || true
-python3 -m pip install --user --quiet \
+# Pin to the SAME python the launcher uses so packages always resolve.
+# The launcher's first preference is /usr/bin/python3 (Apple CLT). Using
+# that here too means pip installs into ~/Library/Python/3.x/lib/python/
+# site-packages which the launcher's python can actually find.
+PY="/usr/bin/python3"
+[ -x "$PY" ] || PY="/usr/local/bin/python3"
+[ -x "$PY" ] || PY="/opt/homebrew/bin/python3"
+[ -x "$PY" ] || { echo "✗ python3 not found"; exit 1; }
+echo "→ Installing Python libraries via $PY (this can take a minute)..."
+"$PY" -m pip install --user --quiet --upgrade pip 2>/dev/null || true
+"$PY" -m pip install --user --quiet \
     PyQt6 requests websockets matplotlib ib_insync \
-    || python3 -m pip install --user --break-system-packages --quiet \
+    || "$PY" -m pip install --user --break-system-packages --quiet \
         PyQt6 requests websockets matplotlib ib_insync
-echo "✓ Libraries installed"
+echo "✓ Libraries installed (for $PY)"
 
 # 4. Build a real macOS .app bundle on the Desktop.
 #    No AppleScript wrapper — the bundle's executable is a shell script that
