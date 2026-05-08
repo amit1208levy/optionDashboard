@@ -101,7 +101,8 @@ def _day_pnl_leg(leg):
 
 from models import (
     StrategyInstance, strategy_extremes, probability_of_profit, capital_for_strategy,
-    strategy_performance, symbol_ivr, symbol_ivp, symbol_beta, symbol_hv30,
+    strategy_performance, strategy_pnl_summary,
+    symbol_ivr, symbol_ivp, symbol_beta, symbol_hv30,
     scenario_pnl, distributed_delta_dte_capital,
     unassigned_positions, group_unassigned, check_exit_conditions,
 )
@@ -1638,6 +1639,11 @@ class StrategyDetailPage(QWidget):
         history = self.portfolio.history
         perf = strategy_performance(self.strategy.id, history,
                                     capital_req=self._capital_required())
+        # Combined P&L (closed + current open) for YTD and all-time, so the
+        # numbers here line up with what the strategy card on the home
+        # screen shows. perf["total_pnl"] is closed-only; pnl_summary
+        # adds the open leg P&L on top.
+        pnl_summary = strategy_pnl_summary(self.strategy.id, history, self.strategy)
         entries = [h for h in history if h.get("strategy_id") == self.strategy.id]
 
         # Build the card frame directly so we can put the Import button
@@ -1697,16 +1703,20 @@ class StrategyDetailPage(QWidget):
         ct = perf.get("closed_trades", perf["closed_legs"])
         cl = perf["closed_legs"]
         legs_note = f" ({cl} legs)" if cl != ct else ""
+        # ── Stats grid ─────────────────────────────────────────────────────
+        # P&L YTD and All-Time match the strategy-card values: each is
+        # 'closed-leg P&L for the period + current open P&L'. 'Closed-only'
+        # is shown alongside as a sanity-check breakdown.
         items = [
             ("Closed trades", f"{ct}{legs_note}"),
-            ("Total P&L",   money(perf["total_pnl"], signed=True)),
+            ("P&L YTD",     money(pnl_summary["total_ytd"], signed=True)),
+            ("All-Time P&L", money(pnl_summary["total_all"], signed=True)),
+            ("Closed only", money(perf["total_pnl"], signed=True)),
             ("Win rate",    f"{perf['win_rate']:.0f}%"),
             ("Avg DIT",     f"{perf['avg_dit']:.0f}d"
                              if perf["avg_dit"] is not None else "—"),
             ("Avg weekly",  money(perf["avg_weekly"], signed=True)
                              if perf["avg_weekly"] is not None else "—"),
-            ("Avg monthly", money(perf["avg_monthly"], signed=True)
-                             if perf["avg_monthly"] is not None else "—"),
             ("Yearly pace", money(perf["yearly"], signed=True)
                              if perf["yearly"] is not None else "—"),
             ("Weekly %",    f"{perf['weekly_pct']:+.2f}%"
