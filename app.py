@@ -821,19 +821,54 @@ class _CloudSyncPanel(QWidget):
         warn.setStyleSheet(f"color: {T.YELLOW}; font-size: 11px; border: none;")
         v.addWidget(warn)
 
-        # Test connection / Push now / Pull now buttons
+        # ── Google OAuth Client ID ────────────────────────────────────────
+        v.addWidget(self._label("Google OAuth Client ID (Desktop app)", T.LABEL))
+        self._oauth_client_id = QLineEdit()
+        self._oauth_client_id.setPlaceholderText(
+            "<numeric>-<random>.apps.googleusercontent.com  "
+            "(create in Google Cloud Console → APIs & Services → Credentials)"
+        )
+        self._oauth_client_id.setText(
+            self._settings.get("google_oauth_client_id") or ""
+        )
+        self._oauth_client_id.setStyleSheet(
+            f"QLineEdit {{ background: {T.BG_ALT}; color: {T.TEXT}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 8px 10px; "
+            f"font-size: 13px; }}"
+            f"QLineEdit:focus {{ border-color: {T.ACCENT}; }}"
+        )
+        v.addWidget(self._oauth_client_id)
+
+        # Sign-in status row
+        status_row = QHBoxLayout()
+        status_row.setSpacing(10)
+        self._signin_status = QLabel("")
+        self._signin_status.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none;"
+        )
+        self._refresh_signin_status()
+        status_row.addWidget(self._signin_status, 1)
+        v.addLayout(status_row)
+
+        # Buttons row
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
-        for label, slot in (("Test connection", self._on_test),
-                            ("Push now",        self._on_push_now),
-                            ("Pull now",        self._on_pull_now)):
+        for label, slot in (("Sign in with Google", self._on_google_signin),
+                            ("Sign out",            self._on_sign_out),
+                            ("Test connection",     self._on_test),
+                            ("Push now",            self._on_push_now),
+                            ("Pull now",            self._on_pull_now)):
             b = QPushButton(label)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
+            primary = (label == "Sign in with Google")
             b.setStyleSheet(
-                f"QPushButton {{ background: transparent; color: {T.ACCENT}; "
-                f"border: 1px solid {T.ACCENT}; border-radius: 6px; "
-                f"padding: 8px 14px; font-size: 12px; font-weight: bold; }}"
-                f"QPushButton:hover {{ background: {T.CARD_ALT}; }}"
+                f"QPushButton {{ background: {T.PURPLE if primary else 'transparent'}; "
+                f"color: {'white' if primary else T.ACCENT}; "
+                f"border: 1px solid {T.PURPLE if primary else T.ACCENT}; "
+                f"border-radius: 6px; padding: 8px 14px; "
+                f"font-size: 12px; font-weight: bold; }}"
+                f"QPushButton:hover {{ background: "
+                f"{T.PURPLE2 if primary else T.CARD_ALT}; }}"
             )
             b.clicked.connect(slot)
             btn_row.addWidget(b)
@@ -857,6 +892,78 @@ class _CloudSyncPanel(QWidget):
             f"letter-spacing: 0.5px; border: none;"
         )
         return l
+
+    def _refresh_signin_status(self):
+        email = api.keychain_get("cloud_sync_google_email")
+        if email:
+            self._signin_status.setText(f"✓ Signed in as <b>{email}</b>")
+            self._signin_status.setTextFormat(Qt.TextFormat.RichText)
+            self._signin_status.setStyleSheet(
+                f"color: {T.GREEN}; font-size: 11px; border: none;"
+            )
+        else:
+            self._signin_status.setText("Not signed in.")
+            self._signin_status.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 11px; border: none;"
+            )
+
+    def _on_google_signin(self):
+        client_id = self._oauth_client_id.text().strip()
+        if not client_id or "googleusercontent.com" not in client_id:
+            self._status.setStyleSheet(
+                f"color: {T.RED}; font-size: 11px; border: none;"
+            )
+            self._status.setText(
+                "✗ Paste a valid Google OAuth Client ID first "
+                "(must end in .apps.googleusercontent.com)."
+            )
+            return
+        self._status.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none;"
+        )
+        self._status.setText("Opening browser for Google sign-in…")
+        QApplication.processEvents()
+
+        try:
+            import cloud_sync
+            tokens = cloud_sync.sign_in_with_google(client_id)
+        except Exception as e:
+            self._status.setStyleSheet(
+                f"color: {T.RED}; font-size: 11px; border: none;"
+            )
+            self._status.setText(f"✗ Sign-in failed: {e}")
+            return
+
+        if not tokens or "refreshToken" not in tokens:
+            self._status.setStyleSheet(
+                f"color: {T.RED}; font-size: 11px; border: none;"
+            )
+            self._status.setText("✗ Sign-in did not complete.")
+            return
+
+        # Persist Firebase tokens + the Google email for status display.
+        api.keychain_set("cloud_sync_refresh_token", tokens["refreshToken"])
+        if tokens.get("email"):
+            api.keychain_set("cloud_sync_google_email", tokens["email"])
+        # Save the OAuth client ID in settings so the user doesn't re-paste it.
+        s = api.load_settings() or {}
+        s["google_oauth_client_id"] = client_id
+        api.save_settings(s)
+
+        self._status.setStyleSheet(
+            f"color: {T.GREEN}; font-size: 11px; border: none;"
+        )
+        self._status.setText(f"✓ Signed in as {tokens.get('email', 'Google user')}.")
+        self._refresh_signin_status()
+
+    def _on_sign_out(self):
+        api.keychain_delete("cloud_sync_refresh_token")
+        api.keychain_delete("cloud_sync_google_email")
+        self._refresh_signin_status()
+        self._status.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none;"
+        )
+        self._status.setText("Signed out. Cached refresh token cleared.")
 
     def _update_strength(self):
         """Color-coded passphrase strength hint right under the field."""

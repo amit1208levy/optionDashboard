@@ -61,8 +61,14 @@ WHAT IS DELIBERATELY *NOT* SYNCED:
 """
 import base64
 import hashlib
+import http.server
 import json
+import secrets
+import socket
+import threading
 import time
+import urllib.parse
+import webbrowser
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Union
 
@@ -102,6 +108,153 @@ SYNCED_FILES = (
     ".snapshots.json",
     ".account_names.json",
 )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+#                      Google Sign-In (OAuth 2.0 + PKCE)
+# ─────────────────────────────────────────────────────────────────────────
+
+def _free_port() -> int:
+    """Pick an unused port on 127.0.0.1 for the OAuth callback server."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def _pkce_pair() -> Tuple[str, str]:
+    """Generate a PKCE (verifier, challenge) pair per RFC 7636."""
+    verifier  = base64.urlsafe_b64encode(secrets.token_bytes(64)).rstrip(b"=").decode("ascii")
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+def sign_in_with_google(google_client_id: str, timeout: float = 180.0) -> Optional[dict]:
+    """
+    Run a Google OAuth 2.0 PKCE flow and exchange the resulting Google ID
+    token for a Firebase ID token. Returns Firebase's full token dict
+    (idToken, refreshToken, localId, email, ...) or None on failure.
+
+    Caller flow (UX): clicking 'Sign in with Google' triggers this.
+      1. Spin up a tiny HTTP server on 127.0.0.1:<random_port>.
+      2. Open the user's default browser to Google's consent page.
+      3. After consent Google redirects to http://127.0.0.1:port/callback
+         with ?code=... and ?state=... params.
+      4. Exchange the auth code (with the PKCE verifier) for tokens at
+         oauth2.googleapis.com/token. No client_secret needed — this is
+         the secure flow for native / desktop apps.
+      5. POST the Google id_token to Firebase identitytoolkit
+         signInWithIdp, receive a Firebase idToken + refreshToken.
+    """
+    port         = _free_port()
+    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    state        = secrets.token_urlsafe(16)
+    verifier, challenge = _pkce_pair()
+
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth?"
+        + urllib.parse.urlencode({
+            "client_id":             google_client_id,
+            "redirect_uri":          redirect_uri,
+            "response_type":         "code",
+            "scope":                 "openid email profile",
+            "state":                 state,
+            "code_challenge":        challenge,
+            "code_challenge_method": "S256",
+            "access_type":           "online",
+            "prompt":                "select_account",
+        })
+    )
+
+    received: dict = {}
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            qs = urllib.parse.urlparse(self.path).query
+            params = urllib.parse.parse_qs(qs)
+            received["code"]  = params.get("code", [None])[0]
+            received["state"] = params.get("state", [None])[0]
+            received["error"] = params.get("error", [None])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            ok = received["code"] and received["state"] == state
+            self.wfile.write((
+                "<html><body style='font-family:-apple-system,sans-serif;"
+                "background:#0b0d14;color:#e2e8f0;padding:60px;text-align:center'>"
+                f"<h2>{'✓ Signed in.' if ok else '✗ Sign-in failed.'}</h2>"
+                "<p>You can close this tab and return to Options Dashboard.</p>"
+                "</body></html>"
+            ).encode("utf-8"))
+
+        # Quiet HTTP server — no console spam.
+        def log_message(self, *a):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", port), _Handler)
+    server.timeout = timeout
+
+    # Open consent in the user's browser, run server in this thread until
+    # the callback fires (handle_request returns after one request).
+    webbrowser.open(auth_url)
+    try:
+        server.handle_request()
+    except Exception as e:
+        print(f"[cloud_sync] OAuth callback server error: {e}", flush=True)
+        return None
+    finally:
+        server.server_close()
+
+    if received.get("error") or not received.get("code") \
+       or received.get("state") != state:
+        print(f"[cloud_sync] OAuth callback rejected: {received}", flush=True)
+        return None
+
+    # Exchange the auth code for Google tokens (PKCE — no client secret).
+    try:
+        r = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id":     google_client_id,
+                "code":          received["code"],
+                "code_verifier": verifier,
+                "grant_type":    "authorization_code",
+                "redirect_uri":  redirect_uri,
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        google_tokens = r.json()
+        google_id_token = google_tokens.get("id_token")
+    except Exception as e:
+        print(f"[cloud_sync] Google token exchange failed: {e}", flush=True)
+        return None
+
+    if not google_id_token:
+        print("[cloud_sync] Google did not return an id_token", flush=True)
+        return None
+
+    # Hand off the Google ID token to Firebase Identity Toolkit so we
+    # get a Firebase-scoped idToken/refreshToken back.
+    try:
+        r = requests.post(
+            f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key={_API_KEY}",
+            json={
+                "postBody":            f"id_token={google_id_token}&providerId=google.com",
+                "requestUri":          redirect_uri,
+                "returnIdpCredential": True,
+                "returnSecureToken":   True,
+            },
+            timeout=20,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[cloud_sync] Firebase signInWithIdp failed: {e}", flush=True)
+        return None
 
 
 def is_available() -> bool:
@@ -182,52 +335,47 @@ class CloudSync:
         h.update(passphrase.encode("utf-8"))
         return h.hexdigest()
 
-    # ── Firebase Anonymous Auth ──────────────────────────────────────────
+    # ── Firebase Auth (Google Sign-In tokens stored in keychain) ────────
     def _ensure_auth(self, timeout: float = 10.0) -> Optional[str]:
-        """Return a valid Firebase idToken. Reuses the existing one until
-        ~30 s before expiry, then refreshes via refreshToken (silent), or
-        signs up anonymously if no refreshToken is cached."""
+        """Return a valid Firebase idToken. Reuses the cached one until
+        ~30 s before expiry, then refreshes via the stored refreshToken.
+
+        The refresh token comes from a prior Google Sign-In flow (see
+        sign_in_with_google()). If there's no stored refresh token, the
+        caller must run that flow first — we don't fall back to anonymous
+        sign-in because Firestore rules require a Google identity."""
         now = time.time()
         if self._id_token and now < self._token_expires_at - 30:
             return self._id_token
 
-        # Try refresh first.
-        if self._refresh_token:
-            try:
-                r = requests.post(
-                    f"https://securetoken.googleapis.com/v1/token?key={_API_KEY}",
-                    data={"grant_type": "refresh_token",
-                          "refresh_token": self._refresh_token},
-                    timeout=timeout,
-                )
-                if r.ok:
-                    j = r.json()
-                    self._id_token = j["id_token"]
-                    self._refresh_token = j["refresh_token"]
-                    self._token_expires_at = now + int(j.get("expires_in", 3600))
-                    _api().keychain_set("cloud_sync_refresh_token",
-                                         self._refresh_token)
-                    return self._id_token
-            except Exception as e:
-                print(f"[cloud_sync] token refresh failed: {e}", flush=True)
+        if not self._refresh_token:
+            print("[cloud_sync] no refresh token cached — user must Sign in with Google",
+                  flush=True)
+            return None
 
-        # Sign up anonymously.
         try:
             r = requests.post(
-                f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={_API_KEY}",
-                json={"returnSecureToken": True},
+                f"https://securetoken.googleapis.com/v1/token?key={_API_KEY}",
+                data={"grant_type": "refresh_token",
+                      "refresh_token": self._refresh_token},
                 timeout=timeout,
             )
-            r.raise_for_status()
-            j = r.json()
-            self._id_token = j["idToken"]
-            self._refresh_token = j["refreshToken"]
-            self._token_expires_at = now + int(j.get("expiresIn", 3600))
-            _api().keychain_set("cloud_sync_refresh_token",
-                                 self._refresh_token)
-            return self._id_token
+            if r.ok:
+                j = r.json()
+                self._id_token = j["id_token"]
+                self._refresh_token = j["refresh_token"]
+                self._token_expires_at = now + int(j.get("expires_in", 3600))
+                _api().keychain_set("cloud_sync_refresh_token",
+                                     self._refresh_token)
+                return self._id_token
+            print(f"[cloud_sync] token refresh: HTTP {r.status_code} {r.text[:200]}",
+                  flush=True)
+            # Refresh token is invalid — wipe so the user has to re-sign-in.
+            self._refresh_token = None
+            _api().keychain_delete("cloud_sync_refresh_token")
+            return None
         except Exception as e:
-            print(f"[cloud_sync] anonymous sign-in failed: {e}", flush=True)
+            print(f"[cloud_sync] token refresh failed: {e}", flush=True)
             return None
 
     def _auth_headers(self) -> dict:
