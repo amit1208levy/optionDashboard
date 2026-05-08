@@ -141,6 +141,12 @@ def _pkce_pair() -> Tuple[str, str]:
     return verifier, challenge
 
 
+class GoogleSignInError(Exception):
+    """Raised by sign_in_with_google so the caller surfaces a real error
+    instead of just None."""
+    pass
+
+
 def sign_in_with_google(google_client_id: Optional[str] = None,
                          timeout: float = 180.0) -> Optional[dict]:
     """
@@ -222,8 +228,9 @@ def sign_in_with_google(google_client_id: Optional[str] = None,
 
     if received.get("error") or not received.get("code") \
        or received.get("state") != state:
-        print(f"[cloud_sync] OAuth callback rejected: {received}", flush=True)
-        return None
+        msg = f"OAuth callback rejected ({received.get('error') or 'no code'})"
+        print(f"[cloud_sync] {msg}: {received}", flush=True)
+        raise GoogleSignInError(msg)
 
     # Exchange the auth code for Google tokens (PKCE — no client secret).
     try:
@@ -238,16 +245,19 @@ def sign_in_with_google(google_client_id: Optional[str] = None,
             },
             timeout=20,
         )
-        r.raise_for_status()
-        google_tokens = r.json()
-        google_id_token = google_tokens.get("id_token")
     except Exception as e:
-        print(f"[cloud_sync] Google token exchange failed: {e}", flush=True)
-        return None
-
+        msg = f"Google token endpoint unreachable: {e}"
+        print(f"[cloud_sync] {msg}", flush=True)
+        raise GoogleSignInError(msg)
+    if not r.ok:
+        msg = f"Google token exchange HTTP {r.status_code}: {r.text[:300]}"
+        print(f"[cloud_sync] {msg}", flush=True)
+        raise GoogleSignInError(msg)
+    google_id_token = (r.json() or {}).get("id_token")
     if not google_id_token:
-        print("[cloud_sync] Google did not return an id_token", flush=True)
-        return None
+        msg = "Google did not return an id_token"
+        print(f"[cloud_sync] {msg}: {r.text[:300]}", flush=True)
+        raise GoogleSignInError(msg)
 
     # Hand off the Google ID token to Firebase Identity Toolkit so we
     # get a Firebase-scoped idToken/refreshToken back.
@@ -262,11 +272,22 @@ def sign_in_with_google(google_client_id: Optional[str] = None,
             },
             timeout=20,
         )
-        r.raise_for_status()
-        return r.json()
     except Exception as e:
-        print(f"[cloud_sync] Firebase signInWithIdp failed: {e}", flush=True)
-        return None
+        msg = f"Firebase signInWithIdp unreachable: {e}"
+        print(f"[cloud_sync] {msg}", flush=True)
+        raise GoogleSignInError(msg)
+    if not r.ok:
+        # Firebase returns helpful JSON on failures — surface the message.
+        try:
+            err = r.json().get("error", {}).get("message", "(no message)")
+        except Exception:
+            err = r.text[:200]
+        msg = f"Firebase rejected the sign-in: {err}"
+        print(f"[cloud_sync] {msg}", flush=True)
+        if "OPERATION_NOT_ALLOWED" in err:
+            msg += " — enable Google sign-in in Firebase Authentication."
+        raise GoogleSignInError(msg)
+    return r.json()
 
 
 def is_available() -> bool:

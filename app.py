@@ -876,6 +876,12 @@ class _CloudSyncPanel(QWidget):
         try:
             import cloud_sync
             tokens = cloud_sync.sign_in_with_google()
+        except cloud_sync.GoogleSignInError as e:
+            self._status.setStyleSheet(
+                f"color: {T.RED}; font-size: 11px; border: none;"
+            )
+            self._status.setText(f"✗ {e}")
+            return
         except Exception as e:
             self._status.setStyleSheet(
                 f"color: {T.RED}; font-size: 11px; border: none;"
@@ -887,7 +893,7 @@ class _CloudSyncPanel(QWidget):
             self._status.setStyleSheet(
                 f"color: {T.RED}; font-size: 11px; border: none;"
             )
-            self._status.setText("✗ Sign-in did not complete.")
+            self._status.setText("✗ Sign-in did not return tokens.")
             return
 
         # Persist Firebase tokens + the Google email for status display.
