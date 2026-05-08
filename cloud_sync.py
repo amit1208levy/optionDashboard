@@ -100,6 +100,15 @@ _BASE_URL   = (
     f"/databases/(default)/documents"
 )
 
+# Google OAuth 2.0 Client ID for the Desktop OptionsDashboard app. This
+# is NOT a secret — Client IDs are designed to be embedded in client
+# applications. The actual security comes from PKCE in the OAuth flow
+# (no client secret is sent) plus Firestore rules locking each user to
+# their own auth.uid path.
+_GOOGLE_OAUTH_CLIENT_ID = (
+    "88826072729-9j5jh8h6lcv5qrsi0v5rcep6js1lra8d.apps.googleusercontent.com"
+)
+
 # Files we sync across devices.
 SYNCED_FILES = (
     ".strategies.json",
@@ -132,7 +141,8 @@ def _pkce_pair() -> Tuple[str, str]:
     return verifier, challenge
 
 
-def sign_in_with_google(google_client_id: str, timeout: float = 180.0) -> Optional[dict]:
+def sign_in_with_google(google_client_id: Optional[str] = None,
+                         timeout: float = 180.0) -> Optional[dict]:
     """
     Run a Google OAuth 2.0 PKCE flow and exchange the resulting Google ID
     token for a Firebase ID token. Returns Firebase's full token dict
@@ -149,6 +159,8 @@ def sign_in_with_google(google_client_id: str, timeout: float = 180.0) -> Option
       5. POST the Google id_token to Firebase identitytoolkit
          signInWithIdp, receive a Firebase idToken + refreshToken.
     """
+    google_client_id = google_client_id or _GOOGLE_OAUTH_CLIENT_ID
+
     port         = _free_port()
     redirect_uri = f"http://127.0.0.1:{port}/callback"
     state        = secrets.token_urlsafe(16)

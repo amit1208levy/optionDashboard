@@ -788,34 +788,8 @@ class _CloudSyncPanel(QWidget):
         )
         v.addWidget(self._enable_chk)
 
-        # ── Google OAuth Client ID ────────────────────────────────────────
-        v.addWidget(self._label("Google OAuth Client ID (Desktop app)", T.LABEL))
-        self._oauth_client_id = QLineEdit()
-        self._oauth_client_id.setPlaceholderText(
-            "ends in .apps.googleusercontent.com"
-        )
-        self._oauth_client_id.setText(
-            self._settings.get("google_oauth_client_id") or ""
-        )
-        self._oauth_client_id.setStyleSheet(
-            f"QLineEdit {{ background: {T.BG_ALT}; color: {T.TEXT}; "
-            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 8px 10px; "
-            f"font-size: 13px; }}"
-            f"QLineEdit:focus {{ border-color: {T.ACCENT}; }}"
-        )
-        v.addWidget(self._oauth_client_id)
-
-        hint = QLabel(
-            "Create one at Google Cloud Console → APIs & Services → "
-            "Credentials → Create credentials → OAuth client ID → "
-            "Desktop app."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet(
-            f"color: {T.MUTED}; font-size: 10px; border: none; "
-            f"background: transparent; padding: 2px 0 4px 0;"
-        )
-        v.addWidget(hint)
+        # Google OAuth Client ID is embedded in cloud_sync.py — no
+        # paste-the-ID step. Just click Sign in with Google below.
 
         # Sign-in status line
         self._signin_status = QLabel("")
@@ -893,16 +867,6 @@ class _CloudSyncPanel(QWidget):
             )
 
     def _on_google_signin(self):
-        client_id = self._oauth_client_id.text().strip()
-        if not client_id or "googleusercontent.com" not in client_id:
-            self._status.setStyleSheet(
-                f"color: {T.RED}; font-size: 11px; border: none;"
-            )
-            self._status.setText(
-                "✗ Paste a valid Google OAuth Client ID first "
-                "(must end in .apps.googleusercontent.com)."
-            )
-            return
         self._status.setStyleSheet(
             f"color: {T.MUTED}; font-size: 11px; border: none;"
         )
@@ -911,7 +875,7 @@ class _CloudSyncPanel(QWidget):
 
         try:
             import cloud_sync
-            tokens = cloud_sync.sign_in_with_google(client_id)
+            tokens = cloud_sync.sign_in_with_google()
         except Exception as e:
             self._status.setStyleSheet(
                 f"color: {T.RED}; font-size: 11px; border: none;"
@@ -933,10 +897,6 @@ class _CloudSyncPanel(QWidget):
             api.keychain_set("cloud_sync_firebase_uid", tokens["localId"])
         if tokens.get("email"):
             api.keychain_set("cloud_sync_google_email", tokens["email"])
-        # Save the OAuth client ID in settings so the user doesn't re-paste it.
-        s = api.load_settings() or {}
-        s["google_oauth_client_id"] = client_id
-        api.save_settings(s)
 
         self._status.setStyleSheet(
             f"color: {T.GREEN}; font-size: 11px; border: none;"
