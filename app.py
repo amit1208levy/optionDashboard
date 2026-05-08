@@ -749,26 +749,24 @@ class _CloudSyncPanel(QWidget):
         super().__init__()
         self._parent_dialog = parent_dialog
         self._settings = api.load_settings() or {}
-        # One-time migration: if the passphrase is currently in plain text
-        # in .settings.json (older builds), move it into the macOS Keychain
-        # and erase the plaintext copy. From now on the passphrase NEVER
-        # touches the filesystem in plain form.
-        legacy = self._settings.get("cloud_sync_passphrase")
-        if legacy:
-            api.keychain_set("cloud_sync_passphrase", legacy)
+        # One-time cleanup: any older builds stored a plaintext or keychain
+        # passphrase. We don't use a passphrase anymore — Google identity
+        # is the secret. Wipe both copies.
+        if "cloud_sync_passphrase" in self._settings:
             self._settings.pop("cloud_sync_passphrase", None)
             api.save_settings(self._settings)
+        api.keychain_delete("cloud_sync_passphrase")
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(14)
 
-        # Intro / explanation
         intro = QLabel(
             "Sync strategies, history, leg groups, snapshots, and account "
-            "names across all your Macs via Firebase. All data is "
-            "<b>encrypted on this device</b> with your passphrase before "
-            "upload — Firebase only stores opaque ciphertext."
+            "names across all your Macs via Firebase. Sign in with the "
+            "<b>same Google account</b> on every Mac to share data. All "
+            "data is encrypted on this device with AES + HMAC (Fernet) "
+            "before upload — Firebase only stores opaque ciphertext."
         )
         intro.setWordWrap(True)
         intro.setTextFormat(Qt.TextFormat.RichText)
@@ -782,43 +780,6 @@ class _CloudSyncPanel(QWidget):
             f"QCheckBox {{ color: {T.TEXT}; font-size: 13px; font-weight: bold; }}"
         )
         v.addWidget(self._enable_chk)
-
-        # Passphrase field
-        v.addWidget(self._label("Passphrase", T.LABEL))
-        self._passphrase = QLineEdit()
-        self._passphrase.setEchoMode(QLineEdit.EchoMode.Password)
-        self._passphrase.setPlaceholderText("Use the same phrase on every Mac")
-        # Read the passphrase from the macOS Keychain (NOT from settings.json).
-        self._passphrase.setText(api.keychain_get("cloud_sync_passphrase") or "")
-        self._passphrase.setStyleSheet(
-            f"QLineEdit {{ background: {T.BG_ALT}; color: {T.TEXT}; "
-            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 8px 10px; "
-            f"font-size: 13px; }}"
-            f"QLineEdit:focus {{ border-color: {T.ACCENT}; }}"
-        )
-        v.addWidget(self._passphrase)
-
-        # Live passphrase-strength meter
-        self._strength_lbl = QLabel("")
-        self._strength_lbl.setWordWrap(True)
-        self._strength_lbl.setStyleSheet(
-            f"color: {T.MUTED}; font-size: 11px; border: none;"
-        )
-        self._passphrase.textChanged.connect(self._update_strength)
-        self._update_strength()
-        v.addWidget(self._strength_lbl)
-
-        warn = QLabel(
-            "⚠ If you forget this passphrase, your synced data is "
-            "<b>permanently unrecoverable</b> — no reset is possible. "
-            "All data is encrypted on this device with AES + HMAC "
-            "(Fernet) using a key derived via PBKDF2-SHA256 with 600,000 "
-            "iterations. Firebase only stores opaque ciphertext."
-        )
-        warn.setWordWrap(True)
-        warn.setTextFormat(Qt.TextFormat.RichText)
-        warn.setStyleSheet(f"color: {T.YELLOW}; font-size: 11px; border: none;")
-        v.addWidget(warn)
 
         # ── Google OAuth Client ID ────────────────────────────────────────
         v.addWidget(self._label("Google OAuth Client ID (Desktop app)", T.LABEL))
@@ -941,7 +902,10 @@ class _CloudSyncPanel(QWidget):
             return
 
         # Persist Firebase tokens + the Google email for status display.
+        # The Firebase localId IS the uid that Firestore rules check.
         api.keychain_set("cloud_sync_refresh_token", tokens["refreshToken"])
+        if tokens.get("localId"):
+            api.keychain_set("cloud_sync_firebase_uid", tokens["localId"])
         if tokens.get("email"):
             api.keychain_set("cloud_sync_google_email", tokens["email"])
         # Save the OAuth client ID in settings so the user doesn't re-paste it.
@@ -958,28 +922,18 @@ class _CloudSyncPanel(QWidget):
     def _on_sign_out(self):
         api.keychain_delete("cloud_sync_refresh_token")
         api.keychain_delete("cloud_sync_google_email")
+        api.keychain_delete("cloud_sync_firebase_uid")
         self._refresh_signin_status()
         self._status.setStyleSheet(
             f"color: {T.MUTED}; font-size: 11px; border: none;"
         )
-        self._status.setText("Signed out. Cached refresh token cleared.")
-
-    def _update_strength(self):
-        """Color-coded passphrase strength hint right under the field."""
-        try:
-            import cloud_sync
-            level, msg = cloud_sync.passphrase_strength(self._passphrase.text())
-        except Exception:
-            return
-        color = {"weak": T.RED, "fair": T.YELLOW, "strong": T.GREEN}.get(level, T.MUTED)
-        self._strength_lbl.setText(f"Strength: {level.upper()} — {msg}")
-        self._strength_lbl.setStyleSheet(
-            f"color: {color}; font-size: 11px; border: none;"
-        )
+        self._status.setText("Signed out. Cached tokens cleared.")
 
     # ── Helpers ──────────────────────────────────────────────────────────
     def _make_sync(self):
-        """Build a CloudSync object using the current passphrase + TT acct."""
+        """Build a CloudSync object reading cached Google sign-in tokens
+        from the keychain. Returns None with a status message if the user
+        hasn't signed in yet."""
         try:
             import cloud_sync
         except ImportError:
@@ -992,23 +946,14 @@ class _CloudSyncPanel(QWidget):
                 "Re-run setup_app.sh to install it."
             )
             return None
-        passphrase = self._passphrase.text().strip()
-        if not passphrase:
+        sync = cloud_sync.CloudSync()
+        if not sync.is_signed_in():
             self._status.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
-            self._status.setText("✗ Type a passphrase first.")
+            self._status.setText(
+                "✗ Click 'Sign in with Google' first."
+            )
             return None
-        # Pull TT account number from creds — same number identifies
-        # the same person across devices, so the path matches.
-        creds = api.load_credentials() or {}
-        acct = (creds.get("login")
-                or creds.get("username")
-                or "anon")
-        try:
-            return cloud_sync.CloudSync(acct, passphrase)
-        except Exception as e:
-            self._status.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
-            self._status.setText(f"✗ {e}")
-            return None
+        return sync
 
     def _on_test(self):
         sync = self._make_sync()
@@ -1084,23 +1029,13 @@ class _CloudSyncPanel(QWidget):
             self._status.setText(f"✗ Pull failed: {e}")
 
     def commit(self):
-        """Persist the toggle to settings.json + passphrase to macOS
-        Keychain (called by the parent dialog on Save). The passphrase
-        NEVER touches plain-text disk; it lives only in the encrypted
-        login keychain."""
+        """Persist the enable toggle. All other state lives in the
+        keychain (refresh token, uid, email) and is written eagerly by
+        the Sign-in / Sign-out handlers."""
         s = api.load_settings() or {}
         s["cloud_sync_enabled"] = bool(self._enable_chk.isChecked())
-        # Strip any legacy plaintext copy that might still be lurking.
         s.pop("cloud_sync_passphrase", None)
         api.save_settings(s)
-
-        passphrase = self._passphrase.text().strip()
-        if passphrase:
-            api.keychain_set("cloud_sync_passphrase", passphrase)
-        else:
-            api.keychain_delete("cloud_sync_passphrase")
-            # Also clear any cached refresh token so next sign-in is fresh.
-            api.keychain_delete("cloud_sync_refresh_token")
 
 
 class _ColumnSettingsDialog(QDialog):

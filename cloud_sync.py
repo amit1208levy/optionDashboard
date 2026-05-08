@@ -287,53 +287,46 @@ def passphrase_strength(passphrase: str) -> tuple:
 
 
 class CloudSync:
-    """One instance per (account_number, passphrase) pair. Cheap to
-    construct — just derives the encryption key + the Firestore document
-    path. Methods do the actual network I/O."""
+    """Read identity + tokens from the keychain — populated by a previous
+    Google Sign-In flow. No passphrase: encryption key + Firestore path
+    are derived from the Firebase UID, which is stable per Google account
+    and unique per user."""
 
-    def __init__(self, account_number: str, passphrase: str):
+    def __init__(self):
         if not HAVE_CRYPTO:
             raise RuntimeError("cryptography package not installed")
-        if not account_number or not passphrase:
-            raise ValueError("account_number and passphrase required")
-        self.account = str(account_number)
-        self._fernet = self._build_fernet(passphrase)
-        self._user_id = self._derive_user_id(passphrase)
-        # Firebase Anonymous Auth — gives every Firestore request a valid
-        # idToken so we can require `request.auth != null` in rules. Stops
-        # unauthenticated parties from probing the database at all.
-        self._id_token: Optional[str] = None
         self._refresh_token: Optional[str] = _api().keychain_get(
             "cloud_sync_refresh_token")
+        self._uid: Optional[str] = _api().keychain_get(
+            "cloud_sync_firebase_uid")
+        self._id_token: Optional[str] = None
         self._token_expires_at: float = 0.0
+        if self._uid:
+            self._fernet = self._build_fernet(self._uid)
+        else:
+            self._fernet = None
+
+    def is_signed_in(self) -> bool:
+        """True iff a Google sign-in has already completed and the
+        Firebase UID + refresh token are cached in the keychain."""
+        return bool(self._uid and self._refresh_token and self._fernet)
 
     # ── Crypto setup ─────────────────────────────────────────────────────
-    # OWASP 2024 recommendation for PBKDF2-HMAC-SHA256. Higher = slower
-    # to brute-force the passphrase if the encrypted data ever leaks.
-    # 600k iterations ≈ 250 ms on Apple Silicon — only paid once per
-    # passphrase change, cached afterwards.
+    # OWASP 2024 recommendation for PBKDF2-HMAC-SHA256.
     _PBKDF2_ITERATIONS = 600_000
 
-    def _build_fernet(self, passphrase: str) -> "Fernet":
-        # Salt = sha256(account_number). Same on every device that types the
-        # same passphrase + uses the same TT account → same key → can decrypt.
-        salt = hashlib.sha256(self.account.encode("utf-8")).digest()
+    def _build_fernet(self, uid: str) -> "Fernet":
+        # Encryption key = PBKDF2(firebase_uid). Same Google account →
+        # same uid → same key → all of that user's devices can decrypt.
+        salt = b"OptionsDashboard-cloud-sync-v2"
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
             iterations=self._PBKDF2_ITERATIONS,
         )
-        key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
+        key = base64.urlsafe_b64encode(kdf.derive(uid.encode("utf-8")))
         return Fernet(key)
-
-    def _derive_user_id(self, passphrase: str) -> str:
-        h = hashlib.sha256()
-        h.update(b"OptionsDashboard-v1|")
-        h.update(self.account.encode("utf-8"))
-        h.update(b"|")
-        h.update(passphrase.encode("utf-8"))
-        return h.hexdigest()
 
     # ── Firebase Auth (Google Sign-In tokens stored in keychain) ────────
     def _ensure_auth(self, timeout: float = 10.0) -> Optional[str]:
@@ -384,9 +377,11 @@ class CloudSync:
 
     # ── Firestore REST helpers ───────────────────────────────────────────
     def _file_url(self, file_name: str) -> str:
+        # Firestore rules enforce request.auth.uid == userId, so each
+        # signed-in user is locked to their own /syncs/<uid>/... tree.
         safe = file_name.replace("/", "_")
         return (
-            f"{_BASE_URL}/syncs/{self._user_id}/files/{safe}"
+            f"{_BASE_URL}/syncs/{self._uid}/files/{safe}"
             f"?key={_API_KEY}"
         )
 
@@ -405,6 +400,10 @@ class CloudSync:
 
     def push_file(self, file_name: str, content, timeout: float = 15.0) -> bool:
         """Encrypt and upload a single file. Returns True on success."""
+        if not self.is_signed_in():
+            print("[cloud_sync] push: not signed in — Google Sign-In required",
+                  flush=True)
+            return False
         try:
             payload = json.dumps(content, default=str).encode("utf-8")
             ciphertext = self._fernet.encrypt(payload).decode("ascii")
@@ -430,8 +429,11 @@ class CloudSync:
                   ) -> Tuple[Optional[Union[dict, list]], Optional[str]]:
         """
         Download + decrypt one file. Returns (content, updated_at_iso).
-        (None, None) means: not in cloud, network failed, or wrong passphrase.
+        (None, None) means: not signed in, not in cloud, network failed,
+        or decrypt failed.
         """
+        if not self.is_signed_in():
+            return None, None
         try:
             r = requests.get(self._file_url(file_name),
                              headers=self._auth_headers(), timeout=timeout)
