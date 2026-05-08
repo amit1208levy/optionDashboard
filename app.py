@@ -1,4 +1,5 @@
 """Options Dashboard — setup + portfolio + configure screens."""
+import json
 import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -738,6 +739,221 @@ class _ColumnPicker(QWidget):
         return out
 
 
+class _CloudSyncPanel(QWidget):
+    """
+    Cloud Sync settings panel inside the Customize Columns dialog.
+    Lets the user enable encrypted Firestore sync of strategies / history /
+    groups across multiple Macs that share a passphrase + TT account.
+    """
+
+    def __init__(self, parent_dialog=None):
+        super().__init__()
+        self._parent_dialog = parent_dialog
+        self._settings = api.load_settings() or {}
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(14)
+
+        # Intro / explanation
+        intro = QLabel(
+            "Sync strategies, history, leg groups, snapshots, and account "
+            "names across all your Macs via Firebase. All data is "
+            "<b>encrypted on this device</b> with your passphrase before "
+            "upload — Firebase only stores opaque ciphertext."
+        )
+        intro.setWordWrap(True)
+        intro.setTextFormat(Qt.TextFormat.RichText)
+        intro.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 12px; border: none;")
+        v.addWidget(intro)
+
+        # Enable toggle
+        self._enable_chk = QCheckBox("Enable cloud sync")
+        self._enable_chk.setChecked(bool(self._settings.get("cloud_sync_enabled")))
+        self._enable_chk.setStyleSheet(
+            f"QCheckBox {{ color: {T.TEXT}; font-size: 13px; font-weight: bold; }}"
+        )
+        v.addWidget(self._enable_chk)
+
+        # Passphrase field
+        v.addWidget(self._label("Passphrase", T.LABEL))
+        self._passphrase = QLineEdit()
+        self._passphrase.setEchoMode(QLineEdit.EchoMode.Password)
+        self._passphrase.setPlaceholderText("Use the same phrase on every Mac")
+        self._passphrase.setText(self._settings.get("cloud_sync_passphrase") or "")
+        self._passphrase.setStyleSheet(
+            f"QLineEdit {{ background: {T.BG_ALT}; color: {T.TEXT}; "
+            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 8px 10px; "
+            f"font-size: 13px; }}"
+            f"QLineEdit:focus {{ border-color: {T.ACCENT}; }}"
+        )
+        v.addWidget(self._passphrase)
+
+        warn = QLabel(
+            "⚠ If you forget this passphrase, your synced data is "
+            "<b>permanently unrecoverable</b> — no reset is possible."
+        )
+        warn.setWordWrap(True)
+        warn.setTextFormat(Qt.TextFormat.RichText)
+        warn.setStyleSheet(f"color: {T.YELLOW}; font-size: 11px; border: none;")
+        v.addWidget(warn)
+
+        # Test connection / Push now / Pull now buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        for label, slot in (("Test connection", self._on_test),
+                            ("Push now",        self._on_push_now),
+                            ("Pull now",        self._on_pull_now)):
+            b = QPushButton(label)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.ACCENT}; "
+                f"border: 1px solid {T.ACCENT}; border-radius: 6px; "
+                f"padding: 8px 14px; font-size: 12px; font-weight: bold; }}"
+                f"QPushButton:hover {{ background: {T.CARD_ALT}; }}"
+            )
+            b.clicked.connect(slot)
+            btn_row.addWidget(b)
+        btn_row.addStretch()
+        v.addLayout(btn_row)
+
+        # Status line
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none; "
+            f"background: transparent; padding: 4px 0;"
+        )
+        v.addWidget(self._status)
+        v.addStretch()
+
+    def _label(self, text, color):
+        l = QLabel(text)
+        l.setStyleSheet(
+            f"color: {color}; font-size: 11px; font-weight: bold; "
+            f"letter-spacing: 0.5px; border: none;"
+        )
+        return l
+
+    # ── Helpers ──────────────────────────────────────────────────────────
+    def _make_sync(self):
+        """Build a CloudSync object using the current passphrase + TT acct."""
+        try:
+            import cloud_sync
+        except ImportError:
+            self._status.setText("✗ cloud_sync module unavailable.")
+            return None
+        if not cloud_sync.is_available():
+            self._status.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
+            self._status.setText(
+                "✗ The 'cryptography' Python package isn't installed. "
+                "Re-run setup_app.sh to install it."
+            )
+            return None
+        passphrase = self._passphrase.text().strip()
+        if not passphrase:
+            self._status.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
+            self._status.setText("✗ Type a passphrase first.")
+            return None
+        # Pull TT account number from creds — same number identifies
+        # the same person across devices, so the path matches.
+        creds = api.load_credentials() or {}
+        acct = (creds.get("login")
+                or creds.get("username")
+                or "anon")
+        try:
+            return cloud_sync.CloudSync(acct, passphrase)
+        except Exception as e:
+            self._status.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
+            self._status.setText(f"✗ {e}")
+            return None
+
+    def _on_test(self):
+        sync = self._make_sync()
+        if not sync:
+            return
+        self._status.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
+        self._status.setText("Testing…")
+        QApplication.processEvents()
+        ok, msg = sync.test_connection()
+        if ok:
+            self._status.setStyleSheet(f"color: {T.GREEN}; font-size: 11px; border: none;")
+            self._status.setText("✓ Connection OK — encryption round-trip succeeded.")
+        else:
+            self._status.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
+            self._status.setText(f"✗ {msg}")
+
+    def _on_push_now(self):
+        sync = self._make_sync()
+        if not sync:
+            return
+        self._status.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
+        self._status.setText("Pushing all files…")
+        QApplication.processEvents()
+        try:
+            import cloud_sync as cs
+            data_dir = api._user_data_dir()
+            data_by_file = {}
+            for fname in cs.SYNCED_FILES:
+                fp = os.path.join(data_dir, fname)
+                if os.path.exists(fp):
+                    try:
+                        with open(fp) as f:
+                            data_by_file[fname] = json.load(f)
+                    except Exception:
+                        pass
+            results = sync.push_all(data_by_file)
+            ok = sum(1 for v in results.values() if v)
+            total = len(results)
+            self._status.setStyleSheet(
+                f"color: {T.GREEN if ok == total else T.YELLOW}; "
+                f"font-size: 11px; border: none;"
+            )
+            self._status.setText(f"✓ Pushed {ok}/{total} files.")
+        except Exception as e:
+            self._status.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
+            self._status.setText(f"✗ Push failed: {e}")
+
+    def _on_pull_now(self):
+        sync = self._make_sync()
+        if not sync:
+            return
+        self._status.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
+        self._status.setText("Pulling all files…")
+        QApplication.processEvents()
+        try:
+            import cloud_sync as cs
+            data_dir = api._user_data_dir()
+            n_pulled = 0
+            for fname in cs.SYNCED_FILES:
+                content, _ = sync.pull_file(fname)
+                if content is not None:
+                    fp = os.path.join(data_dir, fname)
+                    with open(fp, "w") as f:
+                        json.dump(content, f, indent=2, default=str)
+                    n_pulled += 1
+            self._status.setStyleSheet(f"color: {T.GREEN}; font-size: 11px; border: none;")
+            self._status.setText(
+                f"✓ Pulled {n_pulled} file(s) from cloud. Restart the app to "
+                f"load them into the UI."
+            )
+        except Exception as e:
+            self._status.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
+            self._status.setText(f"✗ Pull failed: {e}")
+
+    def commit(self):
+        """Persist the toggle + passphrase to settings.json (called by
+        the parent dialog on Save)."""
+        s = api.load_settings() or {}
+        s["cloud_sync_enabled"] = bool(self._enable_chk.isChecked())
+        passphrase = self._passphrase.text().strip()
+        if passphrase:
+            s["cloud_sync_passphrase"] = passphrase
+        elif "cloud_sync_passphrase" in s:
+            s.pop("cloud_sync_passphrase")
+        api.save_settings(s)
+
+
 class _ColumnSettingsDialog(QDialog):
     """
     Tabbed dialog for customizing both strategy-level columns (home-screen
@@ -795,13 +1011,17 @@ class _ColumnSettingsDialog(QDialog):
             current_leg_keys,
             StrategyCard.DEFAULT_LEG_COLUMN_KEYS,
         )
+        self._sync_panel = _CloudSyncPanel(parent_dialog=self)
 
         s_w = QWidget(); s_l = QVBoxLayout(s_w); s_l.setContentsMargins(14, 14, 14, 14)
         s_l.addWidget(self._strategy_picker)
         l_w = QWidget(); l_l = QVBoxLayout(l_w); l_l.setContentsMargins(14, 14, 14, 14)
         l_l.addWidget(self._leg_picker)
+        c_w = QWidget(); c_l = QVBoxLayout(c_w); c_l.setContentsMargins(14, 14, 14, 14)
+        c_l.addWidget(self._sync_panel)
         tabs.addTab(s_w, "Strategies")
         tabs.addTab(l_w, "Leg Details")
+        tabs.addTab(c_w, "Cloud Sync")
         root.addWidget(tabs, 1)
 
         btns = QDialogButtonBox(
@@ -1772,6 +1992,14 @@ class PortfolioScreen(QWidget):
             self._my_columns, self._my_leg_columns, parent=self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
+            # Cloud-sync tab persists its own settings.
+            try:
+                dlg._sync_panel.commit()
+            except Exception as e:
+                print(f"[cloud_sync] commit failed: {e}", flush=True)
+            # Re-load full settings from disk so we don't clobber sync fields.
+            self._settings = api.load_settings() or {}
+
             new_order     = dlg.result_keys()     or list(StrategyCard.DEFAULT_COLUMN_KEYS)
             new_leg_order = dlg.result_leg_keys() or list(StrategyCard.DEFAULT_LEG_COLUMN_KEYS)
             changed = (new_order != self._my_columns

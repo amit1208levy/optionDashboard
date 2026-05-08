@@ -4,3 +4,5 @@ matplotlib>=3.7
 websockets>=13.0
 # Live market data via Interactive Brokers Gateway / TWS
 ib_insync>=0.9.86
+# Cloud sync (Firestore via REST + AES encryption of all payloads)
+cryptography>=41.0
