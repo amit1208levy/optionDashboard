@@ -172,9 +172,12 @@ class LegRow(QFrame):
         "QFrame:hover {{ border-color: {bh}; background: #1d2034; }}"
     )
     _NORMAL_FUT = (
-        "QFrame {{ background: {card_alt}; border: 1.5px solid {yellow}; "
+        # Muted amber border (amber-900) — far darker than the bright
+        # #fbbf24 we used to use; futures still read as distinct without
+        # the row screaming for attention.
+        "QFrame {{ background: {card_alt}; border: 1px solid #78350f; "
         "border-radius: 8px; }}"
-        "QFrame:hover {{ background: #20251a; }}"
+        "QFrame:hover {{ border-color: #b45309; }}"
     )
     _DRAGGING = (
         "QFrame {{ background: #2a2e4a; border: 1px solid {purple}; "
@@ -442,7 +445,7 @@ class LegRow(QFrame):
         elif getattr(self.leg, "is_future", False):
             # Futures stand out with a yellow border + tinted background
             self.setStyleSheet(
-                self._NORMAL_FUT.format(card_alt=T.CARD_ALT, yellow=T.YELLOW)
+                self._NORMAL_FUT.format(card_alt=T.CARD_ALT)
             )
         else:
             self.setStyleSheet(

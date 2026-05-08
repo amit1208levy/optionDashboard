@@ -507,8 +507,12 @@ class StrategyCard(QFrame):
 
         card = QFrame()
         if is_fut:
+            # Amber-800 (much darker than the bright #fbbf24) — still
+            # signals "futures" without yelling. Pill + yellow ticker
+            # provide the primary visual cue.
             card.setStyleSheet(
-                f"QFrame {{ background: {T.CARD_ALT}; border: 1.5px solid {T.YELLOW}; "
+                f"QFrame {{ background: {T.CARD_ALT}; "
+                f"border: 1px solid #78350f; "
                 f"border-radius: 8px; }}"
             )
         else:
