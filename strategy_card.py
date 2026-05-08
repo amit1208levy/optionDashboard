@@ -568,6 +568,69 @@ class StrategyCard(QFrame):
         ticker_size  = 14 if is_fut else 13
         row.addWidget(_cell(leg.root or "—", ticker_color, 800, ticker_size))
 
+        # ── Futures-contract shortcut layout ─────────────────────────────
+        # Pure futures contracts have no strikes, no Greeks, no DTE in the
+        # options sense. Skip the configurable column iteration entirely
+        # and just show: FUTURES CONTRACT pill + P&L + Open price + Capital
+        # requirement estimate. Three labeled values, that's it.
+        if is_fut_contract:
+            from models import _FUTURES_SPAN, _SPAN_FALLBACK_PCT
+
+            pill = QLabel("FUTURES CONTRACT")
+            pill.setStyleSheet(
+                f"color: #1a1500; background: {T.YELLOW}; border: none; "
+                f"border-radius: 5px; padding: 3px 10px; "
+                f"font-size: 11px; font-weight: 900; letter-spacing: 0.6px;"
+            )
+            row.addWidget(pill)
+
+            # Vertical rule before the value trio
+            sep = QFrame()
+            sep.setFixedWidth(1)
+            sep.setFixedHeight(22)
+            sep.setStyleSheet(f"background: {T.BORDER}; border: none; margin: 0 4px;")
+            row.addWidget(sep)
+
+            def _labeled(label_text, value_text, value_color, value_weight=800,
+                          value_size=14):
+                grp = QHBoxLayout()
+                grp.setSpacing(6)
+                lbl = QLabel(label_text)
+                lbl.setStyleSheet(
+                    f"color: {T.MUTED}; font-size: 10px; font-weight: 600; "
+                    f"letter-spacing: 0.5px; background: transparent; border: none;"
+                )
+                val = QLabel(value_text)
+                val.setStyleSheet(
+                    f"color: {value_color}; font-size: {value_size}px; "
+                    f"font-weight: {value_weight}; background: transparent; border: none;"
+                )
+                grp.addWidget(lbl)
+                grp.addWidget(val)
+                container = QFrame()
+                container.setStyleSheet("background: transparent; border: none;")
+                container.setLayout(grp)
+                return container
+
+            # P&L
+            row.addWidget(_labeled("P&L",
+                                    money(leg.pnl, signed=True),
+                                    pnl_color(leg.pnl), 800, 14))
+            # Open price (per-contract, what you paid/received)
+            open_str = (f"{leg.avg_open_price:g}"
+                        if getattr(leg, "avg_open_price", None) else "—")
+            row.addWidget(_labeled("OPEN", open_str, T.TEXT, 700, 13))
+            # Capital requirement = SPAN initial margin × qty
+            margin_per = _FUTURES_SPAN.get(leg.root or "", 0)
+            if not margin_per:
+                ref = float(getattr(leg, "underlying_price", 0) or 0)
+                margin_per = ref * float(leg.multiplier or 1) * _SPAN_FALLBACK_PCT
+            cap_total = margin_per * (leg.quantity or 0)
+            row.addWidget(_labeled("CAP", money(cap_total),
+                                    T.YELLOW, 700, 13))
+            row.addStretch()
+            return card
+
         # Pre-compute everything once; stat cells are added based on the
         # configured leg-column order.
         exp_str = leg.expires_at.strftime("%b %d") if leg.expires_at else "—"

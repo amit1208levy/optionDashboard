@@ -280,6 +280,65 @@ class LegRow(QFrame):
         )
         h.addWidget(tk)
 
+        # ── Futures-contract shortcut layout ─────────────────────────────
+        # Pure futures contracts have no strike, no Greeks, no DTE in the
+        # options sense. Skip the configurable columns entirely and just
+        # show: FUTURES CONTRACT pill + P&L + Open price + Capital.
+        if is_fut_contract:
+            from models import _FUTURES_SPAN, _SPAN_FALLBACK_PCT
+
+            pill = QLabel("FUTURES CONTRACT")
+            pill.setFixedHeight(22)
+            pill.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
+            pill.setStyleSheet(
+                f"color: #1a1500; background: {T.YELLOW}; border: none; "
+                f"border-radius: 5px; padding: 1px 8px; "
+                f"font-size: 10px; font-weight: 900; letter-spacing: 0.6px;"
+            )
+            h.addWidget(pill)
+
+            # Vertical rule
+            sep = QFrame()
+            sep.setFixedWidth(1)
+            sep.setFixedHeight(22)
+            sep.setStyleSheet(f"background: {T.BORDER}; border: none; margin: 0 8px;")
+            h.addWidget(sep)
+
+            def _add_kv(label_text, value_text, value_color,
+                         value_weight=700, value_size=12, total_w=110):
+                wrap = QWidget()
+                wl = QHBoxLayout(wrap)
+                wl.setContentsMargins(0, 0, 0, 0); wl.setSpacing(4)
+                lbl = QLabel(label_text)
+                lbl.setStyleSheet(
+                    f"color: {T.MUTED}; font-size: 10px; font-weight: 600; "
+                    f"letter-spacing: 0.5px; background: transparent; border: none;"
+                )
+                val = QLabel(value_text)
+                val.setStyleSheet(
+                    f"color: {value_color}; font-size: {value_size}px; "
+                    f"font-weight: {value_weight}; background: transparent; border: none;"
+                )
+                wl.addWidget(lbl); wl.addWidget(val)
+                wrap.setFixedWidth(total_w)
+                h.addWidget(wrap)
+
+            _add_kv("P&L",  money(leg.pnl, signed=True), pnl_color(leg.pnl),
+                     value_weight=800, value_size=13, total_w=110)
+            open_str = (f"{leg.avg_open_price:g}"
+                        if getattr(leg, "avg_open_price", None) else "—")
+            _add_kv("OPEN", open_str, T.TEXT, total_w=110)
+
+            margin_per = _FUTURES_SPAN.get(leg.root or "", 0)
+            if not margin_per:
+                ref = float(getattr(leg, "underlying_price", 0) or 0)
+                margin_per = ref * float(leg.multiplier or 1) * _SPAN_FALLBACK_PCT
+            cap_total = margin_per * (leg.quantity or 0)
+            _add_kv("CAP", money(cap_total), T.YELLOW, total_w=110)
+
+            h.addStretch()
+            return
+
         # Per-key cell builder — fixed widths matching the original layout
         # so the rows stay aligned across legs even with different visible
         # column sets.
