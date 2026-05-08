@@ -146,14 +146,14 @@ INSTALL_OK=0
 # converge even when individual ones fail mid-download.
 for attempt in 1 2 3 4; do
     if "$PY" -m pip install $PIP_OPTS $PIP_FIND_LINKS --user \
-            PyQt6 requests websockets matplotlib ib_insync cryptography; then
+            PyQt6 requests websockets matplotlib ib_insync; then
         INSTALL_OK=1
         break
     fi
     if [ "$SUPPORTS_BSP" -eq 1 ] && \
        "$PY" -m pip install $PIP_OPTS $PIP_FIND_LINKS --user \
               --break-system-packages \
-              PyQt6 requests websockets matplotlib ib_insync cryptography; then
+              PyQt6 requests websockets matplotlib ib_insync; then
         INSTALL_OK=1
         break
     fi

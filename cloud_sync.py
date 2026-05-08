@@ -1,63 +1,33 @@
 """
-Cloud sync via Firebase Firestore REST API + client-side AES encryption.
+Cloud sync via Firebase Firestore REST API.
 
-═══════════════════════════════════════════════════════════════════════════
-                            SECURITY MODEL
-═══════════════════════════════════════════════════════════════════════════
+SECURITY MODEL
+══════════════
+Access control is enforced by Firebase, not by client-side encryption:
 
-Every device pushes ENCRYPTED JSON blobs to Firestore. Firebase, Google,
-and anyone who gains access to the database see ONLY opaque ciphertext.
-Decryption requires the user's passphrase, which never leaves the device.
+  1. AUTH: every Firestore request carries a Firebase ID token issued
+     after Google Sign-In (via OAuth 2.0 PKCE). Unauthenticated requests
+     are rejected before they ever reach the database.
+  2. FIRESTORE RULES: each path /syncs/<uid>/files/<file> is locked to
+     request.auth.uid == uid, so even another authenticated Google user
+     cannot read your data — only your Google account can.
+  3. TRANSPORT: HTTPS end-to-end between the device and Firestore.
 
-THREE INDEPENDENT LAYERS protect your data:
-
-  1. UNGUESSABLE PATH
-     Each user's documents live at  /syncs/<userId>/files/<file>  where
-       userId = sha256("OptionsDashboard-v1|" + account_number + "|" + passphrase)
-     That's 256 bits of entropy. Even if an attacker gets the Firebase
-     project's public apiKey and reverse-engineers our schema, they'd
-     have to brute-force the SHA-256 of (account + passphrase) to find
-     the right path — infeasible.
-
-  2. AUTHENTICATED ENCRYPTION (Fernet = AES-128-CBC + HMAC-SHA256)
-     Every payload is encrypted on the device before it's uploaded. The
-     key is derived via PBKDF2-HMAC-SHA256 with 600,000 iterations (the
-     2024 OWASP recommendation, matching 1Password's current default).
-     Salt = sha256(account_number) so every device with the same
-     passphrase + account derives the SAME key — that's how multi-device
-     sync works without ever transmitting the key. HMAC tag means any
-     tampering with the ciphertext is detected on decrypt and rejected.
-
-  3. FAIL-CLOSED PULL SEMANTICS
-     If decryption fails (corrupted, tampered, wrong passphrase), the
-     pull returns None and the local file is NOT touched. The worst an
-     attacker who somehow finds your path can do is upload junk; they
-     cannot poison your local data — we refuse to overwrite local with
-     anything we can't authenticate.
-
-WHAT'S NOT IN THE THREAT MODEL:
-
-  • Filesystem access to your Mac. The passphrase is stored in
-    .settings.json next to your TastyTrade credentials. Anyone with read
-    access to your home directory can read both — same threat model as
-    the rest of the app.
-  • Forgetting your passphrase. There is no recovery. The data is
-    cryptographically inaccessible without it. Pick something memorable
-    or write it down once.
-  • Free-tier abuse / DoS. Public-rules + path-obscurity means a random
-    bad actor cannot find your data, but a determined attacker who DOES
-    know your account+passphrase could spam writes. Free tier limits
-    (20K writes/day) protect against runaway bills.
+This is the same access-control model as Google Drive / Calendar / etc.,
+where the data is plaintext on Google's side but only your Google
+identity can access it. If you trust Google with your Gmail, this is
+the same trust boundary.
 
 WHAT IS SYNCED across devices:
   .strategies.json, .groups.json, .history.json, .snapshots.json,
   .account_names.json
 
 WHAT IS DELIBERATELY *NOT* SYNCED:
-  • .credentials.json — each device logs in separately (defense in depth).
-  • .settings.json — IBKR Gateway host/port, column preferences are
+  • .credentials.json — each device logs in to TastyTrade separately
+    (defense in depth, lets you sign out one device without affecting
+    the others).
+  • .settings.json — IBKR Gateway host/port + column preferences are
     machine-specific.
-═══════════════════════════════════════════════════════════════════════════
 """
 import base64
 import hashlib
@@ -80,19 +50,10 @@ def _api():
     import api as _a
     return _a
 
-try:
-    from cryptography.fernet import Fernet, InvalidToken
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    HAVE_CRYPTO = True
-except ImportError:
-    HAVE_CRYPTO = False
-
-
 # ── Public Firebase project credentials ──────────────────────────────────
-# These are NOT secrets — Firebase apiKeys are designed to be embedded in
-# client code. Real security comes from the path-derivation + the payload
-# encryption (see top-of-file docstring).
+# Firebase apiKeys are designed to be embedded in client code. Real
+# security comes from Firebase Auth (Google Sign-In) + Firestore rules
+# locking each user to /syncs/<their-own-uid>/...
 _API_KEY    = "AIzaSyD_pa87W0Q8kLxz-oa_QREiGQv5bFHYyEk"
 _PROJECT_ID = "tastytradedashboard"
 _BASE_URL   = (
@@ -305,8 +266,9 @@ def sign_in_with_google(google_client_id: Optional[str] = None,
 
 
 def is_available() -> bool:
-    """Cloud sync needs the cryptography package; report whether we have it."""
-    return HAVE_CRYPTO
+    """Cloud sync uses only the requests library, which is always present.
+    Returns True so callers can skip the legacy availability check."""
+    return True
 
 
 def passphrase_strength(passphrase: str) -> tuple:
@@ -335,45 +297,21 @@ def passphrase_strength(passphrase: str) -> tuple:
 
 class CloudSync:
     """Read identity + tokens from the keychain — populated by a previous
-    Google Sign-In flow. No passphrase: encryption key + Firestore path
-    are derived from the Firebase UID, which is stable per Google account
-    and unique per user."""
+    Google Sign-In flow. Firestore path uses the Firebase UID directly
+    so per-user rules can match request.auth.uid."""
 
     def __init__(self):
-        if not HAVE_CRYPTO:
-            raise RuntimeError("cryptography package not installed")
         self._refresh_token: Optional[str] = _api().keychain_get(
             "cloud_sync_refresh_token")
         self._uid: Optional[str] = _api().keychain_get(
             "cloud_sync_firebase_uid")
         self._id_token: Optional[str] = None
         self._token_expires_at: float = 0.0
-        if self._uid:
-            self._fernet = self._build_fernet(self._uid)
-        else:
-            self._fernet = None
 
     def is_signed_in(self) -> bool:
         """True iff a Google sign-in has already completed and the
         Firebase UID + refresh token are cached in the keychain."""
-        return bool(self._uid and self._refresh_token and self._fernet)
-
-    # ── Crypto setup ─────────────────────────────────────────────────────
-    # OWASP 2024 recommendation for PBKDF2-HMAC-SHA256.
-    _PBKDF2_ITERATIONS = 600_000
-
-    def _build_fernet(self, uid: str) -> "Fernet":
-        # Encryption key = PBKDF2(firebase_uid). Same Google account →
-        # same uid → same key → all of that user's devices can decrypt.
-        salt = b"OptionsDashboard-cloud-sync-v2"
-        kdf = PBKDF2HMAC(
-            algorithm=hashes.SHA256(),
-            length=32,
-            salt=salt,
-            iterations=self._PBKDF2_ITERATIONS,
-        )
-        key = base64.urlsafe_b64encode(kdf.derive(uid.encode("utf-8")))
-        return Fernet(key)
+        return bool(self._uid and self._refresh_token)
 
     # ── Firebase Auth (Google Sign-In tokens stored in keychain) ────────
     def _ensure_auth(self, timeout: float = 10.0) -> Optional[str]:
@@ -446,18 +384,17 @@ class CloudSync:
         return True, "OK"
 
     def push_file(self, file_name: str, content, timeout: float = 15.0) -> bool:
-        """Encrypt and upload a single file. Returns True on success."""
+        """Upload a single file's JSON contents. Returns True on success."""
         if not self.is_signed_in():
             print("[cloud_sync] push: not signed in — Google Sign-In required",
                   flush=True)
             return False
         try:
-            payload = json.dumps(content, default=str).encode("utf-8")
-            ciphertext = self._fernet.encrypt(payload).decode("ascii")
+            payload = json.dumps(content, default=str)
             now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             body = {
                 "fields": {
-                    "ciphertext": {"stringValue": ciphertext},
+                    "json":       {"stringValue": payload},
                     "updated_at": {"stringValue": now_iso},
                 }
             }
@@ -475,9 +412,8 @@ class CloudSync:
     def pull_file(self, file_name: str, timeout: float = 15.0
                   ) -> Tuple[Optional[Union[dict, list]], Optional[str]]:
         """
-        Download + decrypt one file. Returns (content, updated_at_iso).
-        (None, None) means: not signed in, not in cloud, network failed,
-        or decrypt failed.
+        Download one file. Returns (content, updated_at_iso).
+        (None, None) means: not signed in, not in cloud, or network failed.
         """
         if not self.is_signed_in():
             return None, None
@@ -489,17 +425,11 @@ class CloudSync:
             r.raise_for_status()
             doc = r.json()
             fields = doc.get("fields", {})
-            ciphertext = fields.get("ciphertext", {}).get("stringValue")
+            payload = fields.get("json", {}).get("stringValue")
             updated_at = fields.get("updated_at", {}).get("stringValue")
-            if not ciphertext:
+            if payload is None:
                 return None, None
-            plaintext = self._fernet.decrypt(ciphertext.encode("ascii"))
-            content = json.loads(plaintext.decode("utf-8"))
-            return content, updated_at
-        except InvalidToken:
-            print(f"[cloud_sync] pull {file_name}: wrong passphrase "
-                  f"(could not decrypt cloud blob)", flush=True)
-            return None, None
+            return json.loads(payload), updated_at
         except Exception as e:
             print(f"[cloud_sync] pull {file_name} failed: {e}", flush=True)
             return None, None
