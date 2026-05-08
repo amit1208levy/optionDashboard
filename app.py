@@ -752,6 +752,30 @@ class _GoogleSignInWorker(QThread):
             self.done.emit(None, str(e))
 
 
+class _CloudPullWorker(QThread):
+    """Pull every synced file from Firestore on app startup. Emits a
+    {filename: content} dict for the UI to apply. Empty dict = nothing
+    to do (not signed in / sync disabled / network failed)."""
+    done = pyqtSignal(dict)
+
+    def run(self):
+        try:
+            import cloud_sync
+            sync = cloud_sync.CloudSync()
+            if not sync.is_signed_in():
+                self.done.emit({})
+                return
+            results = {}
+            for name in cloud_sync.SYNCED_FILES:
+                content, _ = sync.pull_file(name)
+                if content is not None:
+                    results[name] = content
+            self.done.emit(results)
+        except Exception as e:
+            print(f"[cloud_sync] startup pull failed: {e}", flush=True)
+            self.done.emit({})
+
+
 class _CloudSyncPanel(QWidget):
     """
     Cloud Sync settings panel inside the Customize Columns dialog.
@@ -814,9 +838,9 @@ class _CloudSyncPanel(QWidget):
         self._refresh_signin_status()
         v.addWidget(self._signin_status)
 
-        # ── Buttons (two rows so labels fit on narrow dialogs) ───────────
-        # Row 1: account actions (sign in / sign out)
-        # Row 2: data actions (test / push / pull)
+        # ── Buttons ───────────────────────────────────────────────────────
+        # Sync runs automatically — the app pulls on startup and pushes
+        # after every change. No manual buttons except sign in / sign out.
         def _btn(label, slot, primary=False):
             b = QPushButton(label)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -840,13 +864,15 @@ class _CloudSyncPanel(QWidget):
         signin_row.addStretch()
         v.addLayout(signin_row)
 
-        data_row = QHBoxLayout()
-        data_row.setSpacing(10)
-        data_row.addWidget(_btn("Test connection", self._on_test))
-        data_row.addWidget(_btn("Push now",        self._on_push_now))
-        data_row.addWidget(_btn("Pull now",        self._on_pull_now))
-        data_row.addStretch()
-        v.addLayout(data_row)
+        auto_hint = QLabel(
+            "Sync runs automatically: pulls on app launch, pushes after every "
+            "change you save."
+        )
+        auto_hint.setWordWrap(True)
+        auto_hint.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none; padding: 6px 0;"
+        )
+        v.addWidget(auto_hint)
 
         # Status line
         self._status = QLabel("")
@@ -961,79 +987,6 @@ class _CloudSyncPanel(QWidget):
             )
             return None
         return sync
-
-    def _on_test(self):
-        sync = self._make_sync()
-        if not sync:
-            return
-        self._status.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
-        self._status.setText("Testing…")
-        QApplication.processEvents()
-        ok, msg = sync.test_connection()
-        if ok:
-            self._status.setStyleSheet(f"color: {T.GREEN}; font-size: 11px; border: none;")
-            self._status.setText("✓ Connection OK — encryption round-trip succeeded.")
-        else:
-            self._status.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
-            self._status.setText(f"✗ {msg}")
-
-    def _on_push_now(self):
-        sync = self._make_sync()
-        if not sync:
-            return
-        self._status.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
-        self._status.setText("Pushing all files…")
-        QApplication.processEvents()
-        try:
-            import cloud_sync as cs
-            data_dir = api._user_data_dir()
-            data_by_file = {}
-            for fname in cs.SYNCED_FILES:
-                fp = os.path.join(data_dir, fname)
-                if os.path.exists(fp):
-                    try:
-                        with open(fp) as f:
-                            data_by_file[fname] = json.load(f)
-                    except Exception:
-                        pass
-            results = sync.push_all(data_by_file)
-            ok = sum(1 for v in results.values() if v)
-            total = len(results)
-            self._status.setStyleSheet(
-                f"color: {T.GREEN if ok == total else T.YELLOW}; "
-                f"font-size: 11px; border: none;"
-            )
-            self._status.setText(f"✓ Pushed {ok}/{total} files.")
-        except Exception as e:
-            self._status.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
-            self._status.setText(f"✗ Push failed: {e}")
-
-    def _on_pull_now(self):
-        sync = self._make_sync()
-        if not sync:
-            return
-        self._status.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
-        self._status.setText("Pulling all files…")
-        QApplication.processEvents()
-        try:
-            import cloud_sync as cs
-            data_dir = api._user_data_dir()
-            n_pulled = 0
-            for fname in cs.SYNCED_FILES:
-                content, _ = sync.pull_file(fname)
-                if content is not None:
-                    fp = os.path.join(data_dir, fname)
-                    with open(fp, "w") as f:
-                        json.dump(content, f, indent=2, default=str)
-                    n_pulled += 1
-            self._status.setStyleSheet(f"color: {T.GREEN}; font-size: 11px; border: none;")
-            self._status.setText(
-                f"✓ Pulled {n_pulled} file(s) from cloud. Restart the app to "
-                f"load them into the UI."
-            )
-        except Exception as e:
-            self._status.setStyleSheet(f"color: {T.RED}; font-size: 11px; border: none;")
-            self._status.setText(f"✗ Pull failed: {e}")
 
     def commit(self):
         """Persist the enable toggle. All other state lives in the
@@ -1220,6 +1173,13 @@ class PortfolioScreen(QWidget):
         self.snapshots      = api.load_snapshots()
         self._account_names = api.load_account_names()
         self._settings      = api.load_settings()
+
+        # Cloud-sync: pull latest from Firestore in the background. When it
+        # finishes, _on_cloud_pull_done refreshes our in-memory dicts and
+        # re-renders the UI so the user sees synced data without lifting a
+        # finger.
+        self._cloud_pull_worker = None
+        self._maybe_start_cloud_pull()
 
         self.setStyleSheet(T.BASE_STYLE)
 
@@ -2558,6 +2518,45 @@ class PortfolioScreen(QWidget):
     def current_instances(self):
         positions = self.current_positions()
         return [StrategyInstance(d, positions) for d in self.strategies_raw]
+
+    def _maybe_start_cloud_pull(self):
+        """Kick off a background pull at startup if cloud sync is enabled
+        and the user is signed in. Silent on failure."""
+        if not (self._settings or {}).get("cloud_sync_enabled"):
+            return
+        if self._cloud_pull_worker and self._cloud_pull_worker.isRunning():
+            return
+        self._cloud_pull_worker = _CloudPullWorker()
+        self._cloud_pull_worker.done.connect(self._on_cloud_pull_done)
+        self._cloud_pull_worker.start()
+
+    def _on_cloud_pull_done(self, results):
+        """Apply pulled cloud data: write to local files, refresh in-memory
+        dicts, re-render the home screen."""
+        if not results:
+            return
+        data_dir = api._user_data_dir()
+        # Write each pulled file to disk. Skip the auto-push hook so we
+        # don't immediately push back what we just pulled.
+        for fname, content in results.items():
+            try:
+                with open(os.path.join(data_dir, fname), "w") as f:
+                    json.dump(content, f, indent=2, default=str)
+            except Exception as e:
+                print(f"[cloud_sync] write {fname} failed: {e}", flush=True)
+
+        # Reload in-memory state from disk.
+        self.strategies_all = api.load_strategies()
+        self.history_all    = api.load_history()
+        self.snapshots      = api.load_snapshots()
+        self._account_names = api.load_account_names()
+        # leg_groups live inside strategies_all so they're already refreshed.
+
+        acct = self.current_account()
+        if acct:
+            self._render(acct)
+        print(f"[cloud_sync] startup pull applied {len(results)} file(s)",
+              flush=True)
 
     def reload_after_config_change(self):
         # Re-render immediately with whatever's cached so the user sees the

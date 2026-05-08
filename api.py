@@ -62,6 +62,33 @@ def keychain_delete(service: str) -> bool:
     except Exception:
         return False
 
+
+# ── Cloud-sync auto-push hook ────────────────────────────────────────────
+# Each save_X() function calls this with the saved file's name + content.
+# If cloud sync is enabled and the user is signed in, fires a background
+# thread that pushes the file to Firestore. Silent on success; prints a
+# log line on failure.
+
+def _maybe_cloud_push(file_name: str, content) -> None:
+    try:
+        settings = load_settings() or {}
+        if not settings.get("cloud_sync_enabled"):
+            return
+    except Exception:
+        return
+    import threading
+    def _do():
+        try:
+            import cloud_sync
+            sync = cloud_sync.CloudSync()
+            if sync.is_signed_in():
+                if not sync.push_file(file_name, content):
+                    print(f"[cloud_sync] auto-push {file_name} returned False",
+                          flush=True)
+        except Exception as e:
+            print(f"[cloud_sync] auto-push {file_name} failed: {e}", flush=True)
+    threading.Thread(target=_do, daemon=True).start()
+
 BASE = "https://api.tastyworks.com"
 UA   = "options-dashboard/1.0"
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -151,8 +178,10 @@ def load_groups():
 
 
 def save_groups(assignments, names):
+    payload = {"assignments": assignments, "names": names}
     with open(GROUPS_FILE, "w") as f:
-        json.dump({"assignments": assignments, "names": names}, f, indent=2)
+        json.dump(payload, f, indent=2)
+    _maybe_cloud_push(".groups.json", payload)
 
 
 # ── Account name overrides ──────────────────────────────────────────────────
@@ -170,6 +199,7 @@ def load_account_names():
 def save_account_names(names):
     with open(ACCOUNT_NAMES_FILE, "w") as f:
         json.dump(names, f, indent=2)
+    _maybe_cloud_push(".account_names.json", names)
 
 
 # ── Strategy instances (keyed per account) ──────────────────────────────────
@@ -190,6 +220,7 @@ def load_strategies():
 def save_strategies(data):
     with open(STRATEGIES_FILE, "w") as f:
         json.dump(data, f, indent=2)
+    _maybe_cloud_push(".strategies.json", data)
 
 
 # ── Closed-leg history (keyed per account) ──────────────────────────────────
@@ -210,6 +241,7 @@ def load_history():
 def save_history(data):
     with open(HISTORY_FILE, "w") as f:
         json.dump(data, f, indent=2)
+    _maybe_cloud_push(".history.json", data)
 
 
 # ── Position snapshots (used to detect closures) ────────────────────────────
@@ -230,6 +262,7 @@ def load_snapshots():
 def save_snapshots(snapshots):
     with open(SNAPSHOTS_FILE, "w") as f:
         json.dump(snapshots, f, indent=2)
+    _maybe_cloud_push(".snapshots.json", snapshots)
 
 
 # ── Settings (small key/value blob) ─────────────────────────────────────────
