@@ -570,8 +570,10 @@ class RiskPage(QWidget):
             bwg      = _bw_gamma(positions, metrics)
             net_vega = greeks.get("net_vega") or 0.0
 
-            # Allocation table
-            self._build_allocation(instances, unassigned, overrides)
+            # Allocation table — pass net_liq so percentages are share of
+            # the WHOLE portfolio (capital + cash), not share of used capital.
+            self._build_allocation(instances, unassigned, overrides,
+                                    net_liq=net_liq)
 
             # Chart sections (placeholder while prices load)
             self._build_chart_section("SPY CHART", T.PURPLE, "spy")
@@ -729,11 +731,31 @@ class RiskPage(QWidget):
         self._update_alloc_sort_headers()
         self._render_alloc_rows()
 
-    def _build_allocation(self, instances, unassigned, overrides):
+    def _build_allocation(self, instances, unassigned, overrides, net_liq=0.0):
         self.body.addWidget(self._section_header("PORTFOLIO ALLOCATION BY STRATEGY"))
         card, lay = self._card_frame()
 
         rows, total = strategy_allocation(instances, unassigned, overrides)
+
+        # Re-base every row's pct on net_liq (whole portfolio incl. cash)
+        # instead of total used capital. Then synthesize a Cash row covering
+        # the remainder so the pie + table sum to 100% of the account.
+        if net_liq and net_liq > 0:
+            for r in rows:
+                r["pct"] = (r["capital"] / net_liq) * 100.0
+            cash = max(0.0, net_liq - total)
+            if cash > 0:
+                rows.append({
+                    "id":      "__cash__",
+                    "name":    "Cash",
+                    "root":    "CASH",
+                    "capital": cash,
+                    "pct":     cash / net_liq * 100.0,
+                    "pnl":     0.0,
+                })
+            # Re-sort with Cash placed by its size like any other slice.
+            rows.sort(key=lambda x: x["capital"], reverse=True)
+            total = net_liq
 
         if not rows or total <= 0:
             lay.addWidget(QLabel("No capital data available."))
