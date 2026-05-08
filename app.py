@@ -438,7 +438,7 @@ class AccountSettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.setStyleSheet(T.BASE_STYLE)
-        self.setMinimumWidth(500)
+        self.setMinimumWidth(640)
         self._fields = {}
         self._greek_checks = {}
         self._ibkr_widgets: dict = {}
@@ -759,25 +759,32 @@ class _CloudSyncPanel(QWidget):
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(14)
+        v.setSpacing(12)
 
         intro = QLabel(
-            "Sync strategies, history, leg groups, snapshots, and account "
-            "names across all your Macs via Firebase. Sign in with the "
-            "<b>same Google account</b> on every Mac to share data. All "
-            "data is encrypted on this device with AES + HMAC (Fernet) "
-            "before upload — Firebase only stores opaque ciphertext."
+            "Sign in with the <b>same Google account</b> on every Mac to "
+            "share strategies, history, leg groups, and account names. "
+            "Data is AES-encrypted on this device before upload."
         )
         intro.setWordWrap(True)
         intro.setTextFormat(Qt.TextFormat.RichText)
-        intro.setStyleSheet(f"color: {T.TEXT_DIM}; font-size: 12px; border: none;")
+        intro.setStyleSheet(
+            f"color: {T.TEXT_DIM}; font-size: 12px; border: none; "
+            f"background: transparent;"
+        )
+        intro.setMinimumHeight(46)
         v.addWidget(intro)
 
         # Enable toggle
         self._enable_chk = QCheckBox("Enable cloud sync")
         self._enable_chk.setChecked(bool(self._settings.get("cloud_sync_enabled")))
         self._enable_chk.setStyleSheet(
-            f"QCheckBox {{ color: {T.TEXT}; font-size: 13px; font-weight: bold; }}"
+            f"QCheckBox {{ color: {T.TEXT}; font-size: 13px; font-weight: bold; "
+            f"border: none; padding: 4px 0; }}"
+            f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
+            f"border: 1px solid {T.BORDER}; background: {T.BG_ALT}; }}"
+            f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; "
+            f"border-color: {T.ACCENT}; }}"
         )
         v.addWidget(self._enable_chk)
 
@@ -785,8 +792,7 @@ class _CloudSyncPanel(QWidget):
         v.addWidget(self._label("Google OAuth Client ID (Desktop app)", T.LABEL))
         self._oauth_client_id = QLineEdit()
         self._oauth_client_id.setPlaceholderText(
-            "<numeric>-<random>.apps.googleusercontent.com  "
-            "(create in Google Cloud Console → APIs & Services → Credentials)"
+            "ends in .apps.googleusercontent.com"
         )
         self._oauth_client_id.setText(
             self._settings.get("google_oauth_client_id") or ""
@@ -799,41 +805,60 @@ class _CloudSyncPanel(QWidget):
         )
         v.addWidget(self._oauth_client_id)
 
-        # Sign-in status row
-        status_row = QHBoxLayout()
-        status_row.setSpacing(10)
+        hint = QLabel(
+            "Create one at Google Cloud Console → APIs & Services → "
+            "Credentials → Create credentials → OAuth client ID → "
+            "Desktop app."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 10px; border: none; "
+            f"background: transparent; padding: 2px 0 4px 0;"
+        )
+        v.addWidget(hint)
+
+        # Sign-in status line
         self._signin_status = QLabel("")
         self._signin_status.setStyleSheet(
-            f"color: {T.MUTED}; font-size: 11px; border: none;"
+            f"color: {T.MUTED}; font-size: 12px; border: none; "
+            f"padding: 4px 0;"
         )
         self._refresh_signin_status()
-        status_row.addWidget(self._signin_status, 1)
-        v.addLayout(status_row)
+        v.addWidget(self._signin_status)
 
-        # Buttons row
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(10)
-        for label, slot in (("Sign in with Google", self._on_google_signin),
-                            ("Sign out",            self._on_sign_out),
-                            ("Test connection",     self._on_test),
-                            ("Push now",            self._on_push_now),
-                            ("Pull now",            self._on_pull_now)):
+        # ── Buttons (two rows so labels fit on narrow dialogs) ───────────
+        # Row 1: account actions (sign in / sign out)
+        # Row 2: data actions (test / push / pull)
+        def _btn(label, slot, primary=False):
             b = QPushButton(label)
             b.setCursor(Qt.CursorShape.PointingHandCursor)
-            primary = (label == "Sign in with Google")
+            b.setMinimumHeight(34)
             b.setStyleSheet(
                 f"QPushButton {{ background: {T.PURPLE if primary else 'transparent'}; "
                 f"color: {'white' if primary else T.ACCENT}; "
                 f"border: 1px solid {T.PURPLE if primary else T.ACCENT}; "
-                f"border-radius: 6px; padding: 8px 14px; "
+                f"border-radius: 6px; padding: 0 18px; "
                 f"font-size: 12px; font-weight: bold; }}"
                 f"QPushButton:hover {{ background: "
                 f"{T.PURPLE2 if primary else T.CARD_ALT}; }}"
             )
             b.clicked.connect(slot)
-            btn_row.addWidget(b)
-        btn_row.addStretch()
-        v.addLayout(btn_row)
+            return b
+
+        signin_row = QHBoxLayout()
+        signin_row.setSpacing(10)
+        signin_row.addWidget(_btn("Sign in with Google", self._on_google_signin, primary=True))
+        signin_row.addWidget(_btn("Sign out", self._on_sign_out))
+        signin_row.addStretch()
+        v.addLayout(signin_row)
+
+        data_row = QHBoxLayout()
+        data_row.setSpacing(10)
+        data_row.addWidget(_btn("Test connection", self._on_test))
+        data_row.addWidget(_btn("Push now",        self._on_push_now))
+        data_row.addWidget(_btn("Pull now",        self._on_pull_now))
+        data_row.addStretch()
+        v.addLayout(data_row)
 
         # Status line
         self._status = QLabel("")
