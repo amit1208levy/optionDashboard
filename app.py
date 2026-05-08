@@ -487,35 +487,21 @@ class AccountSettingsDialog(QDialog):
         div.setStyleSheet(f"color: {T.BORDER};")
         root.addWidget(div)
 
-        # ── Leg column visibility ────────────────────────────────────────────
-        col_title = QLabel("Leg column visibility")
-        col_title.setStyleSheet(
+        # ── Cloud Sync (encrypted Firestore via Google Sign-In) ──────────────
+        # Replaces the old per-Greek visibility checkboxes — leg columns are
+        # now configured via the gear-icon dialog on the home page, which
+        # makes the checkboxes here redundant.
+        sync_title = QLabel("Cloud Sync")
+        sync_title.setStyleSheet(
             f"color: {T.ACCENT}; font-size: 15px; font-weight: bold; border: none;"
         )
-        root.addWidget(col_title)
+        root.addWidget(sync_title)
 
-        col_hint = QLabel(
-            "Choose which Greek columns appear in the Legs table on every strategy."
-        )
-        col_hint.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
-        col_hint.setWordWrap(True)
-        root.addWidget(col_hint)
-
-        checks_row = QHBoxLayout()
-        checks_row.setSpacing(18)
-        for key, label in self.LEG_GREEK_OPTIONS:
-            cb = QCheckBox(label)
-            cb.setChecked(key in enabled_greeks)
-            cb.setStyleSheet(
-                f"QCheckBox {{ color: {T.TEXT}; font-size: 13px; border: none; }}"
-                f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
-                f"border: 1px solid {T.BORDER}; background: {T.BG_ALT}; }}"
-                f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; border-color: {T.ACCENT}; }}"
-            )
-            self._greek_checks[key] = cb
-            checks_row.addWidget(cb)
-        checks_row.addStretch()
-        root.addLayout(checks_row)
+        self._sync_panel = _CloudSyncPanel(parent_dialog=self)
+        root.addWidget(self._sync_panel)
+        # The previous per-Greek setting is preserved as-is so other parts
+        # of the app that still read settings["leg_greeks"] keep working.
+        self._enabled_greeks = list(enabled_greeks)
 
         # ── Divider ──────────────────────────────────────────────────────────
         div2 = QFrame()
@@ -617,9 +603,22 @@ class AccountSettingsDialog(QDialog):
         return out
 
     def result_leg_greeks(self):
-        """Return list of enabled Greek column keys in canonical order."""
+        """Return list of enabled Greek column keys in canonical order.
+        The per-Greek checkboxes were removed in favor of the home-page
+        gear-icon → Leg Details column customizer; this just echoes back
+        whatever was already saved in settings."""
         order = [key for key, _ in self.LEG_GREEK_OPTIONS]
-        return [key for key in order if self._greek_checks[key].isChecked()]
+        return [k for k in order if k in self._enabled_greeks]
+
+    def accept(self):
+        """Persist the Cloud Sync panel's state alongside the rest of the
+        settings dialog's outputs."""
+        try:
+            if hasattr(self, "_sync_panel") and self._sync_panel is not None:
+                self._sync_panel.commit()
+        except Exception as e:
+            print(f"[cloud_sync] commit failed: {e}", flush=True)
+        super().accept()
 
     def result_ibkr_settings(self) -> dict:
         """Return the user's IBKR Gateway settings as a JSON-serializable dict."""
@@ -1161,17 +1160,15 @@ class _ColumnSettingsDialog(QDialog):
             current_leg_keys,
             StrategyCard.DEFAULT_LEG_COLUMN_KEYS,
         )
-        self._sync_panel = _CloudSyncPanel(parent_dialog=self)
 
         s_w = QWidget(); s_l = QVBoxLayout(s_w); s_l.setContentsMargins(14, 14, 14, 14)
         s_l.addWidget(self._strategy_picker)
         l_w = QWidget(); l_l = QVBoxLayout(l_w); l_l.setContentsMargins(14, 14, 14, 14)
         l_l.addWidget(self._leg_picker)
-        c_w = QWidget(); c_l = QVBoxLayout(c_w); c_l.setContentsMargins(14, 14, 14, 14)
-        c_l.addWidget(self._sync_panel)
+        # Cloud Sync now lives in the main Settings dialog (Account Settings),
+        # not here. Column tabs only.
         tabs.addTab(s_w, "Strategies")
         tabs.addTab(l_w, "Leg Details")
-        tabs.addTab(c_w, "Cloud Sync")
         root.addWidget(tabs, 1)
 
         btns = QDialogButtonBox(
@@ -2142,14 +2139,6 @@ class PortfolioScreen(QWidget):
             self._my_columns, self._my_leg_columns, parent=self,
         )
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            # Cloud-sync tab persists its own settings.
-            try:
-                dlg._sync_panel.commit()
-            except Exception as e:
-                print(f"[cloud_sync] commit failed: {e}", flush=True)
-            # Re-load full settings from disk so we don't clobber sync fields.
-            self._settings = api.load_settings() or {}
-
             new_order     = dlg.result_keys()     or list(StrategyCard.DEFAULT_COLUMN_KEYS)
             new_leg_order = dlg.result_leg_keys() or list(StrategyCard.DEFAULT_LEG_COLUMN_KEYS)
             changed = (new_order != self._my_columns
