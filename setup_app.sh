@@ -70,20 +70,40 @@ echo "→ Using python: $PY"
     exit 1
 }
 
+# Use long timeouts and many retries so slow / flaky networks (rural Wi-Fi,
+# hotspots, restrictive corporate networks) don't fail mid-download.
+PIP_OPTS="--default-timeout=600 --retries=15"
+
+# Try to bring pip up to a current release first so it has the modern flags
+# (--break-system-packages landed in pip 23). Apple's bundled pip is 21.x.
+echo "→ Upgrading pip..."
+"$PY" -m pip install $PIP_OPTS --user --upgrade pip || \
+    echo "  (continuing with the existing pip version)"
+
+# Detect whether the (possibly upgraded) pip supports
+# --break-system-packages so we don't try a flag that triggers a
+# 'no such option' error on older pip versions.
+SUPPORTS_BSP=0
+if "$PY" -m pip install --help 2>/dev/null | grep -q "break-system-packages"; then
+    SUPPORTS_BSP=1
+fi
+
 echo "→ Installing Python libraries (output below — watch for errors)..."
-# No --quiet so the user sees real failures. The first install attempts
-# the standard --user path; if that fails (typically PEP 668 / externally-
-# managed-environment), retry with --break-system-packages.
 INSTALL_OK=0
-if "$PY" -m pip install --user \
+if "$PY" -m pip install $PIP_OPTS --user \
         PyQt6 requests websockets matplotlib ib_insync; then
     INSTALL_OK=1
-elif "$PY" -m pip install --user --break-system-packages \
-        PyQt6 requests websockets matplotlib ib_insync; then
+elif [ "$SUPPORTS_BSP" -eq 1 ] && \
+     "$PY" -m pip install $PIP_OPTS --user --break-system-packages \
+            PyQt6 requests websockets matplotlib ib_insync; then
     INSTALL_OK=1
 fi
 if [ "$INSTALL_OK" -ne 1 ]; then
+    echo ""
     echo "✗ pip install failed. Scroll up for the real error."
+    echo "  Most common cause is a slow / interrupted download. Re-run:"
+    echo "    curl -fsSL https://raw.githubusercontent.com/amit1208levy/optionDashboard/main/setup_app.sh | bash"
+    echo "  pip caches partial downloads, so retries usually pick up where they left off."
     exit 1
 fi
 
