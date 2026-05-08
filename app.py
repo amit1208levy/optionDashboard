@@ -789,9 +789,22 @@ class _CloudSyncPanel(QWidget):
         )
         v.addWidget(self._passphrase)
 
+        # Live passphrase-strength meter
+        self._strength_lbl = QLabel("")
+        self._strength_lbl.setWordWrap(True)
+        self._strength_lbl.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none;"
+        )
+        self._passphrase.textChanged.connect(self._update_strength)
+        self._update_strength()
+        v.addWidget(self._strength_lbl)
+
         warn = QLabel(
             "⚠ If you forget this passphrase, your synced data is "
-            "<b>permanently unrecoverable</b> — no reset is possible."
+            "<b>permanently unrecoverable</b> — no reset is possible. "
+            "All data is encrypted on this device with AES + HMAC "
+            "(Fernet) using a key derived via PBKDF2-SHA256 with 600,000 "
+            "iterations. Firebase only stores opaque ciphertext."
         )
         warn.setWordWrap(True)
         warn.setTextFormat(Qt.TextFormat.RichText)
@@ -834,6 +847,19 @@ class _CloudSyncPanel(QWidget):
             f"letter-spacing: 0.5px; border: none;"
         )
         return l
+
+    def _update_strength(self):
+        """Color-coded passphrase strength hint right under the field."""
+        try:
+            import cloud_sync
+            level, msg = cloud_sync.passphrase_strength(self._passphrase.text())
+        except Exception:
+            return
+        color = {"weak": T.RED, "fair": T.YELLOW, "strong": T.GREEN}.get(level, T.MUTED)
+        self._strength_lbl.setText(f"Strength: {level.upper()} — {msg}")
+        self._strength_lbl.setStyleSheet(
+            f"color: {color}; font-size: 11px; border: none;"
+        )
 
     # ── Helpers ──────────────────────────────────────────────────────────
     def _make_sync(self):

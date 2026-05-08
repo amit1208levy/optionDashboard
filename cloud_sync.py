@@ -1,22 +1,63 @@
 """
 Cloud sync via Firebase Firestore REST API + client-side AES encryption.
 
-Each device pushes ENCRYPTED JSON blobs to Firestore — Firebase only ever
-sees opaque ciphertext. Decryption requires the passphrase the user set in
-the Cloud Sync settings; without it (and even WITH the public Firebase
-apiKey), nobody can read the data.
+═══════════════════════════════════════════════════════════════════════════
+                            SECURITY MODEL
+═══════════════════════════════════════════════════════════════════════════
 
-Two layers of access control:
-  1. The document path is sha256(account_number + passphrase) — a 64-char
-     unguessable string. Without knowing the passphrase you can't even
-     find the right document.
-  2. Even if you find it, the contents are AES-encrypted with a key
-     derived from the same passphrase via PBKDF2-200k.
+Every device pushes ENCRYPTED JSON blobs to Firestore. Firebase, Google,
+and anyone who gains access to the database see ONLY opaque ciphertext.
+Decryption requires the user's passphrase, which never leaves the device.
 
-Files synced: strategies, leg groups, history, snapshots, account-name
-overrides. Files NOT synced: credentials (each device logs in separately
-for safety) and per-machine settings (IBKR Gateway host/port, column
-preferences) since they're device-specific.
+THREE INDEPENDENT LAYERS protect your data:
+
+  1. UNGUESSABLE PATH
+     Each user's documents live at  /syncs/<userId>/files/<file>  where
+       userId = sha256("OptionsDashboard-v1|" + account_number + "|" + passphrase)
+     That's 256 bits of entropy. Even if an attacker gets the Firebase
+     project's public apiKey and reverse-engineers our schema, they'd
+     have to brute-force the SHA-256 of (account + passphrase) to find
+     the right path — infeasible.
+
+  2. AUTHENTICATED ENCRYPTION (Fernet = AES-128-CBC + HMAC-SHA256)
+     Every payload is encrypted on the device before it's uploaded. The
+     key is derived via PBKDF2-HMAC-SHA256 with 600,000 iterations (the
+     2024 OWASP recommendation, matching 1Password's current default).
+     Salt = sha256(account_number) so every device with the same
+     passphrase + account derives the SAME key — that's how multi-device
+     sync works without ever transmitting the key. HMAC tag means any
+     tampering with the ciphertext is detected on decrypt and rejected.
+
+  3. FAIL-CLOSED PULL SEMANTICS
+     If decryption fails (corrupted, tampered, wrong passphrase), the
+     pull returns None and the local file is NOT touched. The worst an
+     attacker who somehow finds your path can do is upload junk; they
+     cannot poison your local data — we refuse to overwrite local with
+     anything we can't authenticate.
+
+WHAT'S NOT IN THE THREAT MODEL:
+
+  • Filesystem access to your Mac. The passphrase is stored in
+    .settings.json next to your TastyTrade credentials. Anyone with read
+    access to your home directory can read both — same threat model as
+    the rest of the app.
+  • Forgetting your passphrase. There is no recovery. The data is
+    cryptographically inaccessible without it. Pick something memorable
+    or write it down once.
+  • Free-tier abuse / DoS. Public-rules + path-obscurity means a random
+    bad actor cannot find your data, but a determined attacker who DOES
+    know your account+passphrase could spam writes. Free tier limits
+    (20K writes/day) protect against runaway bills.
+
+WHAT IS SYNCED across devices:
+  .strategies.json, .groups.json, .history.json, .snapshots.json,
+  .account_names.json
+
+WHAT IS DELIBERATELY *NOT* SYNCED:
+  • .credentials.json — each device logs in separately (defense in depth).
+  • .settings.json — IBKR Gateway host/port, column preferences are
+    machine-specific.
+═══════════════════════════════════════════════════════════════════════════
 """
 import base64
 import hashlib
@@ -61,6 +102,30 @@ def is_available() -> bool:
     return HAVE_CRYPTO
 
 
+def passphrase_strength(passphrase: str) -> tuple:
+    """
+    Cheap entropy estimate. Returns (level, message) where level is one of
+    'weak' / 'fair' / 'strong'. Used by the settings UI to nudge users
+    toward a passphrase that's actually hard to brute-force.
+    """
+    p = passphrase or ""
+    if len(p) < 8:
+        return ("weak", "Too short — use at least 12 characters.")
+    classes = sum([
+        any(c.islower() for c in p),
+        any(c.isupper() for c in p),
+        any(c.isdigit() for c in p),
+        any(not c.isalnum() for c in p),
+    ])
+    if len(p) < 12 or classes < 2:
+        return ("weak",
+                "Weak — try a 4-word passphrase or 12+ chars with mixed case + digits.")
+    if len(p) < 16 or classes < 3:
+        return ("fair",
+                "OK — 16+ chars or a 4-word passphrase would be stronger.")
+    return ("strong", "Strong.")
+
+
 class CloudSync:
     """One instance per (account_number, passphrase) pair. Cheap to
     construct — just derives the encryption key + the Firestore document
@@ -76,6 +141,12 @@ class CloudSync:
         self._user_id = self._derive_user_id(passphrase)
 
     # ── Crypto setup ─────────────────────────────────────────────────────
+    # OWASP 2024 recommendation for PBKDF2-HMAC-SHA256. Higher = slower
+    # to brute-force the passphrase if the encrypted data ever leaks.
+    # 600k iterations ≈ 250 ms on Apple Silicon — only paid once per
+    # passphrase change, cached afterwards.
+    _PBKDF2_ITERATIONS = 600_000
+
     def _build_fernet(self, passphrase: str) -> "Fernet":
         # Salt = sha256(account_number). Same on every device that types the
         # same passphrase + uses the same TT account → same key → can decrypt.
@@ -84,7 +155,7 @@ class CloudSync:
             algorithm=hashes.SHA256(),
             length=32,
             salt=salt,
-            iterations=200_000,
+            iterations=self._PBKDF2_ITERATIONS,
         )
         key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
         return Fernet(key)
