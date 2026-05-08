@@ -738,6 +738,20 @@ class _ColumnPicker(QWidget):
         return out
 
 
+class _GoogleSignInWorker(QThread):
+    """Run cloud_sync.sign_in_with_google() off the UI thread so the
+    app stays responsive while the user completes the browser flow."""
+    done = pyqtSignal(object, str)   # (tokens dict or None, error message)
+
+    def run(self):
+        try:
+            import cloud_sync
+            tokens = cloud_sync.sign_in_with_google()
+            self.done.emit(tokens, "")
+        except Exception as e:
+            self.done.emit(None, str(e))
+
+
 class _CloudSyncPanel(QWidget):
     """
     Cloud Sync settings panel inside the Customize Columns dialog.
@@ -867,28 +881,30 @@ class _CloudSyncPanel(QWidget):
             )
 
     def _on_google_signin(self):
+        # Don't kick off a second worker if one's already running.
+        if getattr(self, "_signin_worker", None) and self._signin_worker.isRunning():
+            return
         self._status.setStyleSheet(
             f"color: {T.MUTED}; font-size: 11px; border: none;"
         )
-        self._status.setText("Opening browser for Google sign-in…")
+        self._status.setText(
+            "Opening browser for Google sign-in… "
+            "(this dialog stays responsive — finish the sign-in in the browser tab)"
+        )
         QApplication.processEvents()
 
-        try:
-            import cloud_sync
-            tokens = cloud_sync.sign_in_with_google()
-        except cloud_sync.GoogleSignInError as e:
-            self._status.setStyleSheet(
-                f"color: {T.RED}; font-size: 11px; border: none;"
-            )
-            self._status.setText(f"✗ {e}")
-            return
-        except Exception as e:
-            self._status.setStyleSheet(
-                f"color: {T.RED}; font-size: 11px; border: none;"
-            )
-            self._status.setText(f"✗ Sign-in failed: {e}")
-            return
+        # Run the blocking OAuth flow off the UI thread.
+        self._signin_worker = _GoogleSignInWorker()
+        self._signin_worker.done.connect(self._on_signin_done)
+        self._signin_worker.start()
 
+    def _on_signin_done(self, tokens, error):
+        if error:
+            self._status.setStyleSheet(
+                f"color: {T.RED}; font-size: 11px; border: none;"
+            )
+            self._status.setText(f"✗ {error}")
+            return
         if not tokens or "refreshToken" not in tokens:
             self._status.setStyleSheet(
                 f"color: {T.RED}; font-size: 11px; border: none;"
