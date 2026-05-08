@@ -1858,7 +1858,9 @@ class StrategyDetailPage(QWidget):
         )
 
     def _delete_history_entry(self, entry, row_widget):
-        """Remove a single closed-leg history entry after confirmation."""
+        """Remove a single closed-leg history entry after confirmation.
+        Rebuilds the detail page so Total P&L / P&L YTD / win-rate / chart
+        all refresh."""
         side = "Long" if (entry.get("sign") or 0) > 0 else "Short"
         cp   = {"C": "Call", "P": "Put"}.get(entry.get("call_put"), "Stock")
         k    = f" {entry.get('strike', 0):g}" if entry.get("strike") else ""
@@ -1871,17 +1873,19 @@ class StrategyDetailPage(QWidget):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
-        acct = self.portfolio.current_account()
-        if acct:
-            hist = self.portfolio.history_all.get(acct["number"], [])
+        # Remove from BOTH the per-account list (most common) and any other
+        # account list — covers entries imported with the wrong account
+        # number — and from the global history dict in case the entry is
+        # only there.
+        for acct_num, hist in self.portfolio.history_all.items():
             try:
                 hist.remove(entry)
             except ValueError:
                 pass
         self.portfolio.save_history()
-        # Hide the row immediately — no full rebuild needed
-        row_widget.setVisible(False)
-        row_widget.setFixedHeight(0)
+        # Rebuild the page so the cumulative chart, P&L YTD, and the
+        # Performance History stats all reflect the deletion.
+        self.reopen_requested.emit(self.strategy)
 
     # ── Helpers ─────────────────────────────────────────────────────────────
 
