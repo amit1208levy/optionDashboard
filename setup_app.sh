@@ -80,6 +80,57 @@ echo "→ Upgrading pip..."
 "$PY" -m pip install $PIP_OPTS --user --upgrade pip || \
     echo "  (continuing with the existing pip version)"
 
+# ── Pre-fetch the largest wheel via curl (resumable) ─────────────────────
+# pip's downloader does NOT resume partial downloads — every timeout
+# restarts the 62 MB PyQt6-Qt6 wheel from byte 0. On a slow connection
+# that's how you get into the "always times out at 33 MB" loop. curl with
+# -C - resumes from the last byte received, so progress accumulates across
+# retries. We pre-fetch the biggest wheel to a local dir, then point pip
+# at it via --find-links so pip uses our local copy instead of redownloading.
+WHEEL_DIR="$INSTALL_DIR/.wheels"
+mkdir -p "$WHEEL_DIR"
+
+# Query PyPI for the PyQt6-Qt6 wheel URL matching this Mac's architecture.
+PYQT6_QT6_URL="$("$PY" - <<'PYEOF'
+import json, platform, urllib.request
+arch = platform.machine()  # 'arm64' or 'x86_64'
+try:
+    meta = json.loads(urllib.request.urlopen(
+        "https://pypi.org/pypi/PyQt6-Qt6/json", timeout=30).read())
+    for f in meta.get("urls", []):
+        fn = f.get("filename", "")
+        if arch in fn and fn.endswith(".whl"):
+            print(f["url"])
+            break
+except Exception:
+    pass
+PYEOF
+)"
+
+if [ -n "$PYQT6_QT6_URL" ]; then
+    WHEEL_FILE="$WHEEL_DIR/$(basename "$PYQT6_QT6_URL")"
+    if [ -f "$WHEEL_FILE" ]; then
+        echo "→ PyQt6-Qt6 wheel already cached: $WHEEL_FILE"
+    else
+        echo "→ Pre-fetching $(basename "$WHEEL_FILE") with curl (resumable)..."
+        # -C -    : resume from the last byte if the file is partial
+        # --retry : retry on transient errors
+        # --retry-delay : wait between retries
+        # --retry-connrefused : retry even if the connection is refused
+        if curl -L -C - --retry 30 --retry-delay 5 --retry-connrefused \
+                --connect-timeout 30 \
+                -o "$WHEEL_FILE" "$PYQT6_QT6_URL"; then
+            echo "✓ Pre-fetch complete: $(ls -lh "$WHEEL_FILE" | awk '{print $5}')"
+        else
+            echo "  (curl pre-fetch failed; will let pip try directly)"
+            rm -f "$WHEEL_FILE"
+        fi
+    fi
+fi
+# Tell pip to look in our local dir first. If the wheel is there, it
+# uses it instead of redownloading from PyPI.
+PIP_FIND_LINKS="--find-links=$WHEEL_DIR"
+
 # Detect whether the (possibly upgraded) pip supports
 # --break-system-packages so we don't try a flag that triggers a
 # 'no such option' error on older pip versions.
@@ -90,14 +141,25 @@ fi
 
 echo "→ Installing Python libraries (output below — watch for errors)..."
 INSTALL_OK=0
-if "$PY" -m pip install $PIP_OPTS --user \
-        PyQt6 requests websockets matplotlib ib_insync; then
-    INSTALL_OK=1
-elif [ "$SUPPORTS_BSP" -eq 1 ] && \
-     "$PY" -m pip install $PIP_OPTS --user --break-system-packages \
+# Loop a few times: each successful download stays in pip's cache (and our
+# pre-fetched wheel is reused via --find-links), so consecutive attempts
+# converge even when individual ones fail mid-download.
+for attempt in 1 2 3 4; do
+    if "$PY" -m pip install $PIP_OPTS $PIP_FIND_LINKS --user \
             PyQt6 requests websockets matplotlib ib_insync; then
-    INSTALL_OK=1
-fi
+        INSTALL_OK=1
+        break
+    fi
+    if [ "$SUPPORTS_BSP" -eq 1 ] && \
+       "$PY" -m pip install $PIP_OPTS $PIP_FIND_LINKS --user \
+              --break-system-packages \
+              PyQt6 requests websockets matplotlib ib_insync; then
+        INSTALL_OK=1
+        break
+    fi
+    echo "  attempt $attempt failed, retrying in 5s..."
+    sleep 5
+done
 if [ "$INSTALL_OK" -ne 1 ]; then
     echo ""
     echo "✗ pip install failed. Scroll up for the real error."
