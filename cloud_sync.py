@@ -62,10 +62,17 @@ WHAT IS DELIBERATELY *NOT* SYNCED:
 import base64
 import hashlib
 import json
+import time
 from datetime import datetime, timezone
 from typing import Optional, Tuple, Union
 
 import requests
+
+# Imported lazily so this module still imports cleanly on first install
+# even before api.py / its keychain helpers are usable.
+def _api():
+    import api as _a
+    return _a
 
 try:
     from cryptography.fernet import Fernet, InvalidToken
@@ -139,6 +146,13 @@ class CloudSync:
         self.account = str(account_number)
         self._fernet = self._build_fernet(passphrase)
         self._user_id = self._derive_user_id(passphrase)
+        # Firebase Anonymous Auth — gives every Firestore request a valid
+        # idToken so we can require `request.auth != null` in rules. Stops
+        # unauthenticated parties from probing the database at all.
+        self._id_token: Optional[str] = None
+        self._refresh_token: Optional[str] = _api().keychain_get(
+            "cloud_sync_refresh_token")
+        self._token_expires_at: float = 0.0
 
     # ── Crypto setup ─────────────────────────────────────────────────────
     # OWASP 2024 recommendation for PBKDF2-HMAC-SHA256. Higher = slower
@@ -167,6 +181,58 @@ class CloudSync:
         h.update(b"|")
         h.update(passphrase.encode("utf-8"))
         return h.hexdigest()
+
+    # ── Firebase Anonymous Auth ──────────────────────────────────────────
+    def _ensure_auth(self, timeout: float = 10.0) -> Optional[str]:
+        """Return a valid Firebase idToken. Reuses the existing one until
+        ~30 s before expiry, then refreshes via refreshToken (silent), or
+        signs up anonymously if no refreshToken is cached."""
+        now = time.time()
+        if self._id_token and now < self._token_expires_at - 30:
+            return self._id_token
+
+        # Try refresh first.
+        if self._refresh_token:
+            try:
+                r = requests.post(
+                    f"https://securetoken.googleapis.com/v1/token?key={_API_KEY}",
+                    data={"grant_type": "refresh_token",
+                          "refresh_token": self._refresh_token},
+                    timeout=timeout,
+                )
+                if r.ok:
+                    j = r.json()
+                    self._id_token = j["id_token"]
+                    self._refresh_token = j["refresh_token"]
+                    self._token_expires_at = now + int(j.get("expires_in", 3600))
+                    _api().keychain_set("cloud_sync_refresh_token",
+                                         self._refresh_token)
+                    return self._id_token
+            except Exception as e:
+                print(f"[cloud_sync] token refresh failed: {e}", flush=True)
+
+        # Sign up anonymously.
+        try:
+            r = requests.post(
+                f"https://identitytoolkit.googleapis.com/v1/accounts:signUp?key={_API_KEY}",
+                json={"returnSecureToken": True},
+                timeout=timeout,
+            )
+            r.raise_for_status()
+            j = r.json()
+            self._id_token = j["idToken"]
+            self._refresh_token = j["refreshToken"]
+            self._token_expires_at = now + int(j.get("expiresIn", 3600))
+            _api().keychain_set("cloud_sync_refresh_token",
+                                 self._refresh_token)
+            return self._id_token
+        except Exception as e:
+            print(f"[cloud_sync] anonymous sign-in failed: {e}", flush=True)
+            return None
+
+    def _auth_headers(self) -> dict:
+        token = self._ensure_auth()
+        return {"Authorization": f"Bearer {token}"} if token else {}
 
     # ── Firestore REST helpers ───────────────────────────────────────────
     def _file_url(self, file_name: str) -> str:
@@ -202,7 +268,8 @@ class CloudSync:
                 }
             }
             r = requests.patch(self._file_url(file_name),
-                               json=body, timeout=timeout)
+                               json=body, headers=self._auth_headers(),
+                               timeout=timeout)
             if not r.ok:
                 print(f"[cloud_sync] push {file_name}: HTTP {r.status_code} "
                       f"{r.text[:200]}", flush=True)
@@ -218,7 +285,8 @@ class CloudSync:
         (None, None) means: not in cloud, network failed, or wrong passphrase.
         """
         try:
-            r = requests.get(self._file_url(file_name), timeout=timeout)
+            r = requests.get(self._file_url(file_name),
+                             headers=self._auth_headers(), timeout=timeout)
             if r.status_code == 404:
                 return None, None
             r.raise_for_status()

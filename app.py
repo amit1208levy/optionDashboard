@@ -750,6 +750,15 @@ class _CloudSyncPanel(QWidget):
         super().__init__()
         self._parent_dialog = parent_dialog
         self._settings = api.load_settings() or {}
+        # One-time migration: if the passphrase is currently in plain text
+        # in .settings.json (older builds), move it into the macOS Keychain
+        # and erase the plaintext copy. From now on the passphrase NEVER
+        # touches the filesystem in plain form.
+        legacy = self._settings.get("cloud_sync_passphrase")
+        if legacy:
+            api.keychain_set("cloud_sync_passphrase", legacy)
+            self._settings.pop("cloud_sync_passphrase", None)
+            api.save_settings(self._settings)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -780,7 +789,8 @@ class _CloudSyncPanel(QWidget):
         self._passphrase = QLineEdit()
         self._passphrase.setEchoMode(QLineEdit.EchoMode.Password)
         self._passphrase.setPlaceholderText("Use the same phrase on every Mac")
-        self._passphrase.setText(self._settings.get("cloud_sync_passphrase") or "")
+        # Read the passphrase from the macOS Keychain (NOT from settings.json).
+        self._passphrase.setText(api.keychain_get("cloud_sync_passphrase") or "")
         self._passphrase.setStyleSheet(
             f"QLineEdit {{ background: {T.BG_ALT}; color: {T.TEXT}; "
             f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 8px 10px; "
@@ -968,16 +978,23 @@ class _CloudSyncPanel(QWidget):
             self._status.setText(f"✗ Pull failed: {e}")
 
     def commit(self):
-        """Persist the toggle + passphrase to settings.json (called by
-        the parent dialog on Save)."""
+        """Persist the toggle to settings.json + passphrase to macOS
+        Keychain (called by the parent dialog on Save). The passphrase
+        NEVER touches plain-text disk; it lives only in the encrypted
+        login keychain."""
         s = api.load_settings() or {}
         s["cloud_sync_enabled"] = bool(self._enable_chk.isChecked())
+        # Strip any legacy plaintext copy that might still be lurking.
+        s.pop("cloud_sync_passphrase", None)
+        api.save_settings(s)
+
         passphrase = self._passphrase.text().strip()
         if passphrase:
-            s["cloud_sync_passphrase"] = passphrase
-        elif "cloud_sync_passphrase" in s:
-            s.pop("cloud_sync_passphrase")
-        api.save_settings(s)
+            api.keychain_set("cloud_sync_passphrase", passphrase)
+        else:
+            api.keychain_delete("cloud_sync_passphrase")
+            # Also clear any cached refresh token so next sign-in is fresh.
+            api.keychain_delete("cloud_sync_refresh_token")
 
 
 class _ColumnSettingsDialog(QDialog):

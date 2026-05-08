@@ -1,9 +1,66 @@
 """TastyTrade API — auth, credentials, data fetch."""
 import json
 import os
+import subprocess
 import sys
 import shutil
 import requests
+
+
+# ── macOS Keychain helpers ───────────────────────────────────────────────
+# Used for secrets we never want sitting in plain text on disk: the cloud-
+# sync passphrase, the cloud-sync refresh token. Falls back to no-op on
+# non-macOS platforms.
+
+_KEYCHAIN_ACCOUNT = "OptionsDashboard"
+
+
+def keychain_set(service: str, value: str) -> bool:
+    """Store `value` in the user's login keychain under (account, service).
+    Replaces any existing item. Returns True on success."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        subprocess.run(
+            ["security", "add-generic-password",
+             "-a", _KEYCHAIN_ACCOUNT, "-s", service,
+             "-w", value, "-U"],
+            check=True, capture_output=True,
+        )
+        return True
+    except Exception as e:
+        print(f"[keychain] set {service} failed: {e}", flush=True)
+        return False
+
+
+def keychain_get(service: str):
+    """Return the stored secret for `service`, or None if missing / blocked."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        r = subprocess.run(
+            ["security", "find-generic-password",
+             "-a", _KEYCHAIN_ACCOUNT, "-s", service, "-w"],
+            check=True, capture_output=True, text=True,
+        )
+        return r.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def keychain_delete(service: str) -> bool:
+    """Remove a stored secret. Returns True if it existed and was deleted."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        subprocess.run(
+            ["security", "delete-generic-password",
+             "-a", _KEYCHAIN_ACCOUNT, "-s", service],
+            check=True, capture_output=True,
+        )
+        return True
+    except Exception:
+        return False
 
 BASE = "https://api.tastyworks.com"
 UA   = "options-dashboard/1.0"
