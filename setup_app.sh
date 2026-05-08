@@ -55,21 +55,52 @@ fi
 echo "✓ Repo ready"
 
 # 3. Install Python dependencies
-# Pin to the SAME python the launcher uses so packages always resolve.
-# The launcher's first preference is /usr/bin/python3 (Apple CLT). Using
-# that here too means pip installs into ~/Library/Python/3.x/lib/python/
-# site-packages which the launcher's python can actually find.
+# Pin pip install to the SAME python the launcher will use. We pick it by
+# the same priority order as the launcher and persist that path in the
+# repo so the launcher reads the *exact* same interpreter at runtime.
 PY="/usr/bin/python3"
 [ -x "$PY" ] || PY="/usr/local/bin/python3"
 [ -x "$PY" ] || PY="/opt/homebrew/bin/python3"
-[ -x "$PY" ] || { echo "✗ python3 not found"; exit 1; }
-echo "→ Installing Python libraries via $PY (this can take a minute)..."
-"$PY" -m pip install --user --quiet --upgrade pip 2>/dev/null || true
-"$PY" -m pip install --user --quiet \
-    PyQt6 requests websockets matplotlib ib_insync \
-    || "$PY" -m pip install --user --break-system-packages --quiet \
-        PyQt6 requests websockets matplotlib ib_insync
-echo "✓ Libraries installed (for $PY)"
+[ -x "$PY" ] || { echo "✗ python3 not found anywhere"; exit 1; }
+echo "→ Using python: $PY"
+"$PY" --version
+"$PY" -m pip --version || {
+    echo "✗ pip not available for $PY"
+    echo "  Try: $PY -m ensurepip --user"
+    exit 1
+}
+
+echo "→ Installing Python libraries (output below — watch for errors)..."
+# No --quiet so the user sees real failures. The first install attempts
+# the standard --user path; if that fails (typically PEP 668 / externally-
+# managed-environment), retry with --break-system-packages.
+INSTALL_OK=0
+if "$PY" -m pip install --user \
+        PyQt6 requests websockets matplotlib ib_insync; then
+    INSTALL_OK=1
+elif "$PY" -m pip install --user --break-system-packages \
+        PyQt6 requests websockets matplotlib ib_insync; then
+    INSTALL_OK=1
+fi
+if [ "$INSTALL_OK" -ne 1 ]; then
+    echo "✗ pip install failed. Scroll up for the real error."
+    exit 1
+fi
+
+# Hard verify: actually import PyQt6 with the SAME python. Surfaces any
+# remaining mismatch (mixed archs, wrong site-packages, etc.) right here
+# instead of as an opaque ModuleNotFoundError on first launch.
+if ! "$PY" -c "import PyQt6.QtWidgets" 2>&1; then
+    echo "✗ PyQt6 install reported success but $PY can't import it."
+    echo "  $PY -m pip show PyQt6"
+    "$PY" -m pip show PyQt6 2>&1 | head -10
+    exit 1
+fi
+echo "✓ Libraries installed and verified (for $PY)"
+
+# Persist the chosen python path so the launcher reads exactly the same
+# interpreter every time, regardless of $PATH at run time.
+echo "$PY" > "$INSTALL_DIR/.python_path"
 
 # 4. Build a real macOS .app bundle on the Desktop.
 #    No AppleScript wrapper — the bundle's executable is a shell script that
@@ -139,9 +170,18 @@ if [ ! -d "$REPO" ]; then
 fi
 
 PY=""
-for cand in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
-    if [ -x "$cand" ]; then PY="$cand"; break; fi
-done
+# Prefer the python recorded by setup_app.sh — guarantees the launcher
+# uses the same interpreter pip installed against.
+PINFILE="$REPO/.python_path"
+if [ -r "$PINFILE" ]; then
+    p="$(head -1 "$PINFILE")"
+    [ -x "$p" ] && PY="$p"
+fi
+if [ -z "$PY" ]; then
+    for cand in /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3; do
+        if [ -x "$cand" ]; then PY="$cand"; break; fi
+    done
+fi
 if [ -z "$PY" ]; then
     echo "ERROR: no python3 found" >> "$LOG"
     osascript -e "display dialog \"python3 not found. In Terminal: xcode-select --install\" buttons {\"OK\"} default button \"OK\" with icon stop" >>"$LOG" 2>&1
