@@ -3301,6 +3301,10 @@ class MainWindow(QStackedWidget):
     def _back_from_detail(self):
         if self.portfolio:
             self.setCurrentWidget(self.portfolio)
+            # Detail page may have edited the strategy (added legs, renamed,
+            # closed legs, set exit plan, etc). Re-render so the home cards
+            # reflect those edits — otherwise the user has to click Refresh.
+            self.portfolio.reload_after_config_change()
         if self.detail:
             self.removeWidget(self.detail)
             self.detail.deleteLater()
