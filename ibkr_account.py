@@ -131,7 +131,11 @@ def _portfolio_item_to_raw(item) -> Optional[dict]:
         "close-price":             None,
         "multiplier":              multiplier,
         "average-open-price":      avg_open,
-        # These are unused by Position.__init__ but kept for completeness.
+        # IBKR's authoritative unrealized P&L for the position. Position
+        # uses this directly instead of recomputing from open/mark prices,
+        # which avoids futures-contract edge cases where averageCost
+        # semantics drift between TWS / Gateway versions.
+        "unrealized-pnl":          _safe_float(item.unrealizedPNL),
         "unrealized-day-gain":     _safe_float(item.unrealizedPNL),
     }
 

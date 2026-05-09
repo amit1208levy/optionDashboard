@@ -107,9 +107,29 @@ class Position:
         notional_mark = self.quantity * self.multiplier * self.mark_price
         self.cost_basis   = notional_open
         self.market_value = notional_mark
-        self.pnl          = self.sign * (notional_mark - notional_open)
         self.credit_debit = -self.sign * notional_open  # +credit, -debit
-        self.pnl_pct      = (self.pnl / notional_open * 100.0) if notional_open else 0.0
+
+        # P&L: prefer the broker's authoritative number when available.
+        # IBKR returns it via unrealizedPNL (we map it to "unrealized-pnl").
+        # TastyTrade doesn't, so we fall back to the computed value.
+        if "unrealized-pnl" in raw and raw.get("unrealized-pnl") is not None:
+            self.pnl = _to_float(raw.get("unrealized-pnl"))
+        else:
+            self.pnl = self.sign * (notional_mark - notional_open)
+
+        # Safety net for futures contracts: if avg_open_price is missing
+        # / zero, the formula above reports the full notional as P&L
+        # (because notional_open = 0). That's worse than wrong — it's
+        # actively misleading. Zero it instead.
+        if (self.is_future and not self.is_option
+                and (not self.avg_open_price or self.avg_open_price <= 0)
+                and "unrealized-pnl" not in raw):
+            self.pnl = 0.0
+            self.cost_basis   = 0.0
+            self.market_value = 0.0
+            self.credit_debit = 0.0
+
+        self.pnl_pct = (self.pnl / notional_open * 100.0) if notional_open else 0.0
 
         # Filled in later from market-data endpoint (optional)
         self.delta           = None
@@ -128,6 +148,16 @@ class Position:
         self.pnl          = self.sign * (notional_mark - notional_open)
         self.credit_debit = -self.sign * notional_open
         self.pnl_pct      = (self.pnl / notional_open * 100.0) if notional_open else 0.0
+
+        # Same safety net as __init__: pure-futures contracts with a missing
+        # / zero open price would report the full notional as P&L. Zero it.
+        if (self.is_future and not self.is_option
+                and (not self.avg_open_price or self.avg_open_price <= 0)):
+            self.pnl = 0.0
+            self.cost_basis = 0.0
+            self.market_value = 0.0
+            self.credit_debit = 0.0
+            self.pnl_pct = 0.0
 
     def attach_quote(self, quote):
         """Attach market-data response for this symbol: updates mark + Greeks."""
