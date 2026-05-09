@@ -1616,23 +1616,45 @@ def _span_per_contract(leg):
     return ref * (leg.multiplier or 1) * _SPAN_FALLBACK_PCT
 
 
+def _futures_span_per_contract(leg):
+    """SPAN initial margin for a pure futures contract leg."""
+    margin_per = _FUTURES_SPAN.get(leg.root or "", 0)
+    if not margin_per:
+        ref = float(getattr(leg, "underlying_price", 0) or 0)
+        if not ref:
+            ref = float(getattr(leg, "mark_price", 0) or 0)
+        margin_per = ref * float(leg.multiplier or 1) * _SPAN_FALLBACK_PCT
+    return float(margin_per)
+
+
 def _notional_capital(strategy):
     """
     Margin estimate for undefined-risk strategies.
 
-    Futures options  → SPAN scan-range table (per product) × qty
-    Equity options   → strike × 100 × 20% × qty  (Reg-T naked rule)
-    Stock positions  → abs(market_value)
+    Futures contracts → SPAN initial margin from _FUTURES_SPAN × qty
+    Futures options   → SPAN scan-range table (per product) × qty
+    Equity options    → strike × 100 × 20% × qty  (Reg-T naked rule)
+    Stock positions   → abs(market_value)
 
     For strangles / straddles we take the LARGEST short-leg margin block
     (not a sum) because brokers net the two sides.
     Long legs add their cost basis on top.
+    Futures-contract margins are summed separately and ALWAYS added —
+    a long /ZB next to a short SPY put doesn't get netted.
     """
     best = 0.0
     long_cost = 0.0
+    futures_capital = 0.0
 
     for leg in strategy.legs:
         qty = leg.quantity
+
+        # Pure futures contracts (Future, not Future Option). Use SPAN
+        # margin instead of abs(market_value) (which is the notional and
+        # massively over-states the capital actually required).
+        if leg.is_future and not leg.is_option:
+            futures_capital += _futures_span_per_contract(leg) * qty
+            continue
 
         if not leg.is_option:
             best += abs(leg.market_value)
@@ -1651,10 +1673,16 @@ def _notional_capital(strategy):
 
         best = max(best, cap)
 
-    return best + long_cost
+    return best + long_cost + futures_capital
 
 
 def _capital_for(strategy):
+    # If the strategy contains any pure futures contracts, payoff-based
+    # max-loss equals the full notional (price-to-zero) — meaningless as
+    # a capital estimate. SPAN margin is the right number; always go
+    # through _notional_capital for those.
+    if any(l.is_future and not l.is_option for l in strategy.legs):
+        return _notional_capital(strategy)
     _, ml, _ = strategy_extremes(strategy)
     if ml is not None and ml != float("-inf"):
         return abs(ml)
