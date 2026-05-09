@@ -107,7 +107,14 @@ class Position:
         notional_mark = self.quantity * self.multiplier * self.mark_price
         self.cost_basis   = notional_open
         self.market_value = notional_mark
-        self.credit_debit = -self.sign * notional_open  # +credit, -debit
+        # Net credit/debit at open. For pure futures contracts there's no
+        # cash exchange at entry — only margin posted — so credit_debit
+        # is 0 (otherwise the formula reports the full notional as a debit,
+        # e.g. \$290,000 for one /ES contract, which is meaningless).
+        if self.is_future and not self.is_option:
+            self.credit_debit = 0.0
+        else:
+            self.credit_debit = -self.sign * notional_open  # +credit, -debit
 
         # P&L: prefer the broker's authoritative number when available.
         # IBKR returns it via unrealizedPNL (we map it to "unrealized-pnl").
@@ -146,7 +153,11 @@ class Position:
         self.cost_basis   = notional_open
         self.market_value = notional_mark
         self.pnl          = self.sign * (notional_mark - notional_open)
-        self.credit_debit = -self.sign * notional_open
+        # Pure futures contracts: no cash exchanged at open (margin only).
+        if self.is_future and not self.is_option:
+            self.credit_debit = 0.0
+        else:
+            self.credit_debit = -self.sign * notional_open
         self.pnl_pct      = (self.pnl / notional_open * 100.0) if notional_open else 0.0
 
         # Same safety net as __init__: pure-futures contracts with a missing
