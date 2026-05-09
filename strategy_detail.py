@@ -1818,6 +1818,17 @@ class StrategyDetailPage(QWidget):
             f"border: none; background: transparent; margin-top: 8px;"
         )
         lay.addWidget(hdr)
+        sub = QLabel(
+            "Use ✎ to fix a P&L, or 🗑 Remove to delete a row that doesn't "
+            "belong to this strategy. The Performance History stats above "
+            "update immediately."
+        )
+        sub.setWordWrap(True)
+        sub.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; border: none; "
+            f"background: transparent; padding: 0 0 4px 0;"
+        )
+        lay.addWidget(sub)
         for h in sorted(entries, key=lambda e: e.get("closed_at") or "", reverse=True):
             side = "Long" if (h.get("sign") or 0) > 0 else "Short"
             cp = {"C": "Call", "P": "Put"}.get(h.get("call_put"), "Stock")
@@ -1861,15 +1872,17 @@ class StrategyDetailPage(QWidget):
             edit_btn.clicked.connect(lambda _checked, entry=h, lbl=pl: self._edit_history_entry(entry, lbl))
             hl.addWidget(edit_btn)
 
-            # Delete button
-            del_btn = QPushButton("✕")
-            del_btn.setFixedSize(26, 26)
+            # Delete button — clearly visible at rest, fills red on hover.
+            del_btn = QPushButton("🗑  Remove")
+            del_btn.setFixedHeight(28)
             del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            del_btn.setToolTip("Remove entry")
+            del_btn.setToolTip("Remove this entry from history")
             del_btn.setStyleSheet(
-                f"QPushButton {{ background: transparent; color: {T.MUTED}; "
-                f"border: none; font-size: 13px; font-weight: bold; border-radius: 5px; }}"
-                f"QPushButton:hover {{ background: #3d1a1a; color: {T.RED}; }}"
+                f"QPushButton {{ background: transparent; color: {T.RED}; "
+                f"border: 1px solid {T.RED}; border-radius: 6px; "
+                f"padding: 0 12px; font-size: 11px; font-weight: bold; "
+                f"letter-spacing: 0.4px; }}"
+                f"QPushButton:hover {{ background: {T.RED}; color: white; }}"
             )
             del_btn.clicked.connect(lambda _checked, entry=h, widget=row: self._delete_history_entry(entry, widget))
             hl.addWidget(del_btn)
