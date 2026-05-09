@@ -466,7 +466,7 @@ class StrategyCard(QFrame):
         lay.addLayout(agg_row)
 
         # ── Legs section ──────────────────────────────────────────────────
-        section_title = QLabel(f"LEGS  ·  {len(s.legs)}")
+        section_title = QLabel(f"OPEN LEGS  ·  {len(s.legs)}")
         section_title.setStyleSheet(
             f"color: {T.LABEL}; font-size: 11px; font-weight: bold; "
             f"letter-spacing: 0.8px; border: none; background: transparent;"

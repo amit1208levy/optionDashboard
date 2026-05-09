@@ -1,5 +1,5 @@
 """Full-page strategy detail: metrics, Greeks, legs, payoff chart, history."""
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QPushButton, QScrollArea, QSizePolicy, QInputDialog, QDialog, QSlider,
@@ -108,8 +108,35 @@ from models import (
 )
 from payoff_chart import PayoffChart
 from history_chart import HistoryChart
+from pnl_history_chart import PnLHistoryChart
+import position_pnl_history
 from strategy_card import money, pct, fmt_num, pnl_color, dte_color
 from strategies_page import PastLegPickerDialog
+
+
+class _PnLHistoryWorker(QThread):
+    """
+    Builds per-underlying historical P&L series off the UI thread.
+    Network I/O (Yahoo Finance) and BS re-pricing run here so the
+    Performance History card doesn't freeze while data is fetched.
+    """
+    done   = pyqtSignal(dict)    # {root: [(date, pnl), ...]}
+    failed = pyqtSignal(str)
+
+    def __init__(self, legs, history_entries, parent=None):
+        super().__init__(parent)
+        self._legs = list(legs or [])
+        self._history = list(history_entries or [])
+
+    def run(self):
+        try:
+            series = position_pnl_history.build_per_underlying_series(
+                legs            = self._legs,
+                history_entries = self._history,
+            )
+            self.done.emit(series)
+        except Exception as e:
+            self.failed.emit(str(e))
 
 
 # ── Drag handle ──────────────────────────────────────────────────────────────
@@ -283,61 +310,92 @@ class LegRow(QFrame):
         )
         h.addWidget(tk)
 
-        # ── Futures-contract shortcut layout ─────────────────────────────
+        # ── Futures-contract layout ──────────────────────────────────────
         # Pure futures contracts have no strike, no Greeks, no DTE in the
-        # options sense. Skip the configurable columns entirely and just
-        # show: FUTURES CONTRACT pill + P&L + Open price + Capital.
+        # options sense.  Render cells in the SAME widths as the column
+        # header above so values line up; show "—" for fields that don't
+        # apply, the P&L value under the P&L header, a small "FUT" pill in
+        # the C/P slot, and OPEN + CAP as trailing labeled chips.
         if is_fut_contract:
             from models import _FUTURES_SPAN, _SPAN_FALLBACK_PCT
 
-            pill = QLabel("FUTURES CONTRACT")
-            pill.setFixedHeight(22)
-            pill.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter)
-            pill.setStyleSheet(
-                f"color: #1a1500; background: {T.YELLOW}; border: none; "
-                f"border-radius: 5px; padding: 1px 8px; "
-                f"font-size: 10px; font-weight: 900; letter-spacing: 0.6px;"
-            )
-            h.addWidget(pill)
-
-            # Vertical rule
-            sep = QFrame()
-            sep.setFixedWidth(1)
-            sep.setFixedHeight(22)
-            sep.setStyleSheet(f"background: {T.BORDER}; border: none; margin: 0 8px;")
-            h.addWidget(sep)
-
-            def _add_kv(label_text, value_text, value_color,
-                         value_weight=700, value_size=12, total_w=110):
-                wrap = QWidget()
-                wl = QHBoxLayout(wrap)
-                wl.setContentsMargins(0, 0, 0, 0); wl.setSpacing(4)
-                lbl = QLabel(label_text)
-                lbl.setStyleSheet(
-                    f"color: {T.MUTED}; font-size: 10px; font-weight: 600; "
-                    f"letter-spacing: 0.5px; background: transparent; border: none;"
-                )
-                val = QLabel(value_text)
-                val.setStyleSheet(
-                    f"color: {value_color}; font-size: {value_size}px; "
-                    f"font-weight: {value_weight}; background: transparent; border: none;"
-                )
-                wl.addWidget(lbl); wl.addWidget(val)
-                wrap.setFixedWidth(total_w)
-                h.addWidget(wrap)
-
-            _add_kv("P&L",  money(leg.pnl, signed=True), pnl_color(leg.pnl),
-                     value_weight=800, value_size=13, total_w=110)
             open_str = (f"{leg.avg_open_price:g}"
                         if getattr(leg, "avg_open_price", None) else "—")
-            _add_kv("OPEN", open_str, T.TEXT, total_w=110)
 
             margin_per = _FUTURES_SPAN.get(leg.root or "", 0)
             if not margin_per:
                 ref = float(getattr(leg, "underlying_price", 0) or 0)
                 margin_per = ref * float(leg.multiplier or 1) * _SPAN_FALLBACK_PCT
             cap_total = margin_per * (leg.quantity or 0)
-            _add_kv("CAP", money(cap_total), T.YELLOW, total_w=110)
+
+            FUT_WIDTH = {
+                "exp":     68,  "dte":     44,  "strike":  70,  "cp":      32,
+                "pnl":     90,  "pnl_pct": 68,  "day":     82,  "theta_d": 66,
+                "delta":   60,  "gamma":   60,  "vega":    60,  "dit":     44,
+            }
+
+            def _fcell(text, color, key, weight=500, size=11):
+                l = QLabel(text)
+                l.setFixedWidth(FUT_WIDTH.get(key, 60))
+                l.setStyleSheet(
+                    f"color: {color}; background: transparent; border: none; "
+                    f"font-size: {size}px; font-weight: {weight};"
+                )
+                h.addWidget(l)
+
+            fut_keys = self._leg_column_keys or [
+                "exp", "dte", "strike", "cp",
+                "pnl", "pnl_pct", "day", "theta_d", "dit", "dte",
+            ]
+
+            for key in fut_keys:
+                if key == "pnl":
+                    _fcell(money(leg.pnl, signed=True),
+                           pnl_color(leg.pnl), "pnl",
+                           weight=800, size=13)
+                elif key == "cp":
+                    # Tiny "FUT" pill where C/P would normally sit.
+                    wrap = QWidget()
+                    wl = QHBoxLayout(wrap)
+                    wl.setContentsMargins(0, 0, 0, 0); wl.setSpacing(0)
+                    wl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    pill = QLabel("FUT")
+                    pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    pill.setFixedHeight(18)
+                    pill.setStyleSheet(
+                        f"color: #1a1500; background: {T.YELLOW}; border: none; "
+                        f"border-radius: 4px; padding: 0 5px; "
+                        f"font-size: 9px; font-weight: 900; letter-spacing: 0.4px;"
+                    )
+                    wl.addWidget(pill)
+                    wrap.setFixedWidth(FUT_WIDTH["cp"])
+                    h.addWidget(wrap)
+                else:
+                    _fcell("—", T.MUTED, key)
+
+            # Trailing OPEN + CAP labeled chips (the only futures-specific
+            # data on this row, kept compact and clearly labeled).
+            def _add_kv(label_text, value_text, value_color):
+                wrap = QWidget()
+                wl = QHBoxLayout(wrap)
+                wl.setContentsMargins(0, 0, 0, 0); wl.setSpacing(4)
+                lbl = QLabel(label_text)
+                lbl.setStyleSheet(
+                    f"color: {T.MUTED}; font-size: 10px; font-weight: 700; "
+                    f"letter-spacing: 0.5px; background: transparent; border: none;"
+                )
+                val = QLabel(value_text)
+                val.setStyleSheet(
+                    f"color: {value_color}; font-size: 12px; font-weight: 800; "
+                    f"background: transparent; border: none;"
+                )
+                wl.addWidget(lbl); wl.addWidget(val)
+                h.addWidget(wrap)
+
+            h.addSpacing(12)
+            _add_kv("OPEN", open_str, T.TEXT)
+            h.addSpacing(16)
+            _add_kv("CAP", money(cap_total), T.YELLOW)
 
             h.addStretch()
             return
@@ -549,6 +607,122 @@ class _LegsBody(QWidget):
         e.accept()
 
 
+# ── Section drag handle + reorderable stack ─────────────────────────────────
+
+class _SectionDragHandle(QLabel):
+    """
+    ⠿ icon shown in the top-left of each section card.  Pressing it
+    initiates a section-level drag in the parent _SectionStack.
+    """
+    pressed = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__("⠿", parent)
+        self.setFixedSize(20, 22)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setStyleSheet(
+            f"color: {T.MUTED}; border: none; background: transparent; "
+            f"font-size: 14px;"
+        )
+        self.setToolTip("Drag to reorder this section")
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self.pressed.emit()
+            e.accept()
+        else:
+            super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        super().mouseReleaseEvent(e)
+
+
+class _SectionStack(QWidget):
+    """
+    Vertical stack of section frames.  Each section has a drag handle in
+    its top-left; grabbing the handle and moving the mouse reorders the
+    sections live (mirrors the _LegsBody pattern).  On release, emits
+    `reordered` with the new section_id list.
+    """
+    reordered = pyqtSignal(list)   # [section_id, ...] in new order
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._lay = QVBoxLayout(self)
+        self._lay.setContentsMargins(0, 0, 0, 0)
+        self._lay.setSpacing(18)
+        self._sections: list[tuple[str, QFrame]] = []
+        self._dragging: QFrame | None = None
+        self._drag_orig_opacity = None
+
+    def add_section(self, section_id: str, frame: QFrame,
+                     handle: "_SectionDragHandle"):
+        self._sections.append((section_id, frame))
+        self._lay.addWidget(frame)
+        handle.pressed.connect(lambda fr=frame: self._on_press(fr))
+
+    def _on_press(self, frame: QFrame):
+        if len(self._sections) < 2:
+            return
+        self._dragging = frame
+        # Light visual hint while dragging — fade the moved card slightly.
+        try:
+            from PyQt6.QtWidgets import QGraphicsOpacityEffect
+            eff = QGraphicsOpacityEffect(frame)
+            eff.setOpacity(0.65)
+            frame.setGraphicsEffect(eff)
+        except Exception:
+            pass
+        self.grabMouse()
+
+    def mouseMoveEvent(self, e):
+        if self._dragging is None:
+            return
+        local_y = e.position().y()
+        # Insert before the section whose midpoint sits below the cursor.
+        target = len(self._sections) - 1
+        for i, (_sid, fr) in enumerate(self._sections):
+            if local_y < fr.pos().y() + fr.height() // 2:
+                target = i
+                break
+
+        curr = next((i for i, (_sid, fr) in enumerate(self._sections)
+                      if fr is self._dragging), -1)
+        if curr < 0 or target == curr:
+            return
+
+        others = [(sid, fr) for sid, fr in self._sections
+                  if fr is not self._dragging]
+        # Find the section_id of the dragged frame
+        drag_sid = next(sid for sid, fr in self._sections
+                        if fr is self._dragging)
+        others.insert(min(target, len(others)), (drag_sid, self._dragging))
+        self._sections = others
+
+        # Rebuild the layout in the new order.
+        for _sid, fr in self._sections:
+            self._lay.removeWidget(fr)
+        for _sid, fr in self._sections:
+            self._lay.addWidget(fr)
+
+        e.accept()
+
+    def mouseReleaseEvent(self, e):
+        if self._dragging is None:
+            return
+        try:
+            self._dragging.setGraphicsEffect(None)
+        except Exception:
+            pass
+        self._dragging = None
+        self.releaseMouse()
+        self.reordered.emit([sid for sid, _ in self._sections])
+        e.accept()
+
+
 # ── Detail page ─────────────────────────────────────────────────────────────
 
 class StrategyDetailPage(QWidget):
@@ -576,29 +750,69 @@ class StrategyDetailPage(QWidget):
         body.setSpacing(18)
 
         body.addLayout(self._build_summary_row())
-        body.addWidget(self._build_metrics_card())
-        body.addWidget(self._build_greeks_card())
+
+        # Build all section cards, keyed by id, then add them to a
+        # reorderable stack in the user-saved order (with sensible default
+        # for any new sections not yet in the saved order).
+        sections: list[tuple[str, QFrame]] = []
+        sections.append(("metrics", self._build_metrics_card()))
+        sections.append(("greeks",  self._build_greeks_card()))
         mkt_card = self._build_market_card()
         if mkt_card:
-            body.addWidget(mkt_card)
-        body.addWidget(self._build_chart_card())
-        body.addWidget(self._build_legs_card())
-
-        # Leg groups — only for saved strategies (sub-groupings need persistence)
+            sections.append(("market", mkt_card))
+        sections.append(("chart", self._build_chart_card()))
+        sections.append(("legs",  self._build_legs_card()))
         if isinstance(self.strategy, StrategyInstance):
-            body.addWidget(self._build_leg_groups_card())
-
-        if isinstance(self.strategy, StrategyInstance):
-            body.addWidget(self._build_exit_plan_card())
-            body.addWidget(self._build_history_card())
-
+            sections.append(("exit_plan", self._build_exit_plan_card()))
+            sections.append(("history",   self._build_history_card()))
         tmpl_card = self._build_template_card()
         if tmpl_card:
-            body.addWidget(tmpl_card)                # About at bottom
+            sections.append(("template", tmpl_card))
+
+        # Apply saved order (sections not in the saved order keep their
+        # default position relative to the others).
+        saved_order = []
+        try:
+            settings = api.load_settings() or {}
+            so = settings.get("strategy_section_order") or []
+            if isinstance(so, list):
+                saved_order = [s for s in so if isinstance(s, str)]
+        except Exception:
+            pass
+        if saved_order:
+            present = {sid for sid, _ in sections}
+            ordered = [(sid, dict(sections)[sid]) for sid in saved_order
+                       if sid in present]
+            ordered_ids = {sid for sid, _ in ordered}
+            for sid, fr in sections:
+                if sid not in ordered_ids:
+                    ordered.append((sid, fr))
+            sections = ordered
+
+        self._section_stack = _SectionStack()
+        for sid, fr in sections:
+            handle = getattr(fr, "_drag_handle", None)
+            if handle is None:
+                # Section frame without a handle (shouldn't happen now) —
+                # add it but it won't be reorderable.
+                self._section_stack._lay.addWidget(fr)
+                continue
+            self._section_stack.add_section(sid, fr, handle)
+        self._section_stack.reordered.connect(self._on_sections_reordered)
+        body.addWidget(self._section_stack)
 
         body.addStretch()
         scroll.setWidget(body_w)
         root.addWidget(scroll)
+
+    def _on_sections_reordered(self, new_order: list):
+        """Persist the user's section order to settings."""
+        try:
+            settings = api.load_settings() or {}
+            settings["strategy_section_order"] = list(new_order)
+            api.save_settings(settings)
+        except Exception:
+            pass
 
     # ── Header ──────────────────────────────────────────────────────────────
 
@@ -654,11 +868,10 @@ class StrategyDetailPage(QWidget):
             return None
 
         ivr  = symbol_ivr(m)
-        ivp  = symbol_ivp(m)
         hv30 = symbol_hv30(m)
         beta = symbol_beta(m)
 
-        if all(v is None for v in (ivr, ivp, hv30, beta)):
+        if all(v is None for v in (ivr, hv30, beta)):
             return None
 
         frame, lay = self._section_frame(f"Market Stats — {self.strategy.root}")
@@ -671,10 +884,9 @@ class StrategyDetailPage(QWidget):
             return T.GREEN if v >= 50 else (T.YELLOW if v >= 25 else T.RED)
 
         items = [
-            ("IV Rank",       f"{ivr:.0f}"  if ivr  is not None else "—", ivr_color(ivr)),
-            ("IV Percentile", f"{ivp:.0f}"  if ivp  is not None else "—", ivr_color(ivp)),
-            ("HV (30d)",      f"{hv30:.1f}%" if hv30 is not None else "—", T.TEXT),
-            ("Beta",          f"{beta:.2f}" if beta is not None else "—", T.TEXT),
+            ("IV Rank",  f"{ivr:.0f}"   if ivr  is not None else "—", ivr_color(ivr)),
+            ("HV (30d)", f"{hv30:.1f}%" if hv30 is not None else "—", T.TEXT),
+            ("Beta",     f"{beta:.2f}"  if beta is not None else "—", T.TEXT),
         ]
         for i, (k, v, c) in enumerate(items):
             grid.addWidget(self._metric_box(k, v, c), 0, i)
@@ -1022,10 +1234,6 @@ class StrategyDetailPage(QWidget):
         s = self.strategy
         frame, lay = self._section_frame("Net Greeks")
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(6)
-
         # Beta-weighted delta
         m    = self._metrics_for_root()
         beta = symbol_beta(m) if m else None
@@ -1034,19 +1242,46 @@ class StrategyDetailPage(QWidget):
                 else None)
 
         items = [
-            ("Δ Delta",  _fmt_greek(s.net_delta),
-                pnl_color(s.net_delta) if s.net_delta else T.TEXT_DIM),
-            ("Θ Theta",  _fmt_greek(s.net_theta),
-                pnl_color(s.net_theta) if s.net_theta else T.TEXT_DIM),
-            ("V Vega",   _fmt_greek(s.net_vega),  T.TEXT_DIM),
-            ("β×Δ BWD",  _fmt_greek(bwd) if bwd is not None else "—", T.TEXT_DIM),
+            ("Δ",   _fmt_greek(s.net_delta),
+                pnl_color(s.net_delta) if s.net_delta else T.TEXT),
+            ("Θ",   _fmt_greek(s.net_theta),
+                pnl_color(s.net_theta) if s.net_theta else T.TEXT),
+            ("V",   _fmt_greek(s.net_vega),  T.TEXT),
+            ("β·Δ", _fmt_greek(bwd) if bwd is not None else "—", T.TEXT_DIM),
         ]
-        for i, (label, value, color) in enumerate(items):
-            grid.addWidget(self._metric_box(label, value, color), 0, i)
-            grid.setColumnStretch(i, 1)
 
-        lay.addLayout(grid)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        for label, value, color in items:
+            row.addWidget(self._greek_chip(label, value, color))
+        row.addStretch()
+        lay.addLayout(row)
         return frame
+
+    def _greek_chip(self, label, value, color):
+        """Compact horizontal chip: label · value, fits multiple per row."""
+        w = QFrame()
+        w.setStyleSheet(
+            f"QFrame {{ background: #12151d; border: 1px solid {T.BORDER}; "
+            f"border-radius: 6px; }}"
+        )
+        h = QHBoxLayout(w)
+        h.setContentsMargins(10, 4, 12, 4)
+        h.setSpacing(8)
+        l = QLabel(label)
+        l.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; font-weight: 700; "
+            f"background: transparent; border: none;"
+        )
+        h.addWidget(l)
+        v = QLabel(value)
+        v.setStyleSheet(
+            f"color: {color}; font-size: 13px; font-weight: 800; "
+            f"background: transparent; border: none;"
+        )
+        h.addWidget(v)
+        return w
 
     # ── Template info (only for StrategyInstance) ───────────────────────────
 
@@ -1149,12 +1384,27 @@ class StrategyDetailPage(QWidget):
 
     def _build_legs_card(self):
         columns, enabled_greeks = _active_leg_columns()
-        frame, lay = self._section_frame(f"Legs ({len(self.strategy.legs)})")
+        frame, lay = self._section_frame(f"Open Legs ({len(self.strategy.legs)})")
 
-        # + Add Leg button (only for saved instances)
-        if isinstance(self.strategy, StrategyInstance) and self.portfolio:
+        is_instance = isinstance(self.strategy, StrategyInstance)
+
+        # Toolbar: + Add Leg / + New group (saved instances only)
+        if is_instance and self.portfolio:
             btn_row = QHBoxLayout()
             btn_row.addStretch()
+
+            grp_btn = QPushButton("+ New group")
+            grp_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            grp_btn.setFixedHeight(28)
+            grp_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.ACCENT}; "
+                f"border: 1px solid {T.ACCENT}; border-radius: 6px; "
+                f"padding: 0 12px; font-size: 11px; font-weight: bold; }}"
+                f"QPushButton:hover {{ background: {T.ACCENT}; color: white; }}"
+            )
+            grp_btn.clicked.connect(self._on_add_leg_group)
+            btn_row.addWidget(grp_btn)
+
             add_btn = QPushButton("+ Add Leg")
             add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             add_btn.setFixedHeight(28)
@@ -1171,7 +1421,7 @@ class StrategyDetailPage(QWidget):
 
         # Apply user-defined display order if one has been saved
         legs = list(self.strategy.legs)
-        if isinstance(self.strategy, StrategyInstance) and self.portfolio:
+        if is_instance and self.portfolio:
             raw = next(
                 (r for r in self.portfolio.strategies_raw
                  if r["id"] == self.strategy.id), None
@@ -1181,7 +1431,7 @@ class StrategyDetailPage(QWidget):
                 legs.sort(key=lambda l: order.get(l.symbol, 999))
 
         leg_groups = (self.strategy._raw.get("leg_groups") or []
-                      if isinstance(self.strategy, StrategyInstance) else [])
+                      if is_instance else [])
         # Pull configured leg-column order from settings so the detail
         # page matches the home-page drop-down.
         leg_keys = None
@@ -1194,9 +1444,23 @@ class StrategyDetailPage(QWidget):
             pass
         body = _LegsBody(legs, enabled_greeks, leg_groups=leg_groups,
                          leg_column_keys=leg_keys)
-        if isinstance(self.strategy, StrategyInstance):
+        if is_instance:
             body.reordered.connect(self._on_legs_reordered)
         lay.addWidget(body)
+
+        # ── Inline leg-groups subsection (saved instances only) ──────────
+        # Leg groups live inside the Open Legs card now — their cards (with
+        # payoff chart + Greeks) render below the legs list.
+        if is_instance and leg_groups:
+            sub_hdr = QLabel(f"GROUPS  ·  {len(leg_groups)}")
+            sub_hdr.setStyleSheet(
+                f"color: {T.LABEL}; font-size: 11px; font-weight: bold; "
+                f"letter-spacing: 0.8px; border: none; background: transparent; "
+                f"padding-top: 14px;"
+            )
+            lay.addWidget(sub_hdr)
+            for grp in leg_groups:
+                lay.addWidget(self._build_single_group_card(grp))
         return frame
 
     def _on_add_leg(self):
@@ -1766,13 +2030,13 @@ class StrategyDetailPage(QWidget):
         cl = perf["closed_legs"]
         legs_note = f" ({cl} legs)" if cl != ct else ""
         # ── Stats grid ─────────────────────────────────────────────────────
-        # P&L YTD and All-Time match the strategy-card values: each is
+        # P&L YTD and Total P&L match the strategy-card values: each is
         # 'closed-leg P&L for the period + current open P&L'. 'Closed-only'
         # is shown alongside as a sanity-check breakdown.
         items = [
             ("Closed trades", f"{ct}{legs_note}"),
             ("P&L YTD",     money(pnl_summary["total_ytd"], signed=True)),
-            ("All-Time P&L", money(pnl_summary["total_all"], signed=True)),
+            ("Total P&L",   money(pnl_summary["total_all"], signed=True)),
             ("Closed only", money(perf["total_pnl"], signed=True)),
             ("Win rate",    f"{perf['win_rate']:.0f}%"),
             ("Avg DIT",     f"{perf['avg_dit']:.0f}d"
@@ -1800,40 +2064,142 @@ class StrategyDetailPage(QWidget):
         lay.addLayout(grid)
         lay.addSpacing(6)
 
-        # Cumulative P&L chart
-        chart_hdr = QLabel("CUMULATIVE P&L")
+        # ── Per-underlying P&L history (replaces the old cumulative-only chart)
+        # Combines realized P&L from closed legs with mark-to-market estimates
+        # for OPEN legs over the same window.  Option marks at past dates are
+        # estimated via Black-Scholes using IV implied from the opening mark
+        # (so delta evolution + theta are captured without assuming constant
+        # delta).
+        chart_hdr = QLabel("P&L BY UNDERLYING")
         chart_hdr.setStyleSheet(
             f"color: {T.MUTED}; font-size: 10px; font-weight: bold; letter-spacing: 0.5px; "
             f"border: none; background: transparent; margin-top: 6px;"
         )
         lay.addWidget(chart_hdr)
-        chart = HistoryChart(entries, height=3.0)
-        chart.setMinimumHeight(260)
-        lay.addWidget(chart)
 
-        # Closed-legs list
-        hdr = QLabel("CLOSED LEGS")
-        hdr.setStyleSheet(
-            f"color: {T.MUTED}; font-size: 10px; font-weight: bold; letter-spacing: 0.5px; "
-            f"border: none; background: transparent; margin-top: 8px;"
+        charts_wrap = QWidget()
+        charts_wrap.setStyleSheet("background: transparent; border: none;")
+        charts_lay = QVBoxLayout(charts_wrap)
+        charts_lay.setContentsMargins(0, 0, 0, 0)
+        charts_lay.setSpacing(10)
+
+        loading = QLabel("Estimating historical P&L using underlying price history…")
+        loading.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 11px; padding: 24px; "
+            f"border: 1px dashed {T.BORDER}; border-radius: 8px; "
+            f"background: #12151d;"
         )
-        lay.addWidget(hdr)
+        loading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        charts_lay.addWidget(loading)
+        lay.addWidget(charts_wrap)
+
+        caveat = QLabel(
+            "Option marks at past dates are estimated via Black-Scholes "
+            "using IV implied from the opening mark — accuracy degrades for "
+            "very large moves or near expiry."
+        )
+        caveat.setWordWrap(True)
+        caveat.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 10px; border: none; "
+            f"background: transparent; padding-top: 4px;"
+        )
+        lay.addWidget(caveat)
+
+        # Spawn the worker; replace `loading` widget with charts on done.
+        legs_for_history = list(self.strategy.legs)
+
+        def _on_series(series_by_root):
+            try:
+                # Drop the loading placeholder.
+                charts_lay.removeWidget(loading)
+                loading.deleteLater()
+            except Exception:
+                pass
+            if not series_by_root:
+                empty = QLabel("Not enough data to reconstruct historical P&L.")
+                empty.setStyleSheet(
+                    f"color: {T.MUTED}; font-size: 11px; padding: 16px;"
+                )
+                charts_lay.addWidget(empty)
+                return
+            for root, series in series_by_root.items():
+                if not series:
+                    continue
+                ch = PnLHistoryChart(root, series, height=2.6)
+                ch.setMinimumHeight(220)
+                charts_lay.addWidget(ch)
+
+        def _on_failed(msg):
+            try:
+                loading.setText(f"Couldn't load P&L history: {msg}")
+            except Exception:
+                pass
+
+        self._pnl_worker = _PnLHistoryWorker(legs_for_history, entries, parent=self)
+        self._pnl_worker.done.connect(_on_series)
+        self._pnl_worker.failed.connect(_on_failed)
+        self._pnl_worker.start()
+
+        # ── Closed-legs list (hidden by default behind a Show toggle) ──────
+        sorted_entries = sorted(entries,
+                                key=lambda e: e.get("closed_at") or "",
+                                reverse=True)
+
+        list_hdr_row = QHBoxLayout()
+        list_hdr_row.setContentsMargins(0, 8, 0, 0)
+        list_hdr_row.setSpacing(8)
+        list_hdr = QLabel(f"CLOSED LEGS  ·  {len(sorted_entries)}")
+        list_hdr.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 10px; font-weight: bold; "
+            f"letter-spacing: 0.5px; border: none; background: transparent;"
+        )
+        list_hdr_row.addWidget(list_hdr)
+        list_hdr_row.addStretch()
+
+        toggle_btn = QPushButton(f"▸  Show ({len(sorted_entries)})")
+        toggle_btn.setFixedHeight(26)
+        toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        toggle_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.ACCENT}; "
+            f"border: 1px solid {T.ACCENT}; border-radius: 6px; padding: 0 12px; "
+            f"font-size: 11px; font-weight: bold; letter-spacing: 0.4px; }}"
+            f"QPushButton:hover {{ background: {T.ACCENT}; color: white; }}"
+        )
+        list_hdr_row.addWidget(toggle_btn)
+        lay.addLayout(list_hdr_row)
+
+        # Container that holds all the closed-leg rows; toggled by the button.
+        list_wrap = QWidget()
+        list_wrap.setStyleSheet("background: transparent; border: none;")
+        list_lay = QVBoxLayout(list_wrap)
+        list_lay.setContentsMargins(0, 0, 0, 0)
+        list_lay.setSpacing(6)
+
         sub = QLabel(
+            "Each row shows what was bought or sold on the close date.  "
             "Use ✎ to fix a P&L, or 🗑 Remove to delete a row that doesn't "
-            "belong to this strategy. The Performance History stats above "
-            "update immediately."
+            "belong here — the Performance History stats above update right away."
         )
         sub.setWordWrap(True)
         sub.setStyleSheet(
             f"color: {T.MUTED}; font-size: 11px; border: none; "
             f"background: transparent; padding: 0 0 4px 0;"
         )
-        lay.addWidget(sub)
-        for h in sorted(entries, key=lambda e: e.get("closed_at") or "", reverse=True):
-            side = "Long" if (h.get("sign") or 0) > 0 else "Short"
+        list_lay.addWidget(sub)
+
+        for h in sorted_entries:
+            sign = h.get("sign") or 0
+            # The row records what was held while open (sign).  Closing flips
+            # the action: long → sold to close, short → bought to close.
+            close_action = "SOLD" if sign > 0 else "BOUGHT"
             cp = {"C": "Call", "P": "Put"}.get(h.get("call_put"), "Stock")
-            k  = f"{h.get('strike', 0):g}" if h.get("strike") else ""
+            k  = f" {h.get('strike', 0):g}" if h.get("strike") else ""
+            qty = int(h.get("qty") or 0)
+            root = h.get("root") or ""
             pnl = h.get("pnl") or 0.0
+            close_d = (h.get("closed_at") or "—")[:10]
+            open_d  = (h.get("opened_at") or "")[:10]
+
             row = QFrame()
             row.setStyleSheet(
                 f"QFrame {{ background: #12151d; border: 1px solid {T.BORDER}; "
@@ -1843,15 +2209,36 @@ class StrategyDetailPage(QWidget):
             hl = QHBoxLayout(row)
             hl.setContentsMargins(10, 6, 6, 6)
             hl.setSpacing(6)
-            label = QLabel(
-                f"{(h.get('closed_at') or '—')[:10]}  ·  {side} {int(h.get('qty') or 0)} "
-                f"{h.get('root') or ''} {cp} {k}"
+
+            # Two-line label: BIG action line + small dates underneath.
+            line_wrap = QWidget()
+            line_wrap.setStyleSheet("background: transparent; border: none;")
+            ll = QVBoxLayout(line_wrap)
+            ll.setContentsMargins(0, 0, 0, 0); ll.setSpacing(1)
+
+            action_color = T.RED if close_action == "SOLD" else T.GREEN
+            action_lbl = QLabel(
+                f"<span style='color:{action_color}; font-weight:800;'>"
+                f"{close_action}</span> "
+                f"<span style='color:{T.TEXT};'>{qty} {root} {cp}{k}</span>"
             )
-            label.setStyleSheet(
-                f"color: {T.TEXT_DIM}; font-size: 11px; border: none; background: transparent;"
+            action_lbl.setStyleSheet(
+                f"font-size: 12px; border: none; background: transparent;"
             )
-            hl.addWidget(label)
+            ll.addWidget(action_lbl)
+
+            if open_d and close_d != "—":
+                date_text = f"opened {open_d}  →  closed {close_d}"
+            else:
+                date_text = f"closed {close_d}"
+            date_lbl = QLabel(date_text)
+            date_lbl.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 10px; border: none; background: transparent;"
+            )
+            ll.addWidget(date_lbl)
+            hl.addWidget(line_wrap)
             hl.addStretch()
+
             pl = QLabel(money(pnl, signed=True))
             pl.setStyleSheet(
                 f"color: {pnl_color(pnl)}; font-size: 12px; font-weight: bold; "
@@ -1887,7 +2274,19 @@ class StrategyDetailPage(QWidget):
             del_btn.clicked.connect(lambda _checked, entry=h, widget=row: self._delete_history_entry(entry, widget))
             hl.addWidget(del_btn)
 
-            lay.addWidget(row)
+            list_lay.addWidget(row)
+
+        list_wrap.setVisible(False)
+        lay.addWidget(list_wrap)
+
+        def _toggle():
+            now_visible = not list_wrap.isVisible()
+            list_wrap.setVisible(now_visible)
+            toggle_btn.setText(
+                f"▾  Hide ({len(sorted_entries)})" if now_visible
+                else f"▸  Show ({len(sorted_entries)})"
+            )
+        toggle_btn.clicked.connect(_toggle)
 
         return frame
 
@@ -1973,12 +2372,25 @@ class StrategyDetailPage(QWidget):
         lay = QVBoxLayout(f)
         lay.setContentsMargins(22, 18, 22, 20)
         lay.setSpacing(10)
+
+        # Title row: drag handle (top-left) + title text.
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
+        handle = _SectionDragHandle()
+        title_row.addWidget(handle)
         tl = QLabel(title)
         tl.setStyleSheet(
             f"color: {T.ACCENT}; font-size: 14px; font-weight: bold; "
             f"border: none; background: transparent;"
         )
-        lay.addWidget(tl)
+        title_row.addWidget(tl)
+        title_row.addStretch()
+        lay.addLayout(title_row)
+
+        # Stash the handle on the frame so the page-level _SectionStack can
+        # wire it up without each section builder having to thread it through.
+        f._drag_handle = handle
         return f, lay
 
     # ── Leg groups ──────────────────────────────────────────────────────────
@@ -1993,48 +2405,6 @@ class StrategyDetailPage(QWidget):
         self.strategy._raw["leg_groups"] = groups
         if self.portfolio:
             self.portfolio.save_strategies()
-
-    def _build_leg_groups_card(self):
-        frame, lay = self._section_frame("Leg Groups")
-
-        # Hint + "+ New group" button row
-        hint_row = QHBoxLayout()
-        hint = QLabel(
-            "Organize legs into named sub-strategies (e.g. 'Call Spread' + "
-            "'Put Spread'). Each group gets its own payoff chart + Greeks."
-        )
-        hint.setWordWrap(True)
-        hint.setStyleSheet(
-            f"color: {T.MUTED}; font-size: 11px; border: none; background: transparent;"
-        )
-        hint_row.addWidget(hint, 1)
-
-        add_btn = QPushButton("+ New group")
-        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        add_btn.setFixedHeight(30)
-        add_btn.setStyleSheet(
-            f"QPushButton {{ background: {T.PURPLE}; color: white; border: none; "
-            f"border-radius: 6px; padding: 0 14px; font-size: 11px; font-weight: bold; }}"
-            f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
-        )
-        add_btn.clicked.connect(self._on_add_leg_group)
-        hint_row.addWidget(add_btn)
-        lay.addLayout(hint_row)
-
-        groups = self._leg_groups()
-        if not groups:
-            empty = QLabel("No groups yet — click + New group to create one.")
-            empty.setStyleSheet(
-                f"color: {T.MUTED}; font-size: 11px; padding: 16px; border: 1px dashed "
-                f"{T.BORDER}; border-radius: 8px; background: #12151d;"
-            )
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lay.addWidget(empty)
-        else:
-            for grp in groups:
-                lay.addWidget(self._build_single_group_card(grp))
-
-        return frame
 
     def _build_single_group_card(self, grp):
         """Build one card per leg-group: name, payoff chart, Greeks, metrics."""

@@ -1,0 +1,133 @@
+"""
+Per-underlying historical P&L chart.
+
+Takes a (root, [(date, pnl), ...]) series and renders a line chart with
+green/red fill underneath, hover annotation, and a small subtitle showing
+the underlying root + final P&L value.
+"""
+from __future__ import annotations
+
+from datetime import date
+
+import matplotlib
+matplotlib.use("QtAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+import matplotlib.dates as mdates
+import matplotlib.ticker
+
+import theme as T
+
+
+class PnLHistoryChart(FigureCanvasQTAgg):
+    """
+    Series: list of (date, pnl).  The final value drives the line color.
+    """
+
+    def __init__(self, root: str, series: list[tuple[date, float]],
+                  parent=None, height: float = 2.6):
+        fig = Figure(figsize=(6, height), facecolor=T.CARD)
+        fig.subplots_adjust(left=0.13, right=0.97, top=0.86, bottom=0.18)
+        super().__init__(fig)
+        self.setParent(parent)
+        self.setStyleSheet(f"background: {T.CARD};")
+        self.root = root
+        self.series = sorted(series, key=lambda x: x[0])
+        self._xs: list = []
+        self._ys: list = []
+        self._cursor = None
+        self._annot = None
+        self._plot()
+        self.mpl_connect("motion_notify_event", self._on_motion)
+
+    def _plot(self):
+        ax = self.figure.add_subplot(111)
+        ax.set_facecolor(T.CARD)
+        self._ax = ax
+
+        if not self.series:
+            ax.text(0.5, 0.5, f"No price data for {self.root}",
+                    color=T.MUTED, ha="center", va="center",
+                    transform=ax.transAxes, fontsize=10)
+            for s in ax.spines.values():
+                s.set_visible(False)
+            ax.set_xticks([]); ax.set_yticks([])
+            self.draw()
+            return
+
+        xs = [d for d, _ in self.series]
+        ys = [p for _, p in self.series]
+        self._xs, self._ys = xs, ys
+
+        final = ys[-1]
+        line_color = T.GREEN if final >= 0 else T.RED
+
+        ax.plot(xs, ys, color=line_color, linewidth=1.6)
+        ax.fill_between(xs, ys, 0, where=[y >= 0 for y in ys],
+                         interpolate=True, color=T.GREEN, alpha=0.15)
+        ax.fill_between(xs, ys, 0, where=[y < 0 for y in ys],
+                         interpolate=True, color=T.RED,   alpha=0.15)
+        ax.axhline(0, color=T.MUTED, linewidth=0.7,
+                    linestyle="--", alpha=0.6)
+
+        # Title + final value, top-left of axes.
+        sign = "+" if final >= 0 else "−"
+        ax.set_title(
+            f"{self.root}      P&L: {sign}${abs(final):,.2f}",
+            color=T.TEXT, fontsize=10, fontweight="bold",
+            loc="left", pad=8,
+        )
+
+        ax.tick_params(colors=T.MUTED, labelsize=8, length=3)
+        for s in ax.spines.values():
+            s.set_color(T.BORDER); s.set_linewidth(0.8)
+        ax.set_ylabel("P&L ($)", color=T.MUTED, fontsize=9)
+        ax.grid(color=T.BORDER, alpha=0.25, linewidth=0.6)
+        ax.yaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda v, _: f"${v:,.0f}")
+        )
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+
+        self._cursor = ax.axvline(xs[0], color=line_color, linewidth=0.8,
+                                    alpha=0.5, visible=False)
+        self._annot = ax.annotate(
+            "", xy=(0, 0), xytext=(10, 12), textcoords="offset points",
+            ha="left", va="bottom",
+            bbox=dict(boxstyle="round,pad=0.4", fc=T.BG_ALT,
+                       ec=T.BORDER, alpha=0.95),
+            color=T.TEXT, fontsize=9, visible=False,
+        )
+        self.draw()
+
+    # Forward scroll events to the parent so the page scrolls normally.
+    def wheelEvent(self, event):
+        event.ignore()
+
+    def _on_motion(self, event):
+        if event.inaxes != self._ax or not self._xs or event.xdata is None:
+            if self._cursor is not None and self._cursor.get_visible():
+                self._cursor.set_visible(False)
+                self._annot.set_visible(False)
+                self.draw_idle()
+            return
+        x_nums = [mdates.date2num(d) for d in self._xs]
+        idx = min(range(len(x_nums)), key=lambda i: abs(x_nums[i] - event.xdata))
+        sx, sy = self._xs[idx], self._ys[idx]
+        self._cursor.set_xdata([sx, sx])
+        self._cursor.set_visible(True)
+        sign = "+" if sy >= 0 else "−"
+        self._annot.xy = (sx, sy)
+        self._annot.set_text(
+            f"{sx.strftime('%b %d, %Y')}\n{sign}${abs(sy):,.2f}"
+        )
+        xl, xr = self._ax.get_xlim()
+        yl, yu = self._ax.get_ylim()
+        x_num = mdates.date2num(sx)
+        x_off = -10 if x_num > (xl + xr) / 2 else 10
+        y_off = -12 if sy > (yl + yu) / 2 else 12
+        self._annot.set_position((x_off, y_off))
+        self._annot.set_ha("right" if x_off < 0 else "left")
+        self._annot.set_va("top"   if y_off < 0 else "bottom")
+        self._annot.set_visible(True)
+        self.draw_idle()

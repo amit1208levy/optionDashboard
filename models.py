@@ -366,6 +366,7 @@ class Strategy:
         """
         total = 0.0
         any_set = False
+        any_non_option = False
         for l in self.legs:
             # ── Options (both equity and futures) ──────────────────────────
             if l.is_option:
@@ -382,6 +383,10 @@ class Strategy:
 
             # ── Non-options: only delta has a meaningful value ────────────
             if key != "delta":
+                # Theta/gamma/vega for futures + stock are genuinely zero —
+                # not 'unknown'.  Track that we saw such a leg so we can
+                # return 0 (instead of None) below.
+                any_non_option = True
                 continue
             if l.is_future:
                 # Pure futures contract: linear, delta = 1, multiplier from
@@ -394,7 +399,13 @@ class Strategy:
                 # Stock: delta = 1 per share.
                 any_set = True
                 total += l.sign * l.quantity
-        return total if any_set else None
+        if any_set:
+            return total
+        # No option legs contributed, but we have non-option legs and the
+        # caller asked for theta/gamma/vega — those are zero by definition.
+        if any_non_option and key in ("theta", "gamma", "vega"):
+            return 0.0
+        return None
 
     def _detect_name(self):
         legs = self.legs
