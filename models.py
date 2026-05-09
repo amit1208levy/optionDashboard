@@ -1440,32 +1440,35 @@ def portfolio_greeks(positions, metrics_by_root=None):
 # Values are approximate CME/ICE typical initial margins; update as needed.
 
 _FUTURES_SPAN = {
+    # NOTE: SPAN initial margins are exchange-set and drift with volatility.
+    # These values are best-effort estimates as of ~2026; if your broker's
+    # actual maintenance margin disagrees significantly, update this table
+    # — there's no live API that returns per-product SPAN.
+
     # Currency futures (CME)
-    "6A": 900,   "6B": 1800,  "6C": 650,   "6E": 1300,
-    "6J": 1100,  "6M": 1300,  "6N": 650,   "6S": 1600,
-    "6Z": 1200,  "DX": 1200,
+    "6A": 1500,  "6B": 2400,  "6C": 1100,  "6E": 2400,
+    "6J": 2000,  "6M": 2400,  "6N": 1300,  "6S": 2800,
+    "6Z": 2000,  "DX": 1700,
     # Equity index (CME/CBOT)
-    "ES":  12000, "NQ": 15000, "RTY": 6000, "YM": 5000,
-    "MES": 1200,  "MNQ": 1500, "M2K": 600,  "MYM": 500,
-    "EMD": 5000,  "VX":  3500,
+    "ES":  16000, "NQ": 25000, "RTY": 8500, "YM": 8500,
+    "MES": 1600,  "MNQ": 2500, "M2K": 850,  "MYM": 850,
+    "EMD": 8500,  "VX":  4500,
     # Interest rates (CBOT/CME)
-    "ZB": 2000, "ZN": 1100, "ZF": 650, "ZT": 400,
-    "GE": 400,  "SR1": 250, "SR3": 300, "ZQ": 150,
-    "UB": 3000,
+    "ZB": 4200, "UB": 5500, "ZN": 2200, "ZF": 1200, "ZT": 700,
+    "GE": 500,  "SR1": 350, "SR3": 400, "ZQ": 200,
     # Energy (NYMEX)
-    "CL": 4000, "NG": 2200, "RB": 2200, "HO": 2200,
-    "QM": 2000, "MCL": 400,
+    "CL": 6500, "NG": 3500, "RB": 3500, "HO": 3500,
+    "QM": 3000, "MCL": 650,
     # Metals (COMEX/NYMEX)
-    "GC": 6500, "SI": 3500, "HG": 3000, "PL": 1800, "PA": 5000,
-    "MGC": 650, "SIL": 2000,
+    "GC": 11000, "SI": 16000, "HG": 6000, "PL": 3500, "PA": 11000,
+    "MGC": 1100, "SIL": 8000,
     # Agriculture (CBOT/CME/ICE)
-    "ZC": 1000, "ZS": 1600, "ZW": 1100, "ZL": 600,  "ZM": 900,
-    "KC": 2500, "CC": 900,  "CT": 1400, "SB": 500,
-    "OJ": 1000,
+    "ZC": 1700, "ZS": 2700, "ZW": 1900, "ZL": 1200, "ZM": 1500,
+    "KC": 5500, "CC": 2400, "CT": 2200, "SB": 1200, "OJ": 4500,
     # Livestock (CME)
-    "LE": 1500, "HE": 1500, "GF": 1000,
+    "LE": 2500, "HE": 2500, "GF": 2200,
     # Crypto (CME)
-    "BTC": 11000, "MBT": 1100, "ETH": 4500, "MET": 450,
+    "BTC": 30000, "MBT": 3000, "ETH": 9500, "MET": 950,
 }
 
 _SPAN_FALLBACK_PCT = 0.015   # 1.5 % of notional for unknown products
