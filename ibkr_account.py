@@ -121,6 +121,30 @@ def _portfolio_item_to_raw(item) -> Optional[dict]:
     underlying      = _underlying_symbol(c)
     direction       = "Long" if (qty or 0) >= 0 else "Short"
 
+    # ── Expiration date ──────────────────────────────────────────────
+    # ib_insync stores it on the contract as `lastTradeDateOrContractMonth`
+    # in either YYYYMMDD (full) or YYYYMM (month-only) format. Convert to
+    # an ISO timestamp so models.Position parses it via _parse_iso.
+    expires_iso = None
+    ltd = (getattr(c, "lastTradeDateOrContractMonth", "") or "").strip()
+    if len(ltd) == 8 and ltd.isdigit():
+        # Daily / weekly: exact date.
+        expires_iso = f"{ltd[:4]}-{ltd[4:6]}-{ltd[6:8]}T00:00:00Z"
+    elif len(ltd) == 6 and ltd.isdigit():
+        # Monthly contract — fall back to the 3rd Friday of the month
+        # (correct for most equity-index / financial futures and a sensible
+        # default for everything else; better than None).
+        try:
+            from datetime import date, timedelta
+            y, m = int(ltd[:4]), int(ltd[4:6])
+            d = date(y, m, 1)
+            while d.weekday() != 4:                       # 4 = Friday
+                d += timedelta(days=1)
+            d += timedelta(days=14)                       # 3rd Friday
+            expires_iso = f"{d.isoformat()}T00:00:00Z"
+        except Exception:
+            pass
+
     return {
         "symbol":                  tt_sym,
         "underlying-symbol":       underlying,
@@ -131,6 +155,7 @@ def _portfolio_item_to_raw(item) -> Optional[dict]:
         "close-price":             None,
         "multiplier":              multiplier,
         "average-open-price":      avg_open,
+        "expires-at":              expires_iso,
         # IBKR's authoritative unrealized P&L for the position. Position
         # uses this directly instead of recomputing from open/mark prices,
         # which avoids futures-contract edge cases where averageCost

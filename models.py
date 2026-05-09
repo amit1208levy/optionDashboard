@@ -32,6 +32,53 @@ def _days_between(a, b):
 
 _FUT_MONTH = "FGHJKMNQUVXZ"
 
+
+def parse_futures_expiry(symbol):
+    """
+    Try to derive a futures contract's expiration from its code.
+
+    /MESU6 → September 2026  (U = Sep, '6' = 2026 — current decade)
+    /ZBM26 → June 2026       (two-digit year)
+    /CLZ7  → December 2027
+
+    Returns a date (3rd Friday of the contract month, a sensible default
+    for most equity-index / financial futures) or None if the symbol
+    doesn't fit the pattern.
+    """
+    if not symbol:
+        return None
+    s = symbol.strip().lstrip("/")
+    # Strip leading dot for futures-options like "./ESH7 ..."
+    if s.startswith("."):
+        s = s[1:]
+    # Take just the first whitespace-delimited token (drops option strikes)
+    s = s.split()[0]
+    m = re.match(rf"^([A-Z0-9]+?)([{_FUT_MONTH}])(\d{{1,2}})$", s)
+    if not m:
+        return None
+    month_letter = m.group(2)
+    year_digits  = m.group(3)
+    month = _FUT_MONTH.index(month_letter) + 1   # F=1, G=2, ..., Z=12
+    try:
+        from datetime import date, timedelta
+        if len(year_digits) == 1:
+            # Single digit: assume current decade. e.g. '6' in 2026 → 2026.
+            now = date.today()
+            year = (now.year // 10) * 10 + int(year_digits)
+            # If that's already > 5 years past, bump to next decade.
+            if year < now.year - 5:
+                year += 10
+        else:
+            year = 2000 + int(year_digits) if int(year_digits) < 80 else 1900 + int(year_digits)
+        d = date(year, month, 1)
+        while d.weekday() != 4:                  # 4 = Friday
+            d += timedelta(days=1)
+        d += timedelta(days=14)                  # 3rd Friday
+        return d
+    except Exception:
+        return None
+
+
 def normalize_root(underlying_symbol):
     """
     Strip futures contract month/year suffix to return the product root.
@@ -94,6 +141,14 @@ class Position:
 
         self.expires_at = _parse_iso(raw.get("expires-at"))
         self.created_at = _parse_iso(raw.get("created-at"))
+        # Fallback for futures contracts/options whose broker-supplied raw
+        # omits expires-at — derive the expiration from the contract code
+        # in the symbol (e.g. /MESU6 → 3rd Friday of Sep 2026).
+        if self.expires_at is None and "future" in (self.instrument_type or "").lower():
+            target_sym = self.underlying or self.symbol
+            d = parse_futures_expiry(target_sym)
+            if d:
+                self.expires_at = datetime(d.year, d.month, d.day, tzinfo=timezone.utc)
 
         self.call_put, self.strike = parse_option_symbol(self.symbol)
         self.is_option = self.call_put in ("C", "P")
