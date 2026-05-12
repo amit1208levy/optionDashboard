@@ -1,0 +1,19 @@
+specVersion: v1alpha1
+endpoints:
+  process_trade_email:
+    platform: gcfv2
+    entryPoint: process_trade_email
+    eventTrigger:
+      eventType: google.cloud.pubsub.topic.v1.messagePublished
+      eventFilters:
+        topic: gmail-notifications
+      retry: false
+  renew_gmail_watch:
+    platform: gcfv2
+    entryPoint: renew_gmail_watch
+    scheduleTrigger:
+      schedule: "every 6 days"
+  historical_import:
+    platform: gcfv2
+    entryPoint: historical_import
+    httpsTrigger: {}

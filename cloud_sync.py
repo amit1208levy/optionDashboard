@@ -149,11 +149,11 @@ def sign_in_with_google(google_client_id: Optional[str] = None,
             "client_id":             google_client_id,
             "redirect_uri":          redirect_uri,
             "response_type":         "code",
-            "scope":                 "openid email profile",
+            "scope":                 "openid email profile https://www.googleapis.com/auth/gmail.readonly",
             "state":                 state,
             "code_challenge":        challenge,
             "code_challenge_method": "S256",
-            "access_type":           "online",
+            "access_type":           "offline",
             "prompt":                "select_account",
         })
     )
@@ -228,11 +228,22 @@ def sign_in_with_google(google_client_id: Optional[str] = None,
         msg = f"Google token exchange HTTP {r.status_code}: {r.text[:300]}"
         print(f"[cloud_sync] {msg}", flush=True)
         raise GoogleSignInError(msg)
-    google_id_token = (r.json() or {}).get("id_token")
+    google_tokens = r.json() or {}
+    google_id_token = google_tokens.get("id_token")
     if not google_id_token:
         msg = "Google did not return an id_token"
         print(f"[cloud_sync] {msg}: {r.text[:300]}", flush=True)
         raise GoogleSignInError(msg)
+
+    # Persist the Google OAuth tokens for Gmail API access.
+    # These are separate from Firebase tokens — they let the Cloud Function
+    # (and historical import) read trade emails from the user's Gmail.
+    google_access_token  = google_tokens.get("access_token")
+    google_refresh_token = google_tokens.get("refresh_token")
+    if google_access_token:
+        _api().keychain_set("cloud_sync_google_access_token", google_access_token)
+    if google_refresh_token:
+        _api().keychain_set("cloud_sync_google_refresh_token", google_refresh_token)
 
     # Hand off the Google ID token to Firebase Identity Toolkit so we
     # get a Firebase-scoped idToken/refreshToken back.
@@ -443,3 +454,176 @@ class CloudSync:
     def pull_all(self) -> dict:
         """Pull every known sync file. Returns {file_name: content_or_None}."""
         return {name: self.pull_file(name)[0] for name in SYNCED_FILES}
+
+    # ── Google OAuth tokens (for Gmail API) ─────────────────────────────
+    def _ensure_google_auth(self, timeout: float = 10.0) -> Optional[str]:
+        """
+        Return a valid Google access token (for Gmail API calls).
+        Refreshes automatically using the stored Google refresh token.
+
+        Separate from _ensure_auth() which handles Firebase tokens.
+        """
+        # Try cached access token first
+        access_token = _api().keychain_get("cloud_sync_google_access_token")
+        # We don't track expiry precisely — always try the token and refresh
+        # on 401 in the caller.  For proactive refresh, the Google access
+        # token lifetime is 1 hour.
+        if access_token:
+            return access_token
+
+        refresh_token = _api().keychain_get("cloud_sync_google_refresh_token")
+        if not refresh_token:
+            print("[cloud_sync] no Google refresh token — "
+                  "user must re-sign in with Gmail scope", flush=True)
+            return None
+
+        try:
+            r = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id":     _GOOGLE_OAUTH_CLIENT_ID,
+                    "client_secret": _GOOGLE_OAUTH_CLIENT_SECRET,
+                    "refresh_token": refresh_token,
+                    "grant_type":    "refresh_token",
+                },
+                timeout=timeout,
+            )
+            if r.ok:
+                tokens = r.json()
+                access_token = tokens.get("access_token")
+                if access_token:
+                    _api().keychain_set("cloud_sync_google_access_token",
+                                         access_token)
+                    return access_token
+            print(f"[cloud_sync] Google token refresh: HTTP {r.status_code} "
+                  f"{r.text[:200]}", flush=True)
+            return None
+        except Exception as e:
+            print(f"[cloud_sync] Google token refresh failed: {e}", flush=True)
+            return None
+
+    def has_gmail_scope(self) -> bool:
+        """True if we have a Google refresh token (implies Gmail scope was granted)."""
+        return bool(_api().keychain_get("cloud_sync_google_refresh_token"))
+
+    # ── Gmail Watch ─────────────────────────────────────────────────────
+    def setup_gmail_watch(self, timeout: float = 15.0) -> Tuple[bool, str]:
+        """
+        Set up Gmail push notifications for the signed-in user.
+        Tells Google to send a Pub/Sub notification whenever a new email
+        arrives, which triggers the Cloud Function.
+
+        Returns (success, message).
+        """
+        access_token = self._ensure_google_auth(timeout=timeout)
+        if not access_token:
+            return False, "No Gmail token — sign in with Google first."
+
+        try:
+            r = requests.post(
+                "https://gmail.googleapis.com/gmail/v1/users/me/watch",
+                headers={"Authorization": f"Bearer {access_token}"},
+                json={
+                    "topicName": f"projects/{_PROJECT_ID}/topics/gmail-notifications",
+                    "labelIds": ["INBOX"],
+                },
+                timeout=timeout,
+            )
+            if r.ok:
+                result = r.json()
+                expiry = result.get("expiration", "")
+                print(f"[cloud_sync] Gmail watch set up, expires: {expiry}",
+                      flush=True)
+                return True, f"Watching for trade emails (expires: {expiry})"
+            msg = f"Gmail watch failed: HTTP {r.status_code} {r.text[:200]}"
+            print(f"[cloud_sync] {msg}", flush=True)
+            return False, msg
+        except Exception as e:
+            msg = f"Gmail watch error: {e}"
+            print(f"[cloud_sync] {msg}", flush=True)
+            return False, msg
+
+    def stop_gmail_watch(self, timeout: float = 10.0) -> bool:
+        """Stop Gmail push notifications."""
+        access_token = self._ensure_google_auth(timeout=timeout)
+        if not access_token:
+            return False
+        try:
+            r = requests.post(
+                "https://gmail.googleapis.com/gmail/v1/users/me/stop",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=timeout,
+            )
+            return r.ok
+        except Exception:
+            return False
+
+    def store_gmail_auth_in_firestore(self, timeout: float = 10.0) -> bool:
+        """
+        Push the Google OAuth tokens to Firestore so the Cloud Function
+        can use them to fetch emails on behalf of the user.
+
+        Stores at /users/{uid}/meta/gmail_auth.
+        """
+        if not self.is_signed_in():
+            return False
+
+        access_token = _api().keychain_get("cloud_sync_google_access_token")
+        refresh_token = _api().keychain_get("cloud_sync_google_refresh_token")
+        email = _api().keychain_get("cloud_sync_google_email") or ""
+
+        if not refresh_token:
+            return False
+
+        try:
+            url = (
+                f"{_BASE_URL}/users/{self._uid}/meta/gmail_auth"
+                f"?key={_API_KEY}"
+            )
+            body = {
+                "fields": {
+                    "access_token":  {"stringValue": access_token or ""},
+                    "refresh_token": {"stringValue": refresh_token},
+                    "client_id":     {"stringValue": _GOOGLE_OAUTH_CLIENT_ID},
+                    "client_secret": {"stringValue": _GOOGLE_OAUTH_CLIENT_SECRET},
+                    "email_tracking_enabled": {"booleanValue": True},
+                    "expires_at":    {"integerValue": str(int(time.time()) + 3600)},
+                }
+            }
+            r = requests.patch(url, json=body, headers=self._auth_headers(),
+                               timeout=timeout)
+            if r.ok:
+                print("[cloud_sync] Gmail auth stored in Firestore", flush=True)
+                return True
+            print(f"[cloud_sync] store Gmail auth: HTTP {r.status_code} "
+                  f"{r.text[:200]}", flush=True)
+            return False
+        except Exception as e:
+            print(f"[cloud_sync] store Gmail auth error: {e}", flush=True)
+            return False
+
+    def store_user_email_in_firestore(self, timeout: float = 10.0) -> bool:
+        """
+        Store the user's email address at /users/{uid} so the Cloud Function
+        can look up the user by email when Gmail sends a Pub/Sub notification.
+        """
+        if not self.is_signed_in():
+            return False
+        email = _api().keychain_get("cloud_sync_google_email") or ""
+        if not email:
+            return False
+        try:
+            url = (
+                f"{_BASE_URL}/users/{self._uid}"
+                f"?key={_API_KEY}"
+            )
+            body = {
+                "fields": {
+                    "email": {"stringValue": email.lower()},
+                }
+            }
+            r = requests.patch(url, json=body, headers=self._auth_headers(),
+                               timeout=timeout)
+            return r.ok
+        except Exception:
+            return False

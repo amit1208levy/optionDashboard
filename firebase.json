@@ -1,0 +1,14 @@
+{
+  "functions": {
+    "source": "functions",
+    "runtime": "python312",
+    "codebase": "email-tracker",
+    "ignore": [
+      "venv",
+      "__pycache__",
+      ".git",
+      "node_modules",
+      "*.pyc"
+    ]
+  }
+}

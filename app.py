@@ -65,7 +65,10 @@ class PortfolioWorker(QThread):
 
     def __init__(self, token, creds=None, ytd_cache=None, year_start_cache=None,
                  pnl_cache=None, quotes=None, ibkr_provider=None,
-                 ibkr_data_source_only=True):
+                 ibkr_data_source_only=True,
+                 email_tracking_enabled=False,
+                 email_firebase_token=None,
+                 email_uid=None):
         super().__init__()
         self.token      = token
         self.creds      = creds
@@ -76,6 +79,11 @@ class PortfolioWorker(QThread):
         # the worker appends an IBKR account entry to the results.
         self._ibkr_provider         = ibkr_provider
         self._ibkr_data_source_only = ibkr_data_source_only
+        # Email tracking: positions derived from Gmail trade confirmations,
+        # stored in Firestore by the Cloud Function.
+        self._email_tracking_enabled = email_tracking_enabled
+        self._email_firebase_token   = email_firebase_token
+        self._email_uid              = email_uid
         # ytd_cache is a mutable dict shared with PortfolioScreen so it
         # survives across worker instances (i.e. across live-mode refreshes).
         self._ytd_cache        = ytd_cache        if ytd_cache        is not None else {}
@@ -233,23 +241,29 @@ class PortfolioWorker(QThread):
         new_token = None
         for attempt in range(2):   # attempt 0 = normal; attempt 1 = after token refresh
             try:
-                accounts_raw = [a for a in api.list_accounts(self.token)
-                                if a.get("account-number")]
+                # When no TT token, skip TT API calls entirely (email-only mode).
+                ibkr_fut = None
+                if not self.token:
+                    accounts_raw = []
+                    accounts = []
+                else:
+                    accounts_raw = [a for a in api.list_accounts(self.token)
+                                    if a.get("account-number")]
 
-                # Fetch TastyTrade accounts + (optionally) IBKR account in parallel.
-                workers = max(len(accounts_raw), 1)
-                if self._ibkr_provider and not self._ibkr_data_source_only:
-                    workers += 1
-
-                with ThreadPoolExecutor(max_workers=workers) as ex:
-                    tt_futures = [ex.submit(self._fetch_one, a) for a in accounts_raw]
-                    ibkr_fut = None
+                    # Fetch TastyTrade accounts + (optionally) IBKR account in parallel.
+                    workers = max(len(accounts_raw), 1)
                     if self._ibkr_provider and not self._ibkr_data_source_only:
-                        from ibkr_account import fetch_ibkr_account
-                        ibkr_fut = ex.submit(fetch_ibkr_account, self._ibkr_provider)
-                    results = [f.result() for f in tt_futures]
+                        workers += 1
 
-                accounts = [r for r in results if r is not None]
+                    with ThreadPoolExecutor(max_workers=workers) as ex:
+                        tt_futures = [ex.submit(self._fetch_one, a) for a in accounts_raw]
+                        ibkr_fut = None
+                        if self._ibkr_provider and not self._ibkr_data_source_only:
+                            from ibkr_account import fetch_ibkr_account
+                            ibkr_fut = ex.submit(fetch_ibkr_account, self._ibkr_provider)
+                        results = [f.result() for f in tt_futures]
+
+                    accounts = [r for r in results if r is not None]
 
                 # Append IBKR account at the end of the list if available.
                 if ibkr_fut is not None:
@@ -285,6 +299,43 @@ class PortfolioWorker(QThread):
                     except Exception as e:
                         print(f"[ibkr_account] fetch failed: {e}", flush=True)
 
+                # Append email-tracked account if enabled.
+                if self._email_tracking_enabled:
+                    try:
+                        from email_account import build_email_account
+                        email_acct = build_email_account(
+                            self._email_firebase_token,
+                            self._email_uid,
+                        )
+                        if email_acct:
+                            positions = email_acct.get("positions", [])
+                            if positions and self.quotes is not None:
+                                eq_opts = [p.symbol for p in positions
+                                           if p.is_option and not p.is_future]
+                                fu_opts = [p.symbol for p in positions
+                                           if p.is_option and p.is_future]
+                                equities = [p.symbol for p in positions
+                                            if not p.is_option and not p.is_future]
+                                futures  = [p.symbol for p in positions
+                                            if not p.is_option and p.is_future]
+                                try:
+                                    quotes = self.quotes.get_quotes(
+                                        equity_options=eq_opts,
+                                        future_options=fu_opts,
+                                        equities=equities,
+                                        futures=futures,
+                                    )
+                                    for p in positions:
+                                        q = quotes.get(p.symbol)
+                                        if q:
+                                            p.attach_quote(q)
+                                except Exception as qe:
+                                    print(f"[email_account] quote refresh: {qe}",
+                                          flush=True)
+                            accounts.append(email_acct)
+                    except Exception as e:
+                        print(f"[email_account] fetch failed: {e}", flush=True)
+
                 self.done.emit({"accounts": accounts, "error": "", "new_token": new_token})
                 return
 
@@ -312,6 +363,7 @@ class PortfolioWorker(QThread):
 
 class SetupScreen(QWidget):
     connected = pyqtSignal(dict, str)
+    skipped   = pyqtSignal()           # emitted when user clicks "Skip"
 
     def __init__(self):
         super().__init__()
@@ -386,6 +438,19 @@ class SetupScreen(QWidget):
         self.btn.clicked.connect(self._connect)
         lay.addSpacing(16)
         lay.addWidget(self.btn)
+
+        # "Skip" link — enter app without TastyTrade credentials
+        skip_btn = QPushButton("Skip — use Email Tracking only")
+        skip_btn.setFlat(True)
+        skip_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        skip_btn.setStyleSheet(
+            f"QPushButton {{ color: {T.MUTED}; font-size: 12px; border: none; "
+            f"background: transparent; text-decoration: underline; }}"
+            f"QPushButton:hover {{ color: {T.ACCENT}; }}"
+        )
+        skip_btn.clicked.connect(lambda: self.skipped.emit())
+        lay.addSpacing(8)
+        lay.addWidget(skip_btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
     def prefill(self, creds):
         for k, entry in self.fields.items():
@@ -509,6 +574,69 @@ class AccountSettingsDialog(QDialog):
         div2.setStyleSheet(f"color: {T.BORDER};")
         root.addWidget(div2)
 
+        # ── Email Position Tracking ─────────────────────────────────────────
+        email_title = QLabel("Email Position Tracking")
+        email_title.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 15px; font-weight: bold; border: none;"
+        )
+        root.addWidget(email_title)
+
+        email_hint = QLabel(
+            "Automatically reads TastyTrade trade confirmation emails from "
+            "your Gmail to track your portfolio — no TastyTrade API credentials "
+            "needed. Requires Google Sign-In with Gmail read permission."
+        )
+        email_hint.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
+        email_hint.setWordWrap(True)
+        root.addWidget(email_hint)
+
+        et_cfg = settings.get("email_tracking", {})
+        email_cb = QCheckBox("Enable email-based position tracking")
+        email_cb.setChecked(bool(et_cfg.get("enabled")))
+        email_cb.setStyleSheet(_cb_style)
+        email_cb.setToolTip(
+            "When enabled: the app reads TastyTrade trade confirmations from\n"
+            "your Gmail inbox and maintains a live position ledger.\n"
+            "A Cloud Function processes new emails automatically."
+        )
+        self._email_enabled_cb = email_cb
+        root.addWidget(email_cb)
+
+        # Status label
+        self._email_status = QLabel("")
+        self._email_status.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 12px; border: none;"
+        )
+        root.addWidget(self._email_status)
+
+        # Check if Gmail scope is available
+        try:
+            cs = cloud_sync.CloudSync()
+            if cs.is_signed_in() and cs.has_gmail_scope():
+                self._email_status.setText("✓ Gmail access available")
+                self._email_status.setStyleSheet(
+                    f"color: {T.GREEN}; font-size: 12px; border: none;"
+                )
+            elif cs.is_signed_in():
+                self._email_status.setText(
+                    "⚠ Sign out and back in to grant Gmail read permission"
+                )
+                self._email_status.setStyleSheet(
+                    f"color: {T.YELLOW}; font-size: 12px; border: none;"
+                )
+            else:
+                self._email_status.setText(
+                    "Sign in with Google (above) to enable email tracking"
+                )
+        except Exception:
+            pass
+
+        # ── Divider ──────────────────────────────────────────────────────────
+        div3 = QFrame()
+        div3.setFrameShape(QFrame.Shape.HLine)
+        div3.setStyleSheet(f"color: {T.BORDER};")
+        root.addWidget(div3)
+
         # ── IBKR Gateway settings ────────────────────────────────────────────
         ibkr_title = QLabel("IBKR Gateway (live quotes)")
         ibkr_title.setStyleSheet(
@@ -619,6 +747,12 @@ class AccountSettingsDialog(QDialog):
         except Exception as e:
             print(f"[cloud_sync] commit failed: {e}", flush=True)
         super().accept()
+
+    def result_email_tracking(self) -> dict:
+        """Return email tracking settings as a JSON-serializable dict."""
+        return {
+            "enabled": self._email_enabled_cb.isChecked(),
+        }
 
     def result_ibkr_settings(self) -> dict:
         """Return the user's IBKR Gateway settings as a JSON-serializable dict."""
@@ -1142,8 +1276,11 @@ class PortfolioScreen(QWidget):
         #     and falls back to Tasty for misses.
         # token_getter lambda lets the Tasty side always see the freshest
         # OAuth token after a rotation.
-        tasty_provider = TastyQuotesProvider(token_getter=lambda: self.token)
-        self.quotes    = self._build_quotes_provider(tasty_provider)
+        if self.token:
+            tasty_provider = TastyQuotesProvider(token_getter=lambda: self.token)
+            self.quotes    = self._build_quotes_provider(tasty_provider)
+        else:
+            self.quotes    = None   # no TT token — quotes unavailable
         self._worker    = None
         self._accounts  = []
         self._alerted   = {}   # {(strategy_id, condition_type): severity} — prevents repeat alerts
@@ -2256,11 +2393,30 @@ class PortfolioScreen(QWidget):
             f"font-size: 11px; font-weight: bold; }}"
         )
 
+        # Check if email tracking is enabled and get Firebase token.
+        email_enabled = False
+        email_token = None
+        email_uid = None
+        try:
+            settings = api.load_settings()
+            et = settings.get("email_tracking", {})
+            if et.get("enabled"):
+                cs = cloud_sync.CloudSync()
+                if cs.is_signed_in() and cs.has_gmail_scope():
+                    email_token = cs._ensure_auth()
+                    email_uid = cs._uid
+                    email_enabled = bool(email_token and email_uid)
+        except Exception:
+            pass
+
         self._worker = PortfolioWorker(self.token, self.creds, self._ytd_cache,
                                        self._year_start_cache, self._pnl_cache,
                                        quotes=self.quotes,
                                        ibkr_provider=self._ibkr_provider(),
-                                       ibkr_data_source_only=self._ibkr_data_source_only())
+                                       ibkr_data_source_only=self._ibkr_data_source_only(),
+                                       email_tracking_enabled=email_enabled,
+                                       email_firebase_token=email_token,
+                                       email_uid=email_uid)
         self._worker.done.connect(self._on_data)
         self._worker.start()
 
@@ -3074,6 +3230,30 @@ class PortfolioScreen(QWidget):
             old_ibkr = self._settings.get("ibkr") or {}
             new_ibkr = dlg.result_ibkr_settings()
             self._settings["ibkr"] = new_ibkr
+
+            # Email tracking settings
+            new_email = dlg.result_email_tracking()
+            old_email = self._settings.get("email_tracking", {})
+            self._settings["email_tracking"] = new_email
+
+            # If email tracking was just enabled, set up Gmail watch + store
+            # tokens in Firestore so the Cloud Function can access Gmail.
+            if new_email.get("enabled") and not old_email.get("enabled"):
+                try:
+                    cs = cloud_sync.CloudSync()
+                    if cs.is_signed_in() and cs.has_gmail_scope():
+                        cs.store_user_email_in_firestore()
+                        cs.store_gmail_auth_in_firestore()
+                        ok, msg = cs.setup_gmail_watch()
+                        if ok:
+                            print(f"[email_tracking] Gmail watch set up: {msg}",
+                                  flush=True)
+                        else:
+                            print(f"[email_tracking] Gmail watch failed: {msg}",
+                                  flush=True)
+                except Exception as e:
+                    print(f"[email_tracking] setup error: {e}", flush=True)
+
             api.save_settings(self._settings)
             self._refresh_account_combo()
             # IBKR provider is wired at PortfolioScreen.__init__ time, so a
@@ -3203,6 +3383,7 @@ class MainWindow(QStackedWidget):
         if prefill:
             screen.prefill(prefill)
         screen.connected.connect(lambda creds, tok: self._show_portfolio(creds, tok))
+        screen.skipped.connect(lambda: self._show_portfolio({}, ""))
         self.addWidget(screen)
         self.setCurrentWidget(screen)
 
