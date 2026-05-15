@@ -149,7 +149,7 @@ def sign_in_with_google(google_client_id: Optional[str] = None,
             "client_id":             google_client_id,
             "redirect_uri":          redirect_uri,
             "response_type":         "code",
-            "scope":                 "openid email profile https://www.googleapis.com/auth/gmail.readonly",
+            "scope":                 "openid email profile https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/spreadsheets",
             "state":                 state,
             "code_challenge":        challenge,
             "code_challenge_method": "S256",
@@ -505,6 +505,10 @@ class CloudSync:
     def has_gmail_scope(self) -> bool:
         """True if we have a Google refresh token (implies Gmail scope was granted)."""
         return bool(_api().keychain_get("cloud_sync_google_refresh_token"))
+
+    def get_google_access_token(self, timeout: float = 10.0) -> Optional[str]:
+        """Public accessor for the Google OAuth access token (for Sheets API, etc.)."""
+        return self._ensure_google_auth(timeout=timeout)
 
     # ── Gmail Watch ─────────────────────────────────────────────────────
     def setup_gmail_watch(self, timeout: float = 15.0) -> Tuple[bool, str]:

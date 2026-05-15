@@ -12,7 +12,7 @@ endpoints:
     platform: gcfv2
     entryPoint: renew_gmail_watch
     scheduleTrigger:
-      schedule: "every 6 days"
+      schedule: "0 0 */6 * *"
   historical_import:
     platform: gcfv2
     entryPoint: historical_import

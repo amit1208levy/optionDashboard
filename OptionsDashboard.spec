@@ -61,6 +61,8 @@ hiddenimports = [
     # IBKR (optional — ib_insync may not be installed; PyInstaller won't error
     # because we gate these imports with try/except at runtime)
     "ib_insync",
+    # Google Sheets export (lazy import from settings dialog)
+    "sheets_export",
     # pkg_resources used internally by several libraries
     "pkg_resources",
     "pkg_resources.extern",
@@ -78,7 +80,7 @@ a = Analysis(
     runtime_hooks=[],
     # Exclude heavy packages that are definitely not needed
     excludes=["tkinter", "scipy", "pandas", "numpy.distutils",
-              "IPython", "jupyter", "PIL"],
+              "IPython", "jupyter"],
     noarchive=False,
     optimize=0,
 )

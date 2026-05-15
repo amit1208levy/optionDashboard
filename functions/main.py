@@ -500,7 +500,7 @@ def process_trade_email(event: pubsub_fn.CloudEvent[pubsub_fn.MessagePublishedDa
     print(f"[processTradeEmail] Done. Processed {processed_count} trade emails.")
 
 
-@scheduler_fn.on_schedule(schedule="every 6 days")
+@scheduler_fn.on_schedule(schedule="0 0 */6 * *")
 def renew_gmail_watch(event: scheduler_fn.ScheduledEvent):
     """
     Cloud Function triggered by Cloud Scheduler every 6 days to renew

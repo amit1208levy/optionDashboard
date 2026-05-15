@@ -242,10 +242,26 @@ class PortfolioWorker(QThread):
         for attempt in range(2):   # attempt 0 = normal; attempt 1 = after token refresh
             try:
                 # When no TT token, skip TT API calls entirely (email-only mode).
+                # Build offline account(s) from locally-stored strategies/history
+                # so the user can still see their portfolio structure.
                 ibkr_fut = None
                 if not self.token:
-                    accounts_raw = []
                     accounts = []
+                    stored_strategies = api.load_strategies()
+                    stored_names = api.load_account_names()
+                    for acct_num in stored_strategies:
+                        if stored_strategies[acct_num] or acct_num in stored_names:
+                            accounts.append({
+                                "number":             acct_num,
+                                "nickname":           stored_names.get(acct_num) or acct_num,
+                                "balances":           {},
+                                "positions":          [],
+                                "metrics":            {},
+                                "ytd_txns":           [],
+                                "year_start_net_liq": None,
+                                "ytd_pnl_sdk":        None,
+                                "source":             "offline",
+                            })
                 else:
                     accounts_raw = [a for a in api.list_accounts(self.token)
                                     if a.get("account-number")]
@@ -504,6 +520,7 @@ class AccountSettingsDialog(QDialog):
         self.setWindowTitle("Settings")
         self.setStyleSheet(T.BASE_STYLE)
         self.setMinimumWidth(640)
+        self.setMaximumHeight(720)
         self._fields = {}
         self._greek_checks = {}
         self._ibkr_widgets: dict = {}
@@ -512,7 +529,25 @@ class AccountSettingsDialog(QDialog):
                           if k != "iv"]
         ibkr_cfg = settings.get("ibkr") or {}
 
-        root = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Scrollable content area
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(
+            f"QScrollArea {{ border: none; background: transparent; }}"
+            f"QScrollBar:vertical {{ background: {T.BG}; width: 8px; "
+            f"border-radius: 4px; }}"
+            f"QScrollBar::handle:vertical {{ background: {T.BORDER}; "
+            f"border-radius: 4px; min-height: 30px; }}"
+            f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical "
+            f"{{ height: 0; }}"
+        )
+        _inner = QWidget()
+        root = QVBoxLayout(_inner)
         root.setContentsMargins(24, 22, 24, 22)
         root.setSpacing(18)
 
@@ -552,6 +587,103 @@ class AccountSettingsDialog(QDialog):
         div.setStyleSheet(f"color: {T.BORDER};")
         root.addWidget(div)
 
+        # ── TastyTrade API Credentials ──────────────────────────────────────
+        tt_title = QLabel("TastyTrade API")
+        tt_title.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 15px; font-weight: bold; border: none;"
+        )
+        root.addWidget(tt_title)
+
+        _input_style = (
+            f"background: {T.BG_ALT}; border: 1px solid {T.BORDER}; "
+            f"border-radius: 6px; padding: 6px 8px; color: {T.TEXT};"
+        )
+
+        existing_creds = api.load_credentials() or {}
+        self._tt_widgets: dict = {}
+
+        if existing_creds:
+            tt_hint = QLabel(
+                f"Connected as: {existing_creds.get('name', '?')}"
+            )
+            tt_hint.setStyleSheet(
+                f"color: {T.GREEN}; font-size: 12px; border: none;"
+            )
+        else:
+            tt_hint = QLabel(
+                "Connect your TastyTrade developer API credentials to pull "
+                "live account data, positions, and P&&L."
+            )
+            tt_hint.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 12px; border: none;"
+            )
+        tt_hint.setWordWrap(True)
+        root.addWidget(tt_hint)
+        self._tt_status = tt_hint
+
+        tt_form = QFormLayout()
+        tt_form.setSpacing(8)
+
+        for key, label, placeholder, is_secret in [
+            ("name",          "Name:",          "Your name", False),
+            ("client_id",     "Client ID:",     "TastyTrade OAuth Client ID", False),
+            ("refresh_token", "Refresh Token:", "Long-lived refresh token", True),
+            ("secret_token",  "Secret Token:",  "Client secret", True),
+        ]:
+            edit = QLineEdit(existing_creds.get(key, ""))
+            edit.setPlaceholderText(placeholder)
+            edit.setStyleSheet(_input_style)
+            if is_secret:
+                edit.setEchoMode(QLineEdit.EchoMode.Password)
+            self._tt_widgets[key] = edit
+            tt_form.addRow(label, edit)
+        root.addLayout(tt_form)
+
+        tt_btn_row = QHBoxLayout()
+        tt_btn_row.setSpacing(10)
+
+        self._tt_connect_btn = QPushButton(
+            "Update Connection" if existing_creds else "Connect"
+        )
+        self._tt_connect_btn.setStyleSheet(
+            f"QPushButton {{ background: {T.PURPLE}; color: #fff; "
+            f"border: none; border-radius: 6px; padding: 8px 18px; "
+            f"font-size: 13px; font-weight: bold; }}"
+            f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
+            f"QPushButton:disabled {{ background: {T.BORDER}; color: {T.MUTED}; }}"
+        )
+        self._tt_connect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tt_connect_btn.clicked.connect(self._on_tt_connect)
+        tt_btn_row.addWidget(self._tt_connect_btn)
+
+        if existing_creds:
+            tt_disconnect_btn = QPushButton("Disconnect")
+            tt_disconnect_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {T.RED}; "
+                f"border: 1px solid {T.RED}; border-radius: 6px; padding: 8px 14px; "
+                f"font-size: 13px; }}"
+                f"QPushButton:hover {{ background: {T.RED}; color: #fff; }}"
+            )
+            tt_disconnect_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            tt_disconnect_btn.clicked.connect(self._on_tt_disconnect)
+            tt_btn_row.addWidget(tt_disconnect_btn)
+
+        tt_btn_row.addStretch()
+        root.addLayout(tt_btn_row)
+
+        self._tt_result_label = QLabel("")
+        self._tt_result_label.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 12px; border: none;"
+        )
+        self._tt_result_label.setWordWrap(True)
+        root.addWidget(self._tt_result_label)
+
+        # ── Divider ──────────────────────────────────────────────────────────
+        div_tt = QFrame()
+        div_tt.setFrameShape(QFrame.Shape.HLine)
+        div_tt.setStyleSheet(f"color: {T.BORDER};")
+        root.addWidget(div_tt)
+
         # ── Cloud Sync (encrypted Firestore via Google Sign-In) ──────────────
         # Replaces the old per-Greek visibility checkboxes — leg columns are
         # now configured via the gear-icon dialog on the home page, which
@@ -573,6 +705,14 @@ class AccountSettingsDialog(QDialog):
         div2.setFrameShape(QFrame.Shape.HLine)
         div2.setStyleSheet(f"color: {T.BORDER};")
         root.addWidget(div2)
+
+        _cb_style = (
+            f"QCheckBox {{ color: {T.TEXT}; font-size: 13px; border: none; }}"
+            f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
+            f"border: 1px solid {T.BORDER}; background: {T.BG_ALT}; }}"
+            f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; "
+            f"border-color: {T.ACCENT}; }}"
+        )
 
         # ── Email Position Tracking ─────────────────────────────────────────
         email_title = QLabel("Email Position Tracking")
@@ -657,13 +797,6 @@ class AccountSettingsDialog(QDialog):
         ibkr_enable_cb = QCheckBox("Use IBKR Gateway for live quotes (auto-detected)")
         # Checked by default; only unchecked when the user explicitly opts out.
         ibkr_enable_cb.setChecked(ibkr_cfg.get("enabled") is not False)
-        _cb_style = (
-            f"QCheckBox {{ color: {T.TEXT}; font-size: 13px; border: none; }}"
-            f"QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; "
-            f"border: 1px solid {T.BORDER}; background: {T.BG_ALT}; }}"
-            f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; "
-            f"border-color: {T.ACCENT}; }}"
-        )
         ibkr_enable_cb.setStyleSheet(_cb_style)
         self._ibkr_widgets["enabled"] = ibkr_enable_cb
         root.addWidget(ibkr_enable_cb)
@@ -709,18 +842,98 @@ class AccountSettingsDialog(QDialog):
 
         root.addLayout(ibkr_form)
 
-        # ── Buttons ──────────────────────────────────────────────────────────
         notice = QLabel("Changes to IBKR settings take effect on next app launch.")
         notice.setStyleSheet(f"color: {T.MUTED}; font-size: 11px; border: none;")
         notice.setWordWrap(True)
         root.addWidget(notice)
 
+        # ── Divider ──────────────────────────────────────────────────────────
+        div4 = QFrame()
+        div4.setFrameShape(QFrame.Shape.HLine)
+        div4.setStyleSheet(f"color: {T.BORDER};")
+        root.addWidget(div4)
+
+        # ── Google Sheets Export ─────────────────────────────────────────────
+        sheets_title = QLabel("Google Sheets Export")
+        sheets_title.setStyleSheet(
+            f"color: {T.ACCENT}; font-size: 15px; font-weight: bold; border: none;"
+        )
+        root.addWidget(sheets_title)
+
+        sheets_hint = QLabel(
+            "Export a live snapshot of your portfolio to Google Sheets. "
+            "Includes positions, strategies, Greeks, and P&&L."
+        )
+        sheets_hint.setStyleSheet(f"color: {T.MUTED}; font-size: 12px; border: none;")
+        sheets_hint.setWordWrap(True)
+        root.addWidget(sheets_hint)
+
+        sheets_row = QHBoxLayout()
+        sheets_row.setSpacing(10)
+
+        self._sheets_export_btn = QPushButton("Export to Google Sheets")
+        self._sheets_export_btn.setStyleSheet(
+            f"QPushButton {{ background: {T.PURPLE}; color: #fff; "
+            f"border: none; border-radius: 6px; padding: 8px 18px; "
+            f"font-size: 13px; font-weight: bold; }}"
+            f"QPushButton:hover {{ background: {T.PURPLE2}; }}"
+            f"QPushButton:disabled {{ background: {T.BORDER}; color: {T.MUTED}; }}"
+        )
+        self._sheets_export_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sheets_export_btn.clicked.connect(self._on_export_sheets)
+        sheets_row.addWidget(self._sheets_export_btn)
+
+        self._sheets_open_btn = QPushButton("Open Sheet ↗")
+        self._sheets_open_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.ACCENT}; "
+            f"border: 1px solid {T.ACCENT}; border-radius: 6px; padding: 8px 14px; "
+            f"font-size: 13px; }}"
+            f"QPushButton:hover {{ background: {T.ACCENT}; color: #fff; }}"
+        )
+        self._sheets_open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._sheets_open_btn.clicked.connect(self._on_open_sheet)
+        # Only show if we have a saved sheet URL
+        saved_sheet_url = settings.get("sheets_export", {}).get("url")
+        self._sheets_open_btn.setVisible(bool(saved_sheet_url))
+        self._sheets_url = saved_sheet_url or ""
+        sheets_row.addWidget(self._sheets_open_btn)
+
+        sheets_row.addStretch()
+        root.addLayout(sheets_row)
+
+        self._sheets_status = QLabel("")
+        self._sheets_status.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 12px; border: none;"
+        )
+        self._sheets_status.setWordWrap(True)
+        root.addWidget(self._sheets_status)
+
+        # Show last export time if available
+        last_export = settings.get("sheets_export", {}).get("last_export")
+        if last_export:
+            self._sheets_status.setText(f"Last export: {last_export}")
+
+        # Store accounts + strategies for export
+        self._export_accounts = accounts
+        self._export_settings = settings
+
+        # ── End of scrollable content ────────────────────────────────────────
+        root.addStretch()
+
+        scroll.setWidget(_inner)
+        outer.addWidget(scroll, 1)
+
+        # ── Buttons (pinned at bottom, outside scroll) ──────────────────────
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        btn_container = QWidget()
+        btn_layout = QVBoxLayout(btn_container)
+        btn_layout.setContentsMargins(24, 10, 24, 14)
+        btn_layout.addWidget(buttons)
+        outer.addWidget(btn_container)
 
     def result_names(self):
         out = {}
@@ -770,6 +983,193 @@ class AccountSettingsDialog(QDialog):
             "port":             int(raw_port) if raw_port else None,
             "client_id":        _int("client_id", 42),
         }
+
+    def result_sheets_export(self) -> dict:
+        """Return sheets export settings."""
+        return getattr(self, "_sheets_export_result", {})
+
+    def _on_export_sheets(self):
+        """Handle the Export to Google Sheets button click."""
+        self._sheets_export_btn.setEnabled(False)
+        self._sheets_export_btn.setText("Exporting…")
+        self._sheets_status.setText("Connecting to Google Sheets…")
+        self._sheets_status.setStyleSheet(
+            f"color: {T.MUTED}; font-size: 12px; border: none;"
+        )
+        # Force UI repaint before the blocking export call
+        QApplication.processEvents()
+
+        try:
+            import cloud_sync
+            cs = cloud_sync.CloudSync()
+            if not cs.is_signed_in():
+                self._sheets_status.setText(
+                    "⚠ Sign in with Google (Cloud Sync section above) first."
+                )
+                self._sheets_status.setStyleSheet(
+                    f"color: {T.YELLOW}; font-size: 12px; border: none;"
+                )
+                self._sheets_export_btn.setEnabled(True)
+                self._sheets_export_btn.setText("Export to Google Sheets")
+                return
+
+            access_token = cs.get_google_access_token()
+            if not access_token:
+                self._sheets_status.setText(
+                    "⚠ Could not get Google token — try signing out and back in."
+                )
+                self._sheets_status.setStyleSheet(
+                    f"color: {T.YELLOW}; font-size: 12px; border: none;"
+                )
+                self._sheets_export_btn.setEnabled(True)
+                self._sheets_export_btn.setText("Export to Google Sheets")
+                return
+
+            import sheets_export
+
+            # Gather strategies from the parent portfolio screen
+            all_strategies = []
+            parent_screen = self.parent()
+            if parent_screen and hasattr(parent_screen, "_strategy_cards"):
+                for card in parent_screen._strategy_cards:
+                    if hasattr(card, "strategy"):
+                        all_strategies.append(card.strategy)
+            if parent_screen and hasattr(parent_screen, "_ua_cards"):
+                for card in parent_screen._ua_cards:
+                    if hasattr(card, "strategy"):
+                        all_strategies.append(card.strategy)
+
+            existing_id = self._export_settings.get("sheets_export", {}).get(
+                "spreadsheet_id"
+            )
+            sid, url, msg = sheets_export.export_portfolio(
+                google_access_token=access_token,
+                accounts=self._export_accounts,
+                all_strategies=all_strategies,
+                strategies_all=self._export_settings.get("strategies"),
+                existing_spreadsheet_id=existing_id,
+            )
+
+            if sid and url:
+                from datetime import datetime, timezone
+                now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                self._sheets_export_result = {
+                    "spreadsheet_id": sid,
+                    "url": url,
+                    "last_export": now_str,
+                }
+                self._sheets_url = url
+                self._sheets_open_btn.setVisible(True)
+                self._sheets_status.setText(f"✓ {msg}")
+                self._sheets_status.setStyleSheet(
+                    f"color: {T.GREEN}; font-size: 12px; border: none;"
+                )
+                # Persist immediately so the sheet ID survives even if
+                # the user cancels the dialog.
+                try:
+                    settings = api.load_settings()
+                    settings["sheets_export"] = self._sheets_export_result
+                    api.save_settings(settings)
+                except Exception:
+                    pass
+            else:
+                self._sheets_status.setText(f"⚠ {msg}")
+                self._sheets_status.setStyleSheet(
+                    f"color: {T.YELLOW}; font-size: 12px; border: none;"
+                )
+
+        except Exception as e:
+            print(f"[sheets] export error: {e}", flush=True)
+            self._sheets_status.setText(f"⚠ Export failed: {e}")
+            self._sheets_status.setStyleSheet(
+                f"color: {T.YELLOW}; font-size: 12px; border: none;"
+            )
+        finally:
+            self._sheets_export_btn.setEnabled(True)
+            self._sheets_export_btn.setText("Export to Google Sheets")
+
+    def _on_open_sheet(self):
+        """Open the exported Google Sheet in the browser."""
+        if self._sheets_url:
+            import webbrowser
+            webbrowser.open(self._sheets_url)
+
+    # ── TastyTrade credential management ─────────────────────────────────
+
+    def _on_tt_connect(self):
+        """Validate and save TastyTrade API credentials."""
+        data = {k: w.text().strip() for k, w in self._tt_widgets.items()}
+        if not all(data.values()):
+            self._tt_result_label.setText("All fields are required.")
+            self._tt_result_label.setStyleSheet(
+                f"color: {T.RED}; font-size: 12px; border: none;"
+            )
+            return
+
+        self._tt_connect_btn.setEnabled(False)
+        self._tt_connect_btn.setText("Connecting…")
+        self._tt_result_label.setText("")
+        QApplication.processEvents()
+
+        try:
+            token, err = api.get_access_token(
+                data["refresh_token"], data["secret_token"]
+            )
+            if token:
+                api.save_credentials(data)
+                self._tt_result_label.setText(
+                    "✓ Connected — restart the app to load TastyTrade data."
+                )
+                self._tt_result_label.setStyleSheet(
+                    f"color: {T.GREEN}; font-size: 12px; border: none;"
+                )
+                self._tt_status.setText(f"Connected as: {data.get('name', '?')}")
+                self._tt_status.setStyleSheet(
+                    f"color: {T.GREEN}; font-size: 12px; border: none;"
+                )
+                self._tt_needs_restart = True
+            else:
+                msg = err or "Connection failed"
+                if "invalid_grant" in (err or "") or "Invalid JWT" in (err or ""):
+                    msg = ("Invalid credentials — Refresh Token and Secret Token "
+                           "must be from the same OAuth app on developer.tastytrade.com")
+                self._tt_result_label.setText(f"⚠ {msg}")
+                self._tt_result_label.setStyleSheet(
+                    f"color: {T.RED}; font-size: 12px; border: none;"
+                )
+        except Exception as e:
+            self._tt_result_label.setText(f"⚠ {e}")
+            self._tt_result_label.setStyleSheet(
+                f"color: {T.RED}; font-size: 12px; border: none;"
+            )
+        finally:
+            self._tt_connect_btn.setEnabled(True)
+            self._tt_connect_btn.setText("Update Connection")
+
+    def _on_tt_disconnect(self):
+        """Remove saved TastyTrade credentials."""
+        reply = QMessageBox.question(
+            self, "Disconnect TastyTrade",
+            "Remove your TastyTrade API credentials?\n\n"
+            "You can re-add them later. IBKR and email tracking\n"
+            "will continue to work.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            api.clear_credentials()
+            for w in self._tt_widgets.values():
+                w.setText("")
+            self._tt_status.setText("Disconnected — add credentials to reconnect.")
+            self._tt_status.setStyleSheet(
+                f"color: {T.MUTED}; font-size: 12px; border: none;"
+            )
+            self._tt_result_label.setText(
+                "✓ Credentials removed — restart the app to apply."
+            )
+            self._tt_result_label.setStyleSheet(
+                f"color: {T.YELLOW}; font-size: 12px; border: none;"
+            )
+            self._tt_needs_restart = True
 
 
 # ── Column-customization dialog ──────────────────────────────────────────────
@@ -1086,6 +1486,33 @@ class _CloudSyncPanel(QWidget):
         self._status.setText(f"✓ Signed in as {tokens.get('email', 'Google user')}.")
         self._refresh_signin_status()
 
+        # If email tracking is enabled, auto-setup Gmail watch now.
+        try:
+            settings = api.load_settings()
+            if settings.get("email_tracking", {}).get("enabled"):
+                cs = cloud_sync.CloudSync()
+                if cs.is_signed_in() and cs.has_gmail_scope():
+                    cs.store_user_email_in_firestore()
+                    cs.store_gmail_auth_in_firestore()
+                    ok, msg = cs.setup_gmail_watch()
+                    if ok:
+                        self._status.setText(
+                            f"✓ Signed in + Gmail watch active")
+                        print(f"[email_tracking] auto-setup: {msg}",
+                              flush=True)
+                    else:
+                        print(f"[email_tracking] auto-setup failed: {msg}",
+                              flush=True)
+        except Exception as e:
+            print(f"[email_tracking] auto-setup error: {e}", flush=True)
+
+        # Update the email status label if it exists in the parent dialog
+        if self._parent_dialog and hasattr(self._parent_dialog, '_email_status'):
+            self._parent_dialog._email_status.setText(
+                "✓ Gmail access available")
+            self._parent_dialog._email_status.setStyleSheet(
+                f"color: {T.GREEN}; font-size: 12px; border: none;")
+
     def _on_sign_out(self):
         api.keychain_delete("cloud_sync_refresh_token")
         api.keychain_delete("cloud_sync_google_email")
@@ -1280,7 +1707,8 @@ class PortfolioScreen(QWidget):
             tasty_provider = TastyQuotesProvider(token_getter=lambda: self.token)
             self.quotes    = self._build_quotes_provider(tasty_provider)
         else:
-            self.quotes    = None   # no TT token — quotes unavailable
+            # No TT token — still try to detect IBKR Gateway for quotes.
+            self.quotes    = self._build_quotes_provider(None)
         self._worker    = None
         self._accounts  = []
         self._alerted   = {}   # {(strategy_id, condition_type): severity} — prevents repeat alerts
@@ -1549,18 +1977,6 @@ class PortfolioScreen(QWidget):
         settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         settings_btn.clicked.connect(self._open_settings)
         hl.addWidget(settings_btn)
-
-        logout_btn = QPushButton("Log out")
-        logout_btn.setFixedHeight(32)
-        logout_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        logout_btn.clicked.connect(self._logout)
-        logout_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; color: {T.MUTED}; "
-            f"border: 1px solid {T.BORDER}; border-radius: 6px; padding: 0 12px; "
-            f"font-size: 12px; font-weight: normal; }}"
-            f"QPushButton:hover {{ color: {T.TEXT}; border-color: {T.BORDER_H}; }}"
-        )
-        hl.addWidget(logout_btn)
         return header
 
     def _style_live_btn(self, on, streaming=False, mode="connecting"):
@@ -1639,7 +2055,7 @@ class PortfolioScreen(QWidget):
 
         # Explicit opt-out — only path that disables IBKR entirely.
         if ibkr_cfg.get("enabled") is False:
-            return tasty_provider
+            return tasty_provider  # may be None when no TT token
 
         host       = ibkr_cfg.get("host") or "127.0.0.1"
         client_id  = int(ibkr_cfg.get("client_id") or 42)
@@ -1699,9 +2115,16 @@ class PortfolioScreen(QWidget):
         kind = {4001: "Gateway (live)", 4002: "Gateway (paper)",
                 7496: "TWS (live)",     7497: "TWS (paper)"}.get(detected_port,
                                                                  f"port {detected_port}")
-        print(f"[ibkr] auto-detected: {kind} — quotes will use IBKR push, "
-              f"TastyTrade as fallback", flush=True)
-        return HybridQuotesProvider(primary=ibkr_provider, fallback=tasty_provider)
+
+        if tasty_provider is not None:
+            print(f"[ibkr] auto-detected: {kind} — quotes will use IBKR push, "
+                  f"TastyTrade as fallback", flush=True)
+            return HybridQuotesProvider(primary=ibkr_provider, fallback=tasty_provider)
+        else:
+            print(f"[ibkr] auto-detected: {kind} — quotes will use IBKR push "
+                  f"(no TastyTrade fallback, running without TT credentials)",
+                  flush=True)
+            return ibkr_provider
 
     # ── IBKR account-data helpers ─────────────────────────────────────────────
 
@@ -1709,6 +2132,13 @@ class PortfolioScreen(QWidget):
         """Return the IBKRQuotesProvider if active, else None."""
         if isinstance(self.quotes, HybridQuotesProvider):
             return self.quotes._primary
+        # When running without TT credentials, quotes IS the IBKR provider.
+        try:
+            from quotes_ibkr import IBKRQuotesProvider
+            if isinstance(self.quotes, IBKRQuotesProvider):
+                return self.quotes
+        except ImportError:
+            pass
         return None
 
     def _ibkr_data_source_only(self) -> bool:
@@ -1824,9 +2254,13 @@ class PortfolioScreen(QWidget):
                   flush=True)
             return
 
-        # Replace the Tasty-only provider with Hybrid.
-        tasty       = self.quotes
-        self.quotes = HybridQuotesProvider(primary=ibkr_prov, fallback=tasty)
+        # Replace the current provider with IBKR (or Hybrid if Tasty exists).
+        tasty = self.quotes
+        if tasty is not None:
+            self.quotes = HybridQuotesProvider(primary=ibkr_prov, fallback=tasty)
+        else:
+            # No TT credentials → IBKR is the sole quotes source.
+            self.quotes = ibkr_prov
 
         kind = {4001: "Gateway (live)", 4002: "Gateway (paper)",
                 7496: "TWS (live)",     7497: "TWS (paper)"}.get(port, f"port {port}")
@@ -1868,6 +2302,8 @@ class PortfolioScreen(QWidget):
 
     def _start_streamer(self):
         """Open a streaming-quotes connection via the active QuotesProvider."""
+        if self.quotes is None:
+            return
         # Skip entirely if we've already determined streaming isn't available
         # for this OAuth app — avoids spamming 403 retries on every Live
         # toggle.  User stays on REST 15s polling.
@@ -3236,23 +3672,30 @@ class PortfolioScreen(QWidget):
             old_email = self._settings.get("email_tracking", {})
             self._settings["email_tracking"] = new_email
 
-            # If email tracking was just enabled, set up Gmail watch + store
-            # tokens in Firestore so the Cloud Function can access Gmail.
+            # If email tracking was just enabled, try to set up Gmail watch.
+            # If not signed in with Google yet, just save the preference —
+            # Gmail watch will be set up when they sign in via Cloud Sync.
             if new_email.get("enabled") and not old_email.get("enabled"):
                 try:
                     cs = cloud_sync.CloudSync()
                     if cs.is_signed_in() and cs.has_gmail_scope():
-                        cs.store_user_email_in_firestore()
-                        cs.store_gmail_auth_in_firestore()
-                        ok, msg = cs.setup_gmail_watch()
-                        if ok:
-                            print(f"[email_tracking] Gmail watch set up: {msg}",
-                                  flush=True)
-                        else:
-                            print(f"[email_tracking] Gmail watch failed: {msg}",
-                                  flush=True)
+                        self._finish_email_tracking_setup(cs)
+                    else:
+                        QMessageBox.information(
+                            self, "Email Tracking Enabled",
+                            "Email tracking is saved.\n\n"
+                            "To activate it, sign in with Google in the\n"
+                            "Cloud Sync section of Settings. Gmail watch\n"
+                            "will start automatically once signed in.",
+                        )
                 except Exception as e:
                     print(f"[email_tracking] setup error: {e}", flush=True)
+
+            # Sheets export settings (saved even on Cancel via the export button,
+            # but we also persist any result here in case user presses OK after).
+            sheets_result = dlg.result_sheets_export()
+            if sheets_result:
+                self._settings["sheets_export"] = sheets_result
 
             api.save_settings(self._settings)
             self._refresh_account_combo()
@@ -3266,6 +3709,26 @@ class PortfolioScreen(QWidget):
                     "time the app launches.\n\n"
                     "Quit and relaunch to start using IBKR for live quotes.",
                 )
+
+    def _finish_email_tracking_setup(self, cs):
+        """Store Gmail tokens in Firestore and activate Gmail watch."""
+        try:
+            cs.store_user_email_in_firestore()
+            cs.store_gmail_auth_in_firestore()
+            ok, msg = cs.setup_gmail_watch()
+            if ok:
+                print(f"[email_tracking] Gmail watch: {msg}", flush=True)
+                QMessageBox.information(
+                    self, "Email Tracking Active",
+                    "Gmail watch is set up!\n"
+                    "Trade emails will now be processed automatically.",
+                )
+            else:
+                print(f"[email_tracking] Gmail watch failed: {msg}",
+                      flush=True)
+                QMessageBox.warning(self, "Gmail Watch Failed", msg)
+        except Exception as e:
+            print(f"[email_tracking] setup error: {e}", flush=True)
 
     def stop_workers(self):
         """Gracefully stop all background threads before this widget is deleted.
@@ -3365,6 +3828,17 @@ class MainWindow(QStackedWidget):
             )
 
     def _show_initial(self):
+        settings = api.load_settings()
+
+        # First launch ever → show the setup screen so the user can
+        # either connect TastyTrade or skip.  After that first choice,
+        # the app always goes straight to the portfolio; credentials
+        # can be added/changed later in Settings.
+        if not settings.get("first_launch_done"):
+            self._show_setup()
+            return
+
+        # Returning user → try to use saved TT credentials silently.
         creds = api.load_credentials()
         if creds:
             token, err = api.get_access_token(
@@ -3373,24 +3847,43 @@ class MainWindow(QStackedWidget):
             if token:
                 self._show_portfolio(creds, token)
             else:
-                self._show_setup(creds)
+                # Token refresh failed (network, expired, etc.) — go to
+                # portfolio anyway so the user isn't blocked.  IBKR / email
+                # tracking / offline mode will still work.  TT data just
+                # won't load until the token is fixed in Settings.
+                print(f"[startup] TT token refresh failed: {err} — "
+                      f"entering portfolio without TT data", flush=True)
+                self._show_portfolio(creds, "")
         else:
-            self._show_setup()
+            self._show_portfolio({}, "")
 
     def _show_setup(self, prefill=None):
         self._clear_all()
         screen = SetupScreen()
         if prefill:
             screen.prefill(prefill)
-        screen.connected.connect(lambda creds, tok: self._show_portfolio(creds, tok))
-        screen.skipped.connect(lambda: self._show_portfolio({}, ""))
+        screen.connected.connect(self._on_tt_connected)
+        screen.skipped.connect(self._on_skip_login)
         self.addWidget(screen)
         self.setCurrentWidget(screen)
+
+    def _on_tt_connected(self, creds, token):
+        """User connected TT on setup screen — mark first launch done."""
+        settings = api.load_settings()
+        settings["first_launch_done"] = True
+        api.save_settings(settings)
+        self._show_portfolio(creds, token)
+
+    def _on_skip_login(self):
+        """User clicked Skip — mark first launch done and go to portfolio."""
+        settings = api.load_settings()
+        settings["first_launch_done"] = True
+        api.save_settings(settings)
+        self._show_portfolio({}, "")
 
     def _show_portfolio(self, creds, token):
         self._clear_all()
         self.portfolio = PortfolioScreen(creds, token)
-        self.portfolio.logout_requested.connect(self._show_setup)
         self.portfolio.configure_requested.connect(self._show_configure)
         self.portfolio.strategy_clicked.connect(self._show_detail)
         self.portfolio.watchlist_requested.connect(self._show_watchlist)
