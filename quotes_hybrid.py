@@ -100,11 +100,19 @@ class HybridQuotesProvider(QuotesProvider):
             if primary_res:
                 merged.update(primary_res)
                 self._record_primary_success()
+                print(f"[hybrid] IBKR returned {len(primary_res)}/{len(wanted)} "
+                      f"symbols", flush=True)
             else:
                 # Empty result → counts toward the breaker (Gateway down or
                 # qualify failed for everything).
                 if wanted:
                     self._record_primary_fail()
+                    print(f"[hybrid] IBKR returned 0/{len(wanted)} — "
+                          f"fail #{self._fail_count}", flush=True)
+        else:
+            print(f"[hybrid] IBKR breaker open — skipping primary "
+                  f"(resumes at {self._breaker_until - time.time():.0f}s)",
+                  flush=True)
 
         # ── Fallback (TastyTrade) for missing symbols only ───────────────
         missing = wanted - set(merged.keys())

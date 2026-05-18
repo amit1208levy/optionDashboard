@@ -73,12 +73,16 @@ def _ticker_to_normalized(t: Ticker) -> Optional[dict]:
     bid  = _f(t.bid)
     ask  = _f(t.ask)
     last = _f(t.last)
-    if bid  is not None: out["bid"]  = bid
-    if ask  is not None: out["ask"]  = ask
-    if last is not None: out["last"] = last
+    close = _f(t.close)
+    # IBKR uses -1 as "no data" sentinel — exclude those.
+    if bid  is not None and bid > 0:  out["bid"]  = bid
+    if ask  is not None and ask > 0:  out["ask"]  = ask
+    if last is not None and last > 0: out["last"] = last
+    if close is not None and close > 0: out["close"] = close
 
     # Mark = midpoint when both sides are quoted, else last, else IBKR's
-    # marketPrice() (a curated fallback).
+    # marketPrice() (a curated fallback), else previous close (for outside
+    # market hours when no live data is available).
     if bid and ask and bid > 0 and ask > 0:
         out["mark"] = (bid + ask) / 2.0
     elif last and last > 0:
@@ -87,6 +91,17 @@ def _ticker_to_normalized(t: Ticker) -> Optional[dict]:
         mp = _f(t.marketPrice())
         if mp is not None and mp > 0:
             out["mark"] = mp
+        elif close and close > 0:
+            # Outside market hours: use previous close as best available mark.
+            out["mark"] = close
+
+    # Additional Ticker fields — day high/low/volume for richer display.
+    high = _f(getattr(t, "high", None))
+    low  = _f(getattr(t, "low", None))
+    vol  = _f(getattr(t, "volume", None))
+    if high is not None and high > 0: out["high"] = high
+    if low  is not None and low > 0:  out["low"]  = low
+    if vol  is not None and vol > 0:  out["volume"] = vol
 
     # Greeks (options only) — ib_insync populates modelGreeks on options.
     mg = getattr(t, "modelGreeks", None)
@@ -171,6 +186,17 @@ class IBKRQuotesProvider(QuotesProvider):
         self._thread.start()
         self._loop_ready.wait(timeout=5)
 
+        # Eagerly connect so the IB handshake completes before the first
+        # worker refresh needs data.  This avoids the first 2–3 refresh
+        # cycles timing out while the lazy connect races the query timeout.
+        self._submit(self._ensure_connected(), timeout=8)
+        if self._ib and self._ib.isConnected():
+            print(f"[ibkr] eager connect succeeded — "
+                  f"clientId={self._client_id}, port={self._port}", flush=True)
+        else:
+            print(f"[ibkr] eager connect not yet ready — will retry lazily",
+                  flush=True)
+
     # ── thread / loop lifecycle ────────────────────────────────────────────
 
     def _thread_main(self):
@@ -195,7 +221,9 @@ class IBKRQuotesProvider(QuotesProvider):
             return fut.result(timeout=timeout)
         except Exception as e:
             # Surface the error at the call site instead of swallowing it.
-            print(f"[ibkr] submit error: {e}", flush=True)
+            etype = type(e).__name__
+            print(f"[ibkr] submit error ({etype}): {e}",
+                  flush=True)
             return None
 
     # ── connection ─────────────────────────────────────────────────────────
@@ -208,17 +236,20 @@ class IBKRQuotesProvider(QuotesProvider):
             # Re-key streaming-tick events so they fan out to caller callbacks.
             self._ib.pendingTickersEvent += self._on_pending_tickers_loop
             self._ib.disconnectedEvent   += self._on_disconnected_loop
+        print(f"[ibkr] connecting to {self._host}:{self._port} "
+              f"clientId={self._client_id}…", flush=True)
         try:
             await self._ib.connectAsync(
                 self._host, self._port,
                 clientId=self._client_id,
                 readonly=True,
-                timeout=5,
+                timeout=8,
             )
             self._ib.reqMarketDataType(self._market_data_type)
+            print(f"[ibkr] connected OK", flush=True)
             return True
         except Exception as e:
-            print(f"[ibkr] connect failed: {e}", flush=True)
+            print(f"[ibkr] connect failed ({type(e).__name__}): {e}", flush=True)
             self._notify_status_all(f"error:{e}")
             return False
 
@@ -344,36 +375,94 @@ class IBKRQuotesProvider(QuotesProvider):
         if contracts_to_qualify:
             try:
                 await self._ib.qualifyContractsAsync(*contracts_to_qualify)
+                qualified = sum(1 for c in contracts_to_qualify if c.conId)
+                print(f"[ibkr] qualified {qualified}/{len(contracts_to_qualify)} "
+                      f"contracts", flush=True)
             except Exception as e:
                 print(f"[ibkr] qualify failed: {e}", flush=True)
 
         # 2. For each symbol with a valid conId, ensure it's subscribed.
+        #    genericTickList "106,232,233":
+        #      106 = Option Implied Volatility (triggers model computation)
+        #      232 = Mark Price (exchange-published settlement mark)
+        #      233 = RT Volume (real-time trade details)
+        _GENERIC_TICKS = "106,232,233"
         new_subs = []
+        no_conid = []
         for tt in request_tt:
             c = self._contracts_by_tt.get(tt)
             if c is None or not c.conId:
+                no_conid.append(tt)
                 continue
             if tt not in self._tickers_by_tt:
-                t = self._ib.reqMktData(c, "", snapshot=False, regulatorySnapshot=False)
+                t = self._ib.reqMktData(c, _GENERIC_TICKS,
+                                        snapshot=False, regulatorySnapshot=False)
                 self._tickers_by_tt[tt] = t
                 self._tt_by_conid[c.conId] = tt
                 new_subs.append(tt)
+        if no_conid:
+            print(f"[ibkr] {len(no_conid)} symbols had no conId (qualify failed): "
+                  f"{no_conid[:5]}", flush=True)
 
         # 3. Wait briefly for fresh ticks if we just subscribed.
         if new_subs:
+            print(f"[ibkr] subscribed {len(new_subs)} new symbols, "
+                  f"waiting for ticks…", flush=True)
             try:
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2.0)
             except asyncio.CancelledError:
                 raise
 
         # 4. Read current state for each requested symbol.
         out: dict[str, dict] = {}
+        no_data = []
         for tt in request_tt:
             t = self._tickers_by_tt.get(tt)
             q = _ticker_to_normalized(t)
             if q:
                 q["symbol"] = tt
                 out[tt] = q
+            else:
+                no_data.append(tt)
+
+        # 4b. If many symbols returned nothing AND we're on live data type,
+        #     try frozen (type 2 = last settlement values at close) then
+        #     delayed-frozen (type 4) — gives data outside market hours.
+        if no_data and len(no_data) > len(request_tt) * 0.5 and new_subs:
+            if self._market_data_type in (1, 3):
+                for fallback_type in (2, 4):
+                    if not no_data:
+                        break
+                    type_name = "frozen" if fallback_type == 2 else "delayed-frozen"
+                    print(f"[ibkr] {len(no_data)}/{len(request_tt)} symbols have no data — "
+                          f"trying {type_name} (type {fallback_type})…", flush=True)
+                    self._ib.reqMarketDataType(fallback_type)
+                    try:
+                        await asyncio.sleep(1.5)
+                    except asyncio.CancelledError:
+                        raise
+                    # Re-check the symbols that had no data.
+                    recovered = []
+                    for tt in list(no_data):
+                        t = self._tickers_by_tt.get(tt)
+                        q = _ticker_to_normalized(t)
+                        if q:
+                            q["symbol"] = tt
+                            out[tt] = q
+                            recovered.append(tt)
+                    for tt in recovered:
+                        no_data.remove(tt)
+                    if recovered:
+                        print(f"[ibkr] {type_name} recovered {len(recovered)} symbols",
+                              flush=True)
+                # Restore original market data type for future requests.
+                self._ib.reqMarketDataType(self._market_data_type)
+
+        if no_data:
+            print(f"[ibkr] {len(no_data)} symbols returned no tick data: "
+                  f"{no_data[:5]}", flush=True)
+        print(f"[ibkr] get_quotes returning {len(out)}/{len(request_tt)} "
+              f"symbols with data", flush=True)
         return out
 
     # ── Streaming ──────────────────────────────────────────────────────────

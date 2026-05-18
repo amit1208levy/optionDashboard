@@ -36,7 +36,7 @@ import re
 from datetime import date
 from typing import Optional
 
-from ib_insync import Stock, Option, Future, Contract
+from ib_insync import Stock, Option, Future, FuturesOption, Contract
 
 
 class UnsupportedSymbol(ValueError):
@@ -50,6 +50,14 @@ _OPT_RE = re.compile(r"^(.{6})(\d{6})([CP])(\d{8})$")
 # ── Futures: /ROOT + month code (1 letter) + 1-digit year ────────────────────
 # /ESM4  →  groups = ('ES', 'M', '4')
 _FUT_RE = re.compile(r"^/([A-Z0-9]{1,4})([FGHJKMNQUVXZ])(\d)$")
+
+# ── Futures options: extract root+month+year from the leading token ──────────
+# ZSQ6  →  ('ZS', 'Q', '6')      from "./ZSQ6 OZSQ6 260724P1030"
+# MESU6 →  ('MES', 'U', '6')     from "./MESU6EX3N6 260717P5250"
+_FUTOPT_ROOT_RE = re.compile(r"^([A-Z0-9]+?)([FGHJKMNQUVXZ])(\d)")
+
+# Strike part of the last token: YYMMDD + C/P + strike (integer or decimal)
+_FUTOPT_STRIKE_RE = re.compile(r"^(\d{6})([CP])(\d+(?:\.\d+)?)$")
 
 # Futures month codes (CME convention)
 _MONTH_CODE = {
@@ -100,9 +108,11 @@ def tt_to_contract(tt_symbol: str) -> Contract:
 
     s = tt_symbol.strip()
 
-    # Futures option — multi-token, defer
+    # Futures option — multi-token format:
+    #   "./ZSQ6 OZSQ6 260724P1030"   (3 tokens)
+    #   "./MESU6EX3N6 260717P5250"   (2 tokens, root+optcode merged)
     if s.startswith("./"):
-        raise UnsupportedSymbol(f"futures option (deferred): {s}")
+        return _build_futures_option(s)
 
     # Future root (single token starting with /)
     if s.startswith("/"):
@@ -142,6 +152,9 @@ def contract_to_tt(c: Contract) -> Optional[str]:
         return _option_to_tt(c)
     if isinstance(c, Future):
         return _future_to_tt(c)
+    # FuturesOption: the caller should have cached the TT symbol during
+    # tt_to_contract → we can't reliably reconstruct the multi-token TT
+    # format.  Return None so the reverse-map fallback (conId → tt) is used.
     return None
 
 
@@ -188,6 +201,65 @@ def _future_to_tt(c: Future) -> Optional[str]:
     if month not in inv:
         return None
     return f"/{c.symbol.upper()}{inv[month]}{year % 10}"
+
+
+def _build_futures_option(s: str) -> FuturesOption:
+    """
+    Parse a TT futures-option symbol into an IBKR FuturesOption contract.
+
+    TT formats:
+      "./ZSQ6 OZSQ6 260724P1030"      (3 tokens — underlying, optcode, strike)
+      "./MESU6EX3N6 260717P5250"       (2 tokens — root+optcode merged, strike)
+
+    We extract:
+      - futures root      from the first token (ZS, MES, MCL, 6A, ZB, …)
+      - tradingClass      from the option code (OZSQ6 → OZS, EX3N6 → EX3)
+      - expiry YYMMDD     from the last token
+      - C/P + strike      from the last token
+    """
+    body = s[2:]  # strip "./"
+    parts = body.split()
+    if len(parts) < 2:
+        raise UnsupportedSymbol(f"futures option too few tokens: {s}")
+
+    # Last token is always YYMMDDCPSTRIKE
+    strike_tok = parts[-1].strip()
+    m = _FUTOPT_STRIKE_RE.match(strike_tok)
+    if not m:
+        raise UnsupportedSymbol(f"futures option strike parse failed: {s}")
+    yymmdd, cp, strike_str = m.groups()
+    strike = float(strike_str)
+    expiry = "20" + yymmdd  # "260724" → "20260724"
+
+    # First token contains the underlying futures code.
+    first = parts[0]
+    m2 = _FUTOPT_ROOT_RE.match(first)
+    if not m2:
+        raise UnsupportedSymbol(f"futures option root parse failed: {s}")
+    root = m2.group(1)
+
+    # Extract the trading class from the option code to disambiguate
+    # contracts like OZS vs OSD.  The option code is either the 2nd
+    # token (3-token form) or the text after root+month+year in the
+    # 1st token (2-token form).  Strip the trailing month+year suffix
+    # (1 letter + 1 digit) to get the class.
+    trading_class = ""
+    if len(parts) >= 3:
+        # 3-token: "./ZSQ6 OZSQ6 260724P1030" → optcode = "OZSQ6"
+        opt_code = parts[1]
+    else:
+        # 2-token: "./MESU6EX3N6 260717P5250" → remainder after root match
+        opt_code = first[m2.end():]
+    # Strip trailing month-code + year-digit (e.g. "Q6", "N6")
+    mc = re.match(r"^(.+?)[FGHJKMNQUVXZ]\d$", opt_code)
+    if mc:
+        trading_class = mc.group(1)
+
+    exch = _FUT_EXCHANGE.get(root, "GLOBEX")
+    fop = FuturesOption(root, expiry, strike, cp, exchange=exch, currency="USD")
+    if trading_class:
+        fop.tradingClass = trading_class
+    return fop
 
 
 def _resolve_future_year(last_digit: int) -> int:

@@ -179,16 +179,14 @@ class Position:
         else:
             self.pnl = self.sign * (notional_mark - notional_open)
 
-        # Safety net for futures contracts: if avg_open_price is missing
-        # / zero, the formula above reports the full notional as P&L
-        # (because notional_open = 0). That's worse than wrong — it's
-        # actively misleading. Zero it instead.
-        if (self.is_future and not self.is_option
-                and (not self.avg_open_price or self.avg_open_price <= 0)
+        # Safety net: when avg_open_price is missing/zero AND the broker
+        # didn't supply an authoritative unrealizedPNL, zero out P&L to
+        # avoid displaying a misleading number (the formula would show the
+        # full notional as profit/loss).
+        if ((not self.avg_open_price or self.avg_open_price <= 0)
                 and "unrealized-pnl" not in raw):
             self.pnl = 0.0
             self.cost_basis   = 0.0
-            self.market_value = 0.0
             self.credit_debit = 0.0
 
         self.pnl_pct = (self.pnl / notional_open * 100.0) if notional_open else 0.0
@@ -215,13 +213,12 @@ class Position:
             self.credit_debit = -self.sign * notional_open
         self.pnl_pct      = (self.pnl / notional_open * 100.0) if notional_open else 0.0
 
-        # Same safety net as __init__: pure-futures contracts with a missing
-        # / zero open price would report the full notional as P&L. Zero it.
-        if (self.is_future and not self.is_option
-                and (not self.avg_open_price or self.avg_open_price <= 0)):
+        # Safety net: when avg_open_price is missing/zero, the formula
+        # produces misleading P&L values (full notional appears as P&L).
+        # Zero it out — the user will see "—" rather than a wrong number.
+        if not self.avg_open_price or self.avg_open_price <= 0:
             self.pnl = 0.0
             self.cost_basis = 0.0
-            self.market_value = 0.0
             self.credit_debit = 0.0
             self.pnl_pct = 0.0
 
@@ -248,15 +245,25 @@ class Position:
             # Normalise: API usually returns 0–1 but guard against 0–100
             self.probability_otm = raw_potm if raw_potm <= 1.0 else raw_potm / 100.0
 
+        # Previous close / settlement — used for day P&L computation.
+        close_val = f("close")
+        if close_val is not None and close_val > 0:
+            self.close_price = close_val
+
         # Live mark — positions endpoint often returns 0 for futures options;
-        # stocks return last/bid/ask rather than mark
+        # stocks return last/bid/ask rather than mark.
+        # Fallback chain: mark → mid(bid,ask) → last → close (settlement).
         mark = f("mark")
         if mark is None or mark == 0:
             bid, ask = f("bid"), f("ask")
-            if bid is not None and ask is not None:
+            if bid is not None and ask is not None and bid > 0 and ask > 0:
                 mark = (bid + ask) / 2.0
-            elif f("last") is not None:
+            elif f("last") is not None and f("last") > 0:
                 mark = f("last")
+            elif close_val is not None and close_val > 0:
+                # Use previous close / settlement as best available mark
+                # (e.g., outside market hours or when delayed data only).
+                mark = close_val
         if mark is not None and mark > 0:
             self.mark_price = mark
             self._recompute()
@@ -284,6 +291,85 @@ class Position:
     @property
     def expiry_label(self):
         return self.expires_at.strftime("%b %d, %Y") if self.expires_at else "—"
+
+
+# ── Stub positions from stored strategy legs ────────────────────────────────
+
+def _underlying_from_tt(symbol: str) -> str:
+    """Best-effort underlying symbol from a TT-format symbol string."""
+    s = symbol.strip()
+    if s.startswith("./"):
+        # Futures option: "./ZSQ6 OZSQ6 260724P1030" → /ZSQ6
+        parts = s.split()
+        return parts[0].lstrip(".") if parts else s
+    # Equity option: "SPXW  260424P06960000" → SPXW
+    m = re.match(r"^([A-Z]+)", s)
+    return m.group(1) if m else s.split()[0]
+
+
+def _instrument_type_from_tt(symbol: str) -> str:
+    """Derive instrument type from a TT-format symbol string."""
+    s = symbol.strip()
+    cp, _ = parse_option_symbol(s)
+    if s.startswith("./") or s.startswith("/"):
+        return "Future Option" if cp else "Future"
+    return "Equity Option" if cp else "Equity"
+
+
+def _multiplier_from_tt(symbol: str) -> float:
+    """Best-effort contract multiplier for a TT symbol."""
+    itype = _instrument_type_from_tt(symbol)
+    if itype == "Equity Option":
+        return 100.0
+    if itype in ("Future Option", "Future"):
+        root = normalize_root(_underlying_from_tt(symbol))
+        return _CONTRACT_MULT.get(root, 50.0)  # default 50 for micro futures
+    return 1.0
+
+
+def stub_position_from_symbol(symbol: str) -> "Position":
+    """
+    Create a minimal Position from a TT-format symbol string.
+
+    Used in offline mode (no TT token) to reconstruct positions from stored
+    strategy legs so the UI can show strategy structure, DTE, and Greeks
+    (once IBKR quotes are attached).  Quantity defaults to 1, direction to
+    Short (the common case for premium-selling strategies), and open price
+    to 0.  P&L will show $0 until the TT API is restored.
+    """
+    s = symbol.strip()
+    underlying = _underlying_from_tt(s)
+    itype = _instrument_type_from_tt(s)
+    cp, strike = parse_option_symbol(s)
+    mult = _multiplier_from_tt(s)
+
+    # Build expiry from the symbol.
+    expires_iso = None
+    if cp:
+        # Options: extract YYMMDD from the symbol.
+        m = re.search(r"(\d{6})[CP]", s)
+        if m:
+            d = m.group(1)
+            y = 2000 + int(d[:2])
+            expires_iso = f"{y}-{d[2:4]}-{d[4:6]}T00:00:00Z"
+    elif "future" in itype.lower():
+        d = parse_futures_expiry(s)
+        if d:
+            expires_iso = f"{d.isoformat()}T00:00:00Z"
+
+    raw = {
+        "symbol":             s,
+        "underlying-symbol":  underlying,
+        "instrument-type":    itype,
+        "quantity":           1,
+        "quantity-direction": "Short",
+        "mark-price":         0.0,
+        "close-price":        None,
+        "multiplier":         mult,
+        "average-open-price": 0.0,
+        "expires-at":         expires_iso,
+    }
+    return Position(raw)
 
 
 # ── Strategy ─────────────────────────────────────────────────────────────────
