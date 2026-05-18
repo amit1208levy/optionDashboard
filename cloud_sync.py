@@ -119,11 +119,20 @@ class GoogleSignInError(Exception):
 
 
 def sign_in_with_google(google_client_id: Optional[str] = None,
-                         timeout: float = 180.0) -> Optional[dict]:
+                         timeout: float = 180.0,
+                         include_gmail: bool = False) -> Optional[dict]:
     """
     Run a Google OAuth 2.0 PKCE flow and exchange the resulting Google ID
     token for a Firebase ID token. Returns Firebase's full token dict
     (idToken, refreshToken, localId, email, ...) or None on failure.
+
+    Parameters
+    ----------
+    include_gmail
+        When True, also request ``gmail.readonly`` scope (needed for email
+        tracking).  When False (default), only request basic identity
+        scopes — avoids Google's "sensitive info" verification warning
+        for users who only want cloud sync.
 
     Caller flow (UX): clicking 'Sign in with Google' triggers this.
       1. Spin up a tiny HTTP server on 127.0.0.1:<random_port>.
@@ -138,6 +147,10 @@ def sign_in_with_google(google_client_id: Optional[str] = None,
     """
     google_client_id = google_client_id or _GOOGLE_OAUTH_CLIENT_ID
 
+    scopes = "openid email profile"
+    if include_gmail:
+        scopes += " https://www.googleapis.com/auth/gmail.readonly"
+
     port         = _free_port()
     redirect_uri = f"http://127.0.0.1:{port}/callback"
     state        = secrets.token_urlsafe(16)
@@ -149,7 +162,7 @@ def sign_in_with_google(google_client_id: Optional[str] = None,
             "client_id":             google_client_id,
             "redirect_uri":          redirect_uri,
             "response_type":         "code",
-            "scope":                 "openid email profile https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/spreadsheets",
+            "scope":                 scopes,
             "state":                 state,
             "code_challenge":        challenge,
             "code_challenge_method": "S256",
