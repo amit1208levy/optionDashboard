@@ -26,6 +26,7 @@ from models import (
     Position, StrategyInstance, unassigned_positions, group_unassigned,
     build_snapshot, detect_closures, portfolio_greeks, repair_history_pnl,
     repair_pnl_missing_multiplier, check_exit_conditions, probability_of_profit,
+    stub_position_from_symbol,
 )
 from strategy_card import StrategyCard, pnl_color, money, fmt_num
 from strategies_page import ConfigurePage
@@ -219,6 +220,11 @@ class PortfolioWorker(QThread):
                 quotes  = f_quotes.result()
                 metrics = f_metrics.result()
 
+            n_quoted = sum(1 for p in positions if quotes.get(p.symbol))
+            print(f"[worker] acct {num}: {len(positions)} positions, "
+                  f"{len(quotes)} quotes returned, {n_quoted} matched",
+                  flush=True)
+
             for p in positions:
                 p.attach_quote(quotes.get(p.symbol))
 
@@ -238,6 +244,9 @@ class PortfolioWorker(QThread):
     # ── Main run ─────────────────────────────────────────────────────────────
 
     def run(self):
+        print(f"[worker] run() started — token={'yes' if self.token else 'EMPTY'}, "
+              f"ibkr_provider={type(self._ibkr_provider).__name__ if self._ibkr_provider else 'None'}, "
+              f"data_source_only={self._ibkr_data_source_only}", flush=True)
         new_token = None
         for attempt in range(2):   # attempt 0 = normal; attempt 1 = after token refresh
             try:
@@ -249,19 +258,90 @@ class PortfolioWorker(QThread):
                     accounts = []
                     stored_strategies = api.load_strategies()
                     stored_names = api.load_account_names()
+                    stored_history = api.load_history()
+                    today = datetime.now(timezone.utc).date()
+                    strategies_changed = False
+                    history_changed = False
+
                     for acct_num in stored_strategies:
                         if stored_strategies[acct_num] or acct_num in stored_names:
+                            # Reconstruct positions from stored strategy legs,
+                            # skipping expired legs (auto-retire them to history).
+                            stubs = []
+                            for strat in stored_strategies.get(acct_num, []):
+                                expired_syms = []
+                                for sym in list(strat.get("legs", [])):
+                                    try:
+                                        pos = stub_position_from_symbol(sym)
+                                    except Exception:
+                                        continue
+                                    # If the leg has expired, retire it instead
+                                    # of showing it with a negative DTE.
+                                    if pos.expires_at and pos.expires_at.date() < today:
+                                        expired_syms.append(sym)
+                                        # Add a minimal history entry so the
+                                        # closed leg shows in the strategy detail.
+                                        stored_history.setdefault(acct_num, []).append({
+                                            "symbol":      sym,
+                                            "root":        pos.root,
+                                            "strategy_id": strat["id"],
+                                            "qty":         1,
+                                            "sign":        pos.sign,
+                                            "open_price":  0,
+                                            "close_price": 0,
+                                            "multiplier":  pos.multiplier,
+                                            "closed_at":   pos.expires_at.isoformat(),
+                                            "pnl":         0,
+                                            "source":      "auto-expired",
+                                            "call_put":    pos.call_put,
+                                            "strike":      pos.strike,
+                                            "instrument":  pos.instrument_type,
+                                        })
+                                        history_changed = True
+                                        continue
+                                    stubs.append(pos)
+
+                                # Remove expired legs from the strategy.
+                                if expired_syms:
+                                    strat["legs"] = [s for s in strat["legs"]
+                                                     if s not in expired_syms]
+                                    if "leg_order" in strat:
+                                        strat["leg_order"] = [s for s in strat["leg_order"]
+                                                              if s not in expired_syms]
+                                    strategies_changed = True
+
                             accounts.append({
                                 "number":             acct_num,
                                 "nickname":           stored_names.get(acct_num) or acct_num,
                                 "balances":           {},
-                                "positions":          [],
+                                "positions":          stubs,
                                 "metrics":            {},
                                 "ytd_txns":           [],
                                 "year_start_net_liq": None,
                                 "ytd_pnl_sdk":        None,
                                 "source":             "offline",
                             })
+
+                    # Persist changes so expired legs stay retired on next launch.
+                    if strategies_changed:
+                        api.save_strategies(stored_strategies)
+                        print(f"[worker] retired expired legs from strategies",
+                              flush=True)
+                    if history_changed:
+                        api.save_history(stored_history)
+                        print(f"[worker] added expired legs to history",
+                              flush=True)
+                    # Even without a TT token, fetch IBKR account if Gateway
+                    # is connected — IBKR doesn't need TT credentials.
+                    print(f"[worker] no-token branch: {len(accounts)} offline accts, "
+                          f"ibkr_provider={bool(self._ibkr_provider)}, "
+                          f"data_source_only={self._ibkr_data_source_only}", flush=True)
+                    if self._ibkr_provider and not self._ibkr_data_source_only:
+                        from ibkr_account import fetch_ibkr_account
+                        print("[worker] submitting fetch_ibkr_account...", flush=True)
+                        ibkr_fut = ThreadPoolExecutor(max_workers=1).submit(
+                            fetch_ibkr_account, self._ibkr_provider
+                        )
                 else:
                     accounts_raw = [a for a in api.list_accounts(self.token)
                                     if a.get("account-number")]
@@ -273,7 +353,6 @@ class PortfolioWorker(QThread):
 
                     with ThreadPoolExecutor(max_workers=workers) as ex:
                         tt_futures = [ex.submit(self._fetch_one, a) for a in accounts_raw]
-                        ibkr_fut = None
                         if self._ibkr_provider and not self._ibkr_data_source_only:
                             from ibkr_account import fetch_ibkr_account
                             ibkr_fut = ex.submit(fetch_ibkr_account, self._ibkr_provider)
@@ -282,9 +361,13 @@ class PortfolioWorker(QThread):
                     accounts = [r for r in results if r is not None]
 
                 # Append IBKR account at the end of the list if available.
+                print(f"[worker] ibkr_fut={'submitted' if ibkr_fut else 'None'}, "
+                      f"accounts so far: {len(accounts)}", flush=True)
                 if ibkr_fut is not None:
                     try:
                         ibkr_acct = ibkr_fut.result()
+                        print(f"[worker] ibkr_acct result: "
+                              f"{'has ' + str(len(ibkr_acct.get('positions', []))) + ' positions' if ibkr_acct else 'None'}", flush=True)
                         if ibkr_acct:
                             # Refresh Greeks via the live quotes provider so the
                             # IBKR account's position cards show full Greek rows.
@@ -352,6 +435,44 @@ class PortfolioWorker(QThread):
                     except Exception as e:
                         print(f"[email_account] fetch failed: {e}", flush=True)
 
+                # Attach IBKR quotes to offline (stub) positions so they get
+                # live mark prices, Greeks, and underlying price.
+                if self.quotes is not None:
+                    for acct in accounts:
+                        if acct.get("source") != "offline":
+                            continue
+                        positions = acct.get("positions", [])
+                        if not positions:
+                            continue
+                        eq_opts = [p.symbol for p in positions
+                                   if p.is_option and not p.is_future]
+                        fu_opts = [p.symbol for p in positions
+                                   if p.is_option and p.is_future]
+                        equities = [p.symbol for p in positions
+                                    if not p.is_option and not p.is_future]
+                        futures  = [p.symbol for p in positions
+                                    if not p.is_option and p.is_future]
+                        try:
+                            quotes = self.quotes.get_quotes(
+                                equity_options=eq_opts,
+                                future_options=fu_opts,
+                                equities=equities,
+                                futures=futures,
+                            )
+                            attached = 0
+                            for p in positions:
+                                q = quotes.get(p.symbol)
+                                if q:
+                                    p.attach_quote(q)
+                                    attached += 1
+                            print(f"[worker] offline quotes: {attached}/{len(positions)} "
+                                  f"symbols got IBKR data", flush=True)
+                        except Exception as qe:
+                            print(f"[worker] offline quote fetch: {qe}", flush=True)
+
+                total_pos = sum(len(a.get("positions", [])) for a in accounts)
+                print(f"[worker] DONE — emitting {len(accounts)} accounts, "
+                      f"{total_pos} total positions", flush=True)
                 self.done.emit({"accounts": accounts, "error": "", "new_token": new_token})
                 return
 
@@ -1277,10 +1398,16 @@ class _GoogleSignInWorker(QThread):
     app stays responsive while the user completes the browser flow."""
     done = pyqtSignal(object, str)   # (tokens dict or None, error message)
 
+    def __init__(self, include_gmail: bool = False):
+        super().__init__()
+        self._include_gmail = include_gmail
+
     def run(self):
         try:
             import cloud_sync
-            tokens = cloud_sync.sign_in_with_google()
+            tokens = cloud_sync.sign_in_with_google(
+                include_gmail=self._include_gmail,
+            )
             self.done.emit(tokens, "")
         except Exception as e:
             self.done.emit(None, str(e))
@@ -1347,7 +1474,8 @@ class _CloudSyncPanel(QWidget):
         intro.setMinimumHeight(46)
         v.addWidget(intro)
 
-        # Enable toggle
+        # Enable toggle — persists immediately on click so the setting
+        # survives regardless of how the dialog is closed (OK / Cancel / X).
         self._enable_chk = QCheckBox("Enable cloud sync")
         self._enable_chk.setChecked(bool(self._settings.get("cloud_sync_enabled")))
         self._enable_chk.setStyleSheet(
@@ -1358,6 +1486,7 @@ class _CloudSyncPanel(QWidget):
             f"QCheckBox::indicator:checked {{ background: {T.ACCENT}; "
             f"border-color: {T.ACCENT}; }}"
         )
+        self._enable_chk.toggled.connect(self._on_enable_toggled)
         v.addWidget(self._enable_chk)
 
         # Google OAuth Client ID is embedded in cloud_sync.py — no
@@ -1454,7 +1583,11 @@ class _CloudSyncPanel(QWidget):
         QApplication.processEvents()
 
         # Run the blocking OAuth flow off the UI thread.
-        self._signin_worker = _GoogleSignInWorker()
+        # Only request Gmail scope if email tracking is enabled — avoids
+        # Google's "sensitive info" verification screen for cloud-sync-only users.
+        settings = api.load_settings() or {}
+        email_on = bool((settings.get("email_tracking") or {}).get("enabled"))
+        self._signin_worker = _GoogleSignInWorker(include_gmail=email_on)
         self._signin_worker.done.connect(self._on_signin_done)
         self._signin_worker.start()
 
@@ -1549,10 +1682,20 @@ class _CloudSyncPanel(QWidget):
             return None
         return sync
 
+    def _on_enable_toggled(self, checked: bool):
+        """Save the toggle to disk immediately so it persists even if the
+        user closes the dialog with X or Cancel instead of OK."""
+        s = api.load_settings() or {}
+        s["cloud_sync_enabled"] = checked
+        api.save_settings(s)
+
     def commit(self):
         """Persist the enable toggle. All other state lives in the
         keychain (refresh token, uid, email) and is written eagerly by
-        the Sign-in / Sign-out handlers."""
+        the Sign-in / Sign-out handlers.
+        NOTE: The toggle is also saved eagerly via _on_enable_toggled(),
+        so this is effectively a no-op for the checkbox — kept for
+        backward compat with the accept() call chain."""
         s = api.load_settings() or {}
         s["cloud_sync_enabled"] = bool(self._enable_chk.isChecked())
         s.pop("cloud_sync_passphrase", None)
@@ -1709,6 +1852,13 @@ class PortfolioScreen(QWidget):
         else:
             # No TT token — still try to detect IBKR Gateway for quotes.
             self.quotes    = self._build_quotes_provider(None)
+        # Log which quotes provider is active for debugging.
+        if self.quotes is None:
+            print("[startup] quotes provider: NONE (no TT token, no IBKR)", flush=True)
+        elif isinstance(self.quotes, HybridQuotesProvider):
+            print("[startup] quotes provider: Hybrid (IBKR primary + TT fallback)", flush=True)
+        else:
+            print(f"[startup] quotes provider: {type(self.quotes).__name__}", flush=True)
         self._worker    = None
         self._accounts  = []
         self._alerted   = {}   # {(strategy_id, condition_type): severity} — prevents repeat alerts
@@ -1846,6 +1996,17 @@ class PortfolioScreen(QWidget):
 
         self._load_data()
         self._auto_update_check()
+
+        # Auto-enable live mode when IBKR Gateway was detected at startup.
+        # This fires the 15-second refresh timer and shows the "● Gateway"
+        # pill without the user having to click the Live button.
+        if self._ibkr_provider() is not None:
+            self.live_btn.blockSignals(True)
+            self.live_btn.setChecked(True)
+            self.live_btn.blockSignals(False)
+            self._live_timer.start()
+            self._ws_unavailable = not self.token   # no TT streaming without token
+            self._update_ibkr_pill_checked()
 
     # ── Header ──────────────────────────────────────────────────────────────
 
@@ -1996,6 +2157,12 @@ class PortfolioScreen(QWidget):
                 f"QPushButton:hover {{ background: {T.GREEN}; }}"
             )
         elif on:
+            # If IBKR is the active provider and there's no TT token, show
+            # Gateway instead of "Connecting" to a dead TT stream.
+            prov = self._ibkr_provider() if hasattr(self, "quotes") else None
+            if prov is not None and not self.token:
+                self._update_ibkr_pill_checked()
+                return
             self.live_btn.setText("⟳  Connecting")
             self.live_btn.setStyleSheet(
                 f"QPushButton {{ background: transparent; color: {T.YELLOW}; "
@@ -2159,9 +2326,10 @@ class PortfolioScreen(QWidget):
         port = getattr(prov, "_port", None)
         label = {4001: "Gateway",      4002: "Gateway (paper)",
                  7496: "TWS",          7497: "TWS (paper)"}.get(port, "IBKR")
-        # Only update the label when the button is in its idle (off) state so we
-        # don't clobber "● Streaming" / "⟳ Connecting" while streaming is active.
-        if not self.live_btn.isChecked():
+        # Update the label when the button is idle (off), OR when the button is
+        # on but we have no TT token (IBKR is the only provider, so "Gateway"
+        # is more informative than "Connecting" to a dead TT stream).
+        if not self.live_btn.isChecked() or not self.token:
             self.live_btn.setText(f"●  {label}")
             self.live_btn.setStyleSheet(
                 f"QPushButton {{ background: transparent; color: {T.GREEN}; "
@@ -2169,6 +2337,24 @@ class PortfolioScreen(QWidget):
                 f"font-size: 11px; font-weight: bold; }}"
                 f"QPushButton:hover {{ background: {T.GREEN_D}; color: white; }}"
             )
+
+    def _update_ibkr_pill_checked(self):
+        """Show '● Gateway' even when the live button is checked (ON).
+        Used when IBKR is the sole quotes provider (no TT token).
+        Does NOT require is_connected() since the IB connection is lazy."""
+        prov = self._ibkr_provider() if hasattr(self, "quotes") else None
+        if prov is None:
+            return
+        port  = getattr(prov, "_port", None)
+        label = {4001: "Gateway",    4002: "Gateway (paper)",
+                 7496: "TWS",        7497: "TWS (paper)"}.get(port, "IBKR")
+        self.live_btn.setText(f"●  {label}")
+        self.live_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {T.GREEN}; "
+            f"border: 1px solid {T.GREEN}; border-radius: 6px; padding: 0 10px; "
+            f"font-size: 11px; font-weight: bold; }}"
+            f"QPushButton:hover {{ background: {T.GREEN_D}; color: white; }}"
+        )
 
     # ── IBKR late-connect probe ──────────────────────────────────────────────
 
@@ -2273,6 +2459,16 @@ class PortfolioScreen(QWidget):
 
         self._update_ibkr_pill()
         self._update_streamer_symbols()
+
+        # Auto-enable live mode when Gateway comes up mid-session.
+        if not self.live_btn.isChecked():
+            self.live_btn.blockSignals(True)
+            self.live_btn.setChecked(True)
+            self.live_btn.blockSignals(False)
+            self._live_timer.start()
+            self._ws_unavailable = not self.token
+            self._update_ibkr_pill_checked()
+
         # Trigger an immediate refresh so the next fetch uses IBKR.
         self._load_data()
 
@@ -2288,10 +2484,22 @@ class PortfolioScreen(QWidget):
 
     def _toggle_live(self, on):
         if on:
+            self._live_timer.start()
+
+            # When we have no TT token, TT streaming can't work.  If IBKR is
+            # the active quotes provider show "● Gateway" straight away instead
+            # of spinning on "Connecting" forever.  Don't check is_connected()
+            # because the IB connection is lazy — the provider existing means
+            # Gateway was reachable at startup.
+            ibkr_prov = self._ibkr_provider() if hasattr(self, "quotes") else None
+            if not self.token and ibkr_prov is not None:
+                self._ws_unavailable = True          # no TT streamer needed
+                self._update_ibkr_pill_checked()      # show "● Gateway" even while checked
+                return
+
             # Show "Connecting…" (or "Live" if we've learned WS isn't available)
             mode = "rest" if getattr(self, "_ws_unavailable", False) else "connecting"
             self._style_live_btn(True, streaming=False, mode=mode)
-            self._live_timer.start()
             self._start_streamer()
         else:
             # Clicking OFF — cancel any in-progress connect immediately and
@@ -2807,6 +3015,23 @@ class PortfolioScreen(QWidget):
         self._more_btn.setText("Less  ▲" if self._more_expanded else "More  ▼")
 
     # ── Data loading / close detection ──────────────────────────────────────
+
+    def _show_tt_warning(self, err):
+        """Show a warning banner when TT token refresh failed."""
+        msg = (
+            "⚠ TastyTrade connection failed — positions won't load.\n"
+            "Update your credentials in Settings → TastyTrade API."
+        )
+        if "invalid_grant" in (err or ""):
+            msg = (
+                "⚠ TastyTrade token expired — positions won't load.\n"
+                "Update your credentials in Settings → TastyTrade API."
+            )
+        self.status_lbl.setText(msg)
+        self.status_lbl.setStyleSheet(
+            f"color: {T.YELLOW}; font-size: 12px; border: none; "
+            f"background: transparent;"
+        )
 
     def _load_data(self):
         # Don't start a second worker while one is already running — that would
@@ -3659,7 +3884,18 @@ class PortfolioScreen(QWidget):
         dlg = AccountSettingsDialog(
             self._accounts, self._account_names, self._settings, parent=self
         )
-        if dlg.exec() == QDialog.DialogCode.Accepted:
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+
+        # The cloud-sync enable checkbox saves eagerly on toggle (to disk),
+        # so sync the on-disk value into self._settings no matter how the
+        # dialog was closed (OK / Cancel / X).  This prevents any later
+        # save_settings(self._settings) from clobbering the user's choice.
+        disk = api.load_settings() or {}
+        self._settings["cloud_sync_enabled"] = disk.get(
+            "cloud_sync_enabled", False
+        )
+
+        if accepted:
             self._account_names = dlg.result_names()
             api.save_account_names(self._account_names)
             self._settings["leg_greeks"] = dlg.result_leg_greeks()
@@ -3834,12 +4070,21 @@ class MainWindow(QStackedWidget):
         # either connect TastyTrade or skip.  After that first choice,
         # the app always goes straight to the portfolio; credentials
         # can be added/changed later in Settings.
-        if not settings.get("first_launch_done"):
+        # Also honor the legacy "skip_tt_login" flag from older versions.
+        has_launched = (settings.get("first_launch_done")
+                        or settings.get("skip_tt_login"))
+        creds = api.load_credentials()
+
+        if not has_launched and not creds:
             self._show_setup()
             return
 
+        # Migrate: mark first_launch_done so the check is one flag going forward.
+        if not settings.get("first_launch_done"):
+            settings["first_launch_done"] = True
+            api.save_settings(settings)
+
         # Returning user → try to use saved TT credentials silently.
-        creds = api.load_credentials()
         if creds:
             token, err = api.get_access_token(
                 creds["refresh_token"], creds["secret_token"]
@@ -3847,13 +4092,11 @@ class MainWindow(QStackedWidget):
             if token:
                 self._show_portfolio(creds, token)
             else:
-                # Token refresh failed (network, expired, etc.) — go to
-                # portfolio anyway so the user isn't blocked.  IBKR / email
-                # tracking / offline mode will still work.  TT data just
-                # won't load until the token is fixed in Settings.
-                print(f"[startup] TT token refresh failed: {err} — "
-                      f"entering portfolio without TT data", flush=True)
-                self._show_portfolio(creds, "")
+                # Token refresh failed — enter portfolio anyway.
+                # Show a warning so the user knows to fix credentials
+                # in Settings. IBKR / email tracking still work.
+                print(f"[startup] TT token refresh failed: {err}", flush=True)
+                self._show_portfolio(creds, "", tt_error=err)
         else:
             self._show_portfolio({}, "")
 
@@ -3881,7 +4124,7 @@ class MainWindow(QStackedWidget):
         api.save_settings(settings)
         self._show_portfolio({}, "")
 
-    def _show_portfolio(self, creds, token):
+    def _show_portfolio(self, creds, token, tt_error=None):
         self._clear_all()
         self.portfolio = PortfolioScreen(creds, token)
         self.portfolio.configure_requested.connect(self._show_configure)
@@ -3890,6 +4133,10 @@ class MainWindow(QStackedWidget):
         self.portfolio.risk_requested.connect(self._show_risk)
         self.addWidget(self.portfolio)
         self.setCurrentWidget(self.portfolio)
+        # Show a warning banner if TT token failed so the user knows
+        # to update credentials in Settings.
+        if tt_error and creds:
+            QTimer.singleShot(500, lambda: self.portfolio._show_tt_warning(tt_error))
 
     def _show_configure(self):
         if self.portfolio is None:
