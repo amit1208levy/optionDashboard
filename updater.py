@@ -170,7 +170,40 @@ def _find_app_bundle_path():
     return app if app.endswith(".app") else None
 
 
-def self_install():
+def _download_zip(url: str, dest: str, progress_cb=None) -> None:
+    """
+    Stream-download `url` to `dest` with generous connect + per-chunk read
+    timeouts.  Using requests in streaming mode (instead of
+    urllib.urlretrieve) means a stalled GitHub CDN connection raises instead
+    of hanging forever, while still tolerating slow but progressing
+    downloads (40 MB over a 500 KB/s link takes ~80 s).
+
+    Raises requests.RequestException on failure.
+    """
+    headers = {"User-Agent": "OptionsDashboard-Updater"}
+    # connect=30 s, read=120 s between chunks — generous so a slow but
+    # steady connection isn't killed mid-download.
+    with requests.get(
+        url, stream=True, timeout=(30, 120),
+        allow_redirects=True, headers=headers,
+    ) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("Content-Length") or 0)
+        done  = 0
+        with open(dest, "wb") as f:
+            for chunk in r.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                done += len(chunk)
+                if progress_cb is not None:
+                    try:
+                        progress_cb(done, total)
+                    except Exception:
+                        pass
+
+
+def self_install(progress_cb=None):
     """
     Download the latest OptionsDashboard.zip from GitHub Releases,
     unpack it, replace the running .app bundle, and relaunch.
@@ -179,10 +212,15 @@ def self_install():
     for this process to exit before touching the bundle — so we never
     delete our own binary out from under ourselves.
 
+    NOTE: this is a blocking network operation (~40 MB download).  Callers
+    on a GUI thread must run it from a worker thread, or the event loop
+    will freeze and macOS will report a hang.  Pass `progress_cb(done, total)`
+    to receive byte-count updates from the worker thread.
+
     Returns (ok: bool, message: str).
     On success this process will exit shortly after returning True.
     """
-    import tempfile, urllib.request, zipfile
+    import tempfile, zipfile
 
     app_path = _find_app_bundle_path()
     if not app_path:
@@ -193,7 +231,7 @@ def self_install():
 
     # 1. Download
     try:
-        urllib.request.urlretrieve(_APP_ZIP_URL, zip_path)
+        _download_zip(_APP_ZIP_URL, zip_path, progress_cb=progress_cb)
     except Exception as exc:
         return False, f"Download failed: {exc}"
 

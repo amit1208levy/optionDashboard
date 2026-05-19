@@ -44,6 +44,23 @@ class UpdateCheckWorker(QThread):
         self.done.emit(updater.check_latest())
 
 
+class UpdateInstallWorker(QThread):
+    """Downloads + extracts the new .app on a worker thread.
+
+    The actual ~40 MB HTTPS download must NOT run on the GUI thread — a slow
+    connection would freeze the event loop and macOS reports it as a hang
+    (see v1.5.0 hang report 2BE6936C).
+    """
+    progress = pyqtSignal(int, int)   # (bytes_done, bytes_total)  total=0 if unknown
+    done     = pyqtSignal(bool, str)  # (ok, message)
+
+    def run(self):
+        def cb(done_bytes, total_bytes):
+            self.progress.emit(int(done_bytes), int(total_bytes))
+        ok, msg = updater.self_install(progress_cb=cb)
+        self.done.emit(ok, msg)
+
+
 class ConnectWorker(QThread):
     done = pyqtSignal(str, str)
 
@@ -3829,26 +3846,51 @@ class PortfolioScreen(QWidget):
             download.setText("⬇  Update now")
             def _go_bundle():
                 download.setEnabled(False)
+                later.setEnabled(False)
                 download.setText("Downloading…")
-                ok, msg = updater.self_install()
-                if not ok:
-                    import webbrowser
-                    QMessageBox.warning(
-                        dlg, "Update failed",
-                        f"{msg}\n\nOpening GitHub Releases so you can "
-                        f"download manually."
-                    )
-                    webbrowser.open(
-                        "https://github.com/amit1208levy/optionDashboard/releases"
-                    )
-                    download.setEnabled(True)
-                    download.setText("⬇  Update now")
-                    return
-                # Exit cleanly — the detached shell script will relaunch
-                # the new bundle once we're gone.
-                dlg.accept()
-                import sys
-                sys.exit(0)
+
+                # Run the download + extract on a worker thread so the GUI
+                # event loop keeps pumping (otherwise a slow connection
+                # freezes the UI and macOS flags it as a hang).
+                worker = UpdateInstallWorker(self)
+
+                def _on_progress(done_bytes, total_bytes):
+                    if total_bytes > 0:
+                        pct = int(done_bytes * 100 / total_bytes)
+                        mb_done = done_bytes / (1024 * 1024)
+                        mb_total = total_bytes / (1024 * 1024)
+                        download.setText(
+                            f"Downloading… {pct}% ({mb_done:.1f}/{mb_total:.1f} MB)"
+                        )
+                    else:
+                        mb_done = done_bytes / (1024 * 1024)
+                        download.setText(f"Downloading… {mb_done:.1f} MB")
+
+                def _on_done(ok, msg):
+                    worker.deleteLater()
+                    if not ok:
+                        import webbrowser
+                        QMessageBox.warning(
+                            dlg, "Update failed",
+                            f"{msg}\n\nOpening GitHub Releases so you can "
+                            f"download manually."
+                        )
+                        webbrowser.open(
+                            "https://github.com/amit1208levy/optionDashboard/releases"
+                        )
+                        download.setEnabled(True)
+                        later.setEnabled(True)
+                        download.setText("⬇  Update now")
+                        return
+                    # Exit cleanly — the detached shell script will relaunch
+                    # the new bundle once we're gone.
+                    dlg.accept()
+                    import sys
+                    sys.exit(0)
+
+                worker.progress.connect(_on_progress)
+                worker.done.connect(_on_done)
+                worker.start()
             download.clicked.connect(_go_bundle)
         else:
             download.setText("⬇  Update now")
