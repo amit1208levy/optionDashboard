@@ -26,28 +26,30 @@ echo "════════════════════════�
 echo ""
 
 # ── 1. Find PyInstaller ───────────────────────────────────────────────────────
-PYI=""
+# Prefer `python3 -m PyInstaller` over the standalone script, because the
+# script's #! shebang sometimes points to an Xcode-shipped Python that gets
+# wiped by Xcode updates ("No such file or directory" on a present file).
+PYTHON=""
 for candidate in \
-    "$(command -v pyinstaller 2>/dev/null)" \
-    "$HOME/Library/Python/3.12/bin/pyinstaller" \
-    "$HOME/Library/Python/3.11/bin/pyinstaller" \
-    "$HOME/Library/Python/3.10/bin/pyinstaller" \
-    "$HOME/Library/Python/3.9/bin/pyinstaller" \
-    "/usr/local/bin/pyinstaller" \
-    "/opt/homebrew/bin/pyinstaller"; do
-    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-        PYI="$candidate"
+    "$(command -v python3 2>/dev/null)" \
+    "/opt/homebrew/bin/python3" \
+    "/usr/local/bin/python3" \
+    "/usr/bin/python3"; do
+    if [ -n "$candidate" ] && [ -x "$candidate" ] \
+       && "$candidate" -c "import PyInstaller" 2>/dev/null; then
+        PYTHON="$candidate"
         break
     fi
 done
 
-if [ -z "$PYI" ]; then
-    echo "✗ PyInstaller not found. Install it first:"
-    echo "     pip3 install pyinstaller --user"
+if [ -z "$PYTHON" ]; then
+    echo "✗ PyInstaller not found in any python3 on PATH. Install it first:"
+    echo "     python3 -m pip install --user pyinstaller"
     exit 1
 fi
 
-echo "→ Using PyInstaller: $PYI ($(\"$PYI\" --version))"
+PYI_VERSION="$("$PYTHON" -m PyInstaller --version 2>/dev/null || echo unknown)"
+echo "→ Using PyInstaller: $PYTHON -m PyInstaller ($PYI_VERSION)"
 echo ""
 
 # ── 2. Clean previous builds ──────────────────────────────────────────────────
@@ -56,7 +58,7 @@ rm -rf build dist
 
 # ── 3. Run PyInstaller ────────────────────────────────────────────────────────
 echo "→ Running PyInstaller..."
-"$PYI" OptionsDashboard.spec --noconfirm
+"$PYTHON" -m PyInstaller OptionsDashboard.spec --noconfirm
 
 # ── 4. Verify .app was created ────────────────────────────────────────────────
 if [ ! -d "$APP_PATH" ]; then

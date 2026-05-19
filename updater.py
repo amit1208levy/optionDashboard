@@ -220,7 +220,7 @@ def self_install(progress_cb=None):
     Returns (ok: bool, message: str).
     On success this process will exit shortly after returning True.
     """
-    import tempfile, zipfile
+    import tempfile
 
     app_path = _find_app_bundle_path()
     if not app_path:
@@ -235,11 +235,22 @@ def self_install(progress_cb=None):
     except Exception as exc:
         return False, f"Download failed: {exc}"
 
-    # 2. Unpack
+    # 2. Unpack — must use macOS `ditto`, not Python's zipfile.
+    #   - Python 3.9's zipfile.extractall strips POSIX exec bits, leaving the
+    #     Mach-O binary inside the .app without +x — macOS then refuses to
+    #     launch the bundle with "can't be opened" + generic Finder icon.
+    #   - build.sh creates zips with `ditto --sequesterRsrc`, which separates
+    #     resource forks into a __MACOSX/ sidecar. Only ditto knows how to
+    #     reassemble that on extract; zipfile can't.
     extract_dir = os.path.join(tmpdir, "extracted")
+    os.makedirs(extract_dir, exist_ok=True)
     try:
-        with zipfile.ZipFile(zip_path) as z:
-            z.extractall(extract_dir)
+        result = subprocess.run(
+            ["/usr/bin/ditto", "-x", "-k", zip_path, extract_dir],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            return False, f"Could not unzip download: {result.stderr.strip() or 'ditto failed'}"
     except Exception as exc:
         return False, f"Could not unzip download: {exc}"
 
