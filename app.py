@@ -412,6 +412,30 @@ class PortfolioWorker(QThread):
                                 except Exception as qe:
                                     print(f"[ibkr_account] quote refresh: {qe}", flush=True)
                             accounts.append(ibkr_acct)
+
+                            # When user is in offline mode (no TT token) but
+                            # IBKR Gateway IS connected, the offline accounts
+                            # have empty balance dicts → NET LIQ / BP USED %
+                            # show "—". Copy IBKR's balances onto each
+                            # offline account so the user sees their broker's
+                            # NetLiquidation regardless of which account is
+                            # selected. Safe because in offline mode there's
+                            # no competing TT balance to clobber.
+                            ibkr_bal = ibkr_acct.get("balances") or {}
+                            if ibkr_bal:
+                                for a in accounts:
+                                    if (a.get("source") == "offline"
+                                            and not a.get("balances")):
+                                        a["balances"] = dict(ibkr_bal)
+                                        # year_start_net_liq currently None
+                                        # for offline accounts; copy from IBKR
+                                        # if it has one (rare — Gateway
+                                        # doesn't expose it natively).
+                                        if (a.get("year_start_net_liq") is None
+                                                and ibkr_acct.get("year_start_net_liq")):
+                                            a["year_start_net_liq"] = (
+                                                ibkr_acct["year_start_net_liq"]
+                                            )
                     except Exception as e:
                         print(f"[ibkr_account] fetch failed: {e}", flush=True)
 
@@ -3550,12 +3574,22 @@ class PortfolioScreen(QWidget):
                 )
         else:
             # SDK call failed → numbers will be approximate.  Warn the user.
+            # Offline mode (no TT token) is a different scenario from a
+            # generic SDK failure; tailor the message accordingly.
             self.status_lbl.setStyleSheet(
                 f"color: {T.YELLOW}; font-size: 11px; border: none; background: transparent;"
             )
-            self.status_lbl.setText(
-                "YTD numbers are approximate (SDK fetch failed — using fallback math)."
-            )
+            if acct.get("source") == "offline":
+                self.status_lbl.setText(
+                    "Running without TastyTrade credentials — NET LIQ comes from "
+                    "IBKR Gateway, YTD totals are aggregated from local history, "
+                    "and OPEN P&L on individual strategies will show \"—\" until "
+                    "you sign in to TastyTrade (Settings → TastyTrade API)."
+                )
+            else:
+                self.status_lbl.setText(
+                    "YTD numbers are approximate (SDK fetch failed — using fallback math)."
+                )
 
             # Fallback: same NetLiq-delta math but with our manual transaction
             # parsing.  Less robust because field names are guessed.
@@ -3589,6 +3623,34 @@ class PortfolioScreen(QWidget):
             year_start_nl = acct.get("year_start_net_liq") or current_nl
             ytd_wf        = current_nl - year_start_nl - net_deposits
             ytd_total     = ytd_wf + ytd_fees
+
+            # Offline mode (no TT credentials, no SDK history): the NetLiq-
+            # delta formula collapses to 0 because year_start_nl falls back
+            # to current_nl. But the user has real per-strategy YTD values
+            # in .history.json (those drive the per-row "P&L YTD" column).
+            # Sum them here so the portfolio-level tile matches reality.
+            if (acct.get("source") == "offline"
+                    and (ytd_wf is None or abs(ytd_wf) < 1e-6)):
+                from datetime import date
+                this_year = date.today().year
+                acct_history = self.history_all.get(acct["number"], []) or []
+                realized_ytd_sum = 0.0
+                for h in acct_history:
+                    closed_at = h.get("closed_at") or ""
+                    if closed_at[:4] == str(this_year):
+                        try:
+                            realized_ytd_sum += float(h.get("pnl") or 0.0)
+                        except (TypeError, ValueError):
+                            pass
+                # Add open P&L from non-stub positions (in offline mode,
+                # stubs contribute 0, so this is usually just 0 unless
+                # the user has a mix).
+                open_pnl_sum = sum(
+                    p.pnl for p in positions_now
+                    if not getattr(p, "pnl_unknown", False)
+                )
+                ytd_wf    = realized_ytd_sum + open_pnl_sum
+                ytd_total = ytd_wf  # no fees data in offline mode
 
         self.ytd_gross_lbl.setText(money(ytd_total, signed=True))
         self.ytd_gross_lbl.setStyleSheet(

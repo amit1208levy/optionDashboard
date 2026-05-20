@@ -122,6 +122,13 @@ class Position:
     """
 
     def __init__(self, raw):
+        # True when we can't compute P&L meaningfully (no avg_open_price).
+        # Typical case: offline-mode stub positions reconstructed from
+        # `.strategies.json` symbols (no broker fill price available).
+        # The UI uses this to render "—" instead of misleading "+$0.00".
+        # Initialized early so the safety-net branches below can set it.
+        self.pnl_unknown = False
+
         self.raw             = raw
         self.symbol          = raw.get("symbol", "")
         self.underlying      = raw.get("underlying-symbol", "")
@@ -182,12 +189,16 @@ class Position:
         # Safety net: when avg_open_price is missing/zero AND the broker
         # didn't supply an authoritative unrealizedPNL, zero out P&L to
         # avoid displaying a misleading number (the formula would show the
-        # full notional as profit/loss).
+        # full notional as profit/loss). Mark it as "unknown" so the UI
+        # can render "—" instead of a misleading "+$0.00" — this is the
+        # offline-stub case (positions reconstructed from .strategies.json
+        # without a broker fill price).
         if ((not self.avg_open_price or self.avg_open_price <= 0)
                 and "unrealized-pnl" not in raw):
             self.pnl = 0.0
             self.cost_basis   = 0.0
             self.credit_debit = 0.0
+            self.pnl_unknown  = True
 
         self.pnl_pct = (self.pnl / notional_open * 100.0) if notional_open else 0.0
 
@@ -220,12 +231,17 @@ class Position:
 
         # Safety net: when avg_open_price is missing/zero, the formula
         # produces misleading P&L values (full notional appears as P&L).
-        # Zero it out — the user will see "—" rather than a wrong number.
+        # Zero it out and flag the value as unknown so the UI renders "—".
         if not self.avg_open_price or self.avg_open_price <= 0:
             self.pnl = 0.0
             self.cost_basis = 0.0
             self.credit_debit = 0.0
             self.pnl_pct = 0.0
+            self.pnl_unknown = True
+        else:
+            # We have real cost basis now; recovery from a previous stub
+            # state should clear the unknown flag.
+            self.pnl_unknown = False
 
     def attach_quote(self, quote):
         """Attach market-data response for this symbol: updates mark + Greeks."""
@@ -423,6 +439,10 @@ class Strategy:
     def pnl_pct(self):
         denom = self.cost_basis
         return (self.pnl / denom * 100.0) if denom else 0.0
+    @property
+    def pnl_unknown(self):
+        """True when ANY leg has an unknown P&L (offline stub, no fill price)."""
+        return any(getattr(l, "pnl_unknown", False) for l in self.legs)
 
     @property
     def dte(self):

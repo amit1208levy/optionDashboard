@@ -303,15 +303,25 @@ class StrategyCard(QFrame):
                     txt, c = money(day_pnl, signed=True), pnl_color(day_pnl)
                 h.addWidget(self._stat(label, txt, c, width=width))
             elif key == "pnl":
-                h.addWidget(self._stat(
-                    label, money(strategy.pnl, signed=True),
-                    pnl_color(strategy.pnl), is_pnl=True, width=width,
-                ))
+                # Offline stubs have no fill price → showing "+$0.00" would
+                # be misleading. Render em-dash so the user knows the value
+                # is unavailable, not zero.
+                if getattr(strategy, "pnl_unknown", False):
+                    h.addWidget(self._stat(label, "—", T.MUTED,
+                                           is_pnl=True, width=width))
+                else:
+                    h.addWidget(self._stat(
+                        label, money(strategy.pnl, signed=True),
+                        pnl_color(strategy.pnl), is_pnl=True, width=width,
+                    ))
             elif key == "pnl_pct":
-                h.addWidget(self._stat(
-                    label, pct(strategy.pnl_pct),
-                    pnl_color(strategy.pnl_pct), width=width,
-                ))
+                if getattr(strategy, "pnl_unknown", False):
+                    h.addWidget(self._stat(label, "—", T.MUTED, width=width))
+                else:
+                    h.addWidget(self._stat(
+                        label, pct(strategy.pnl_pct),
+                        pnl_color(strategy.pnl_pct), width=width,
+                    ))
             elif key == "ytd":
                 txt = (money(ytd_total, signed=True) if ytd_total is not None else "—")
                 c   = pnl_color(ytd_total) if ytd_total is not None else T.MUTED
