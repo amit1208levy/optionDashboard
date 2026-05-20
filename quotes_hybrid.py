@@ -1,14 +1,21 @@
 """
-Hybrid quotes provider — IBKR Gateway primary, TastyTrade fallback.
+Hybrid quotes provider — IBKR Gateway primary, TastyTrade fallback,
+optional Yahoo tertiary.
 
 The dashboard always asks for quotes through this single object.  It
 asks IBKR first (fast, real-time push); for any symbols IBKR doesn't
 return data for (futures options, occasional outages, symbols that
 fail to qualify, etc.) it transparently falls back to TastyTrade's
-REST endpoint.  Callers see a unified ``{tt_symbol: quote}`` dict and
-never know which side answered.
+REST endpoint.  If a tertiary provider is configured (typically
+Yahoo Finance), it is consulted for any symbols still missing after
+both IBKR and TT — useful when the user has neither IBKR Gateway
+running nor a valid TT token.
 
-Streaming wraps both providers — IBKR is the primary streamer; the
+Callers see a unified ``{tt_symbol: quote}`` dict and never know which
+side answered. Quote dicts from the tertiary include
+``"source": "yahoo"`` so the UI can badge them as delayed.
+
+Streaming wraps the primary and fallback (Yahoo has no push API). The
 callback receives merged updates from both sources.  Status callbacks
 report the IBKR side's connection state (the user-visible "● Live"
 indicator follows IBKR, since that's the real-time source).
@@ -17,7 +24,8 @@ Circuit breaker
 ---------------
 Three consecutive IBKR get_quotes() failures in a row bypass IBKR for
 the next 5 minutes — avoids stacking 15 s timeouts onto every refresh
-when Gateway is down.
+when Gateway is down. The tertiary has no breaker (it's already the
+last resort).
 """
 from __future__ import annotations
 
@@ -46,9 +54,17 @@ class HybridQuotesProvider(QuotesProvider):
     _BREAKER_FAILS  = 3      # consecutive failures before tripping
     _BREAKER_COOLDOWN = 300  # seconds to wait before retrying primary
 
-    def __init__(self, primary: QuotesProvider, fallback: QuotesProvider):
+    def __init__(
+        self,
+        primary: QuotesProvider,
+        fallback: QuotesProvider,
+        tertiary: Optional[QuotesProvider] = None,
+    ):
         self._primary  = primary
         self._fallback = fallback
+        # Tertiary is consulted only for symbols neither primary nor fallback
+        # could fill. Typically Yahoo Finance; may be None to disable.
+        self._tertiary = tertiary
         self._fail_count       = 0
         self._breaker_until    = 0.0
         # Streaming uses one handle from each provider when both support it.
@@ -135,6 +151,33 @@ class HybridQuotesProvider(QuotesProvider):
                 fb_res = {}
             for k, v in (fb_res or {}).items():
                 merged.setdefault(k, v)
+
+        # ── Tertiary (Yahoo, etc.) for whatever's still missing ──────────
+        # No circuit breaker — the tertiary is already the last resort.
+        # It only ever runs when both IBKR and TT have failed to cover a
+        # symbol, so the cost is naturally bounded.
+        if self._tertiary is not None:
+            still_missing = wanted - set(merged.keys())
+            if still_missing:
+                t_eq_opts = [s for s in eq_opts if s in still_missing]
+                t_fu_opts = [s for s in fu_opts if s in still_missing]
+                t_eq      = [s for s in eq      if s in still_missing]
+                t_fu      = [s for s in fu      if s in still_missing]
+                try:
+                    t_res = self._tertiary.get_quotes(
+                        equity_options=t_eq_opts,
+                        future_options=t_fu_opts,
+                        equities=t_eq,
+                        futures=t_fu,
+                    )
+                except Exception as e:
+                    print(f"[hybrid] tertiary raised: {e}", flush=True)
+                    t_res = {}
+                for k, v in (t_res or {}).items():
+                    merged.setdefault(k, v)
+                if t_res:
+                    print(f"[hybrid] tertiary returned {len(t_res)}/"
+                          f"{len(still_missing)} symbols", flush=True)
 
         return merged
 

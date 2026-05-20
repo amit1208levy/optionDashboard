@@ -195,6 +195,25 @@ class StrategyCard(QFrame):
         sub_row.addWidget(self._badge(strategy.root or "—", T.ACCENT))
         sub_row.addWidget(self._badge(f"{len(strategy.legs)} legs", T.MUTED, outlined=True))
 
+        # Delayed-source badge: shown when any leg's most recent quote came
+        # from a non-broker provider (Yahoo Finance). Quotes from Yahoo are
+        # ~15 min delayed and have Greeks computed locally via Black-Scholes,
+        # so the user needs to know this strategy's numbers aren't live.
+        if any(getattr(l, "quote_source", None) == "yahoo" for l in strategy.legs):
+            delay_min = next(
+                (getattr(l, "quote_delayed_minutes", None) for l in strategy.legs
+                 if getattr(l, "quote_source", None) == "yahoo"
+                 and getattr(l, "quote_delayed_minutes", None)),
+                15,
+            )
+            yahoo_badge = self._badge(f"Y · {delay_min}m", T.MUTED, outlined=True)
+            yahoo_badge.setToolTip(
+                "Quote from Yahoo Finance — delayed by ~{} min. "
+                "Greeks are computed locally via Black-Scholes; expect ±2% "
+                "drift vs broker values.".format(delay_min)
+            )
+            sub_row.addWidget(yahoo_badge)
+
         ivr = symbol_ivr(self.metrics.get(strategy.root))
         if ivr is not None:
             ivr_c = T.GREEN if ivr >= 50 else (T.YELLOW if ivr >= 25 else T.RED)

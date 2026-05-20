@@ -2274,6 +2274,18 @@ class PortfolioScreen(QWidget):
         if detected_port is None:
             # Silent — most users won't have Gateway running.  Logging at
             # DEBUG-equivalent so it isn't noise on stderr.
+            if tasty_provider is None:
+                # No IBKR and no TT — hand back a Yahoo-only provider so
+                # equity-option positions still get marks + computed Greeks.
+                # Yahoo can't help futures options; those stay blank.
+                from quotes_yahoo import YahooQuotesProvider
+                print("[quotes] no IBKR / no TT — falling back to Yahoo "
+                      "for equity-option quotes (delayed ~15 min, no "
+                      "futures options).", flush=True)
+                return YahooQuotesProvider()
+            # TT only — keep existing behavior. (Yahoo would only help when
+            # TT can't cover a symbol, which is rare for accounts that have
+            # a valid TT token.)
             return tasty_provider
 
         # Lazy import so users without ib_insync installed don't crash
@@ -2300,15 +2312,24 @@ class PortfolioScreen(QWidget):
                 7496: "TWS (live)",     7497: "TWS (paper)"}.get(detected_port,
                                                                  f"port {detected_port}")
 
+        # Yahoo is the always-on tertiary safety net. Activates only when
+        # both IBKR and TT (when present) fail to fill a symbol.
+        from quotes_yahoo import YahooQuotesProvider
+        yahoo = YahooQuotesProvider()
+
         if tasty_provider is not None:
             print(f"[ibkr] auto-detected: {kind} — quotes will use IBKR push, "
-                  f"TastyTrade as fallback", flush=True)
-            return HybridQuotesProvider(primary=ibkr_provider, fallback=tasty_provider)
+                  f"TastyTrade as fallback, Yahoo as last-resort", flush=True)
+            return HybridQuotesProvider(
+                primary=ibkr_provider, fallback=tasty_provider, tertiary=yahoo,
+            )
         else:
-            print(f"[ibkr] auto-detected: {kind} — quotes will use IBKR push "
-                  f"(no TastyTrade fallback, running without TT credentials)",
-                  flush=True)
-            return ibkr_provider
+            # No TT — use Yahoo as the (single) fallback behind IBKR.
+            print(f"[ibkr] auto-detected: {kind} — quotes will use IBKR push, "
+                  f"Yahoo as fallback (no TastyTrade credentials)", flush=True)
+            return HybridQuotesProvider(
+                primary=ibkr_provider, fallback=yahoo,
+            )
 
     # ── IBKR account-data helpers ─────────────────────────────────────────────
 
@@ -2457,13 +2478,22 @@ class PortfolioScreen(QWidget):
                   flush=True)
             return
 
-        # Replace the current provider with IBKR (or Hybrid if Tasty exists).
-        tasty = self.quotes
-        if tasty is not None:
-            self.quotes = HybridQuotesProvider(primary=ibkr_prov, fallback=tasty)
+        # Replace the current provider. After late IBKR connect:
+        #   • If we previously had a Yahoo-only provider (no IBKR + no TT
+        #     state), promote IBKR to primary with Yahoo as fallback.
+        #   • If we had TT (or a Hybrid wrapping TT), put IBKR in front
+        #     and keep TT (or whatever previous) as fallback, with Yahoo
+        #     as a tertiary safety net.
+        from quotes_yahoo import YahooQuotesProvider
+        prev = self.quotes
+        if prev is None or isinstance(prev, YahooQuotesProvider):
+            self.quotes = HybridQuotesProvider(
+                primary=ibkr_prov, fallback=YahooQuotesProvider(),
+            )
         else:
-            # No TT credentials → IBKR is the sole quotes source.
-            self.quotes = ibkr_prov
+            self.quotes = HybridQuotesProvider(
+                primary=ibkr_prov, fallback=prev, tertiary=YahooQuotesProvider(),
+            )
 
         kind = {4001: "Gateway (live)", 4002: "Gateway (paper)",
                 7496: "TWS (live)",     7497: "TWS (paper)"}.get(port, f"port {port}")

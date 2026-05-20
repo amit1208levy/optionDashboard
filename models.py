@@ -199,6 +199,11 @@ class Position:
         self.iv              = None
         self.underlying_price = None
         self.probability_otm = None   # from TastyTrade market-data API
+        # Provenance — which provider supplied the last quote. Set by
+        # attach_quote() when the quote dict includes a "source" key.
+        # Used by the UI to badge delayed / non-broker sources.
+        self.quote_source           = None  # e.g. "yahoo"
+        self.quote_delayed_minutes  = None  # e.g. 15
 
     def _recompute(self):
         notional_open = self.quantity * self.multiplier * self.avg_open_price
@@ -230,6 +235,18 @@ class Position:
             v = quote.get(k)
             try: return float(v)
             except (TypeError, ValueError): return None
+
+        # Provenance: which provider supplied this quote? Used by the UI
+        # to badge delayed/non-broker sources (e.g. "Y" for Yahoo).
+        src = quote.get("source")
+        if src:
+            self.quote_source = str(src)
+            delayed_min = quote.get("delayed_minutes")
+            if delayed_min is not None:
+                try:
+                    self.quote_delayed_minutes = int(delayed_min)
+                except (TypeError, ValueError):
+                    pass
 
         self.delta            = f("delta")
         self.gamma            = f("gamma")
